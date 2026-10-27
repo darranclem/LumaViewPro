@@ -1,5 +1,5 @@
 """
-image_utils.py - Fast, cached image processing, flat-field shading correction, focus metrics,
+image_utils.py - Image processing, flat-field shading correction, focus sharpness metrics,
 and optically accurate synthetic camera frame generation for LumaViewPro.
 """
 
@@ -8,10 +8,11 @@ import os
 import cv2
 import numpy as np
 import math
-from typing import Optional, Tuple, Union, Dict, List
+from typing import Optional, Tuple, Dict, List
 
 # Pre-computed cell colony coordinate cache for 20 FPS live simulation
 _CELL_CACHE: Dict[Tuple[int, int], List[Tuple[float, float, float]]] = {}
+_DARK_NOISE_FRAME: Optional[np.ndarray] = None
 
 
 def _init_cell_cache():
@@ -22,11 +23,11 @@ def _init_cell_cache():
         for c in range(24):
             seed = (r * 24 + c + 1) * 1000
             np.random.seed(seed)
-            num_cells = 45
+            num_cells = 50
             angles = np.random.uniform(0, 2 * np.pi, num_cells)
-            radii = np.random.uniform(0.1, 3.2, num_cells)
-            cell_rs = np.random.uniform(0.015, 0.035, num_cells)
-            
+            radii = np.random.uniform(0.05, 3.2, num_cells)
+            cell_rs = np.random.uniform(0.015, 0.038, num_cells)
+
             cell_list = []
             for i in range(num_cells):
                 dx = radii[i] * np.cos(angles[i])
@@ -124,17 +125,24 @@ def compute_focus_score(img: np.ndarray, method: str = "laplacian") -> float:
 
 
 def generate_disconnected_camera_frame(sensor_size: Tuple[int, int] = (512, 512)) -> np.ndarray:
-    """Generates a clear 'CAMERA DISCONNECTED' overlay frame for offline/unconnected PCs."""
+    """Generates a clear 'CAMERA DISCONNECTED' status frame when run without USB camera attached."""
     w, h = sensor_size
-    frame = np.zeros((h, w, 3), dtype=np.uint8)
-    # Dark blue-gray background with warning box
-    cv2.rectangle(frame, (10, 10), (w - 10, h - 10), (25, 25, 35), -1)
-    cv2.rectangle(frame, (10, 10), (w - 10, h - 10), (60, 60, 120), 2)
+    frame = np.full((h, w, 3), (25, 25, 30), dtype=np.uint8)
 
-    cv2.putText(frame, "MICROSCOPE DISCONNECTED", (w // 2 - 180, h // 2 - 15),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (100, 100, 255), 2)
-    cv2.putText(frame, "Connect USB Camera & Stage Controller", (w // 2 - 180, h // 2 + 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.50, (180, 180, 220), 1)
+    # Outer border
+    cv2.rectangle(frame, (15, 15), (w - 15, h - 15), (40, 40, 60), -1)
+    cv2.rectangle(frame, (15, 15), (w - 15, h - 15), (70, 70, 180), 2)
+
+    # Disconnected Symbol / Icon
+    cx, cy = w // 2, h // 2 - 20
+    cv2.circle(frame, (cx, cy), 40, (50, 50, 200), -1)
+    cv2.line(frame, (cx - 20, cy - 20), (cx + 20, cy + 20), (240, 240, 240), 4)
+    cv2.line(frame, (cx + 20, cy - 20), (cx - 20, cy + 20), (240, 240, 240), 4)
+
+    # Text Banner
+    cv2.putText(frame, "MICROSCOPE DISCONNECTED", (cx - 180, cy + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (100, 100, 255), 2)
+    cv2.putText(frame, "Connect USB Microscope Hardware", (cx - 150, cy + 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 220), 1)
+
     return frame
 
 
@@ -155,18 +163,20 @@ def generate_well_plate_cell_frame(
     **kwargs
 ) -> np.ndarray:
     """
-    Generates synthetic high-resolution camera frames with ultra-fast rendering.
-    - If is_light_on is False: Returns dark camera sensor noise frame (black window).
+    Generates synthetic high-resolution camera frames with ultra-fast OpenCV rendering.
+    - If is_light_on is False: Returns dark camera sensor Poisson noise frame.
     - If is_light_on is True: Renders well interior disks, cell colonies, well rim outlines,
       inter-well structural grid lines, outer plate skirt borders, and Z defocus blur.
     """
+    global _DARK_NOISE_FRAME
     w, h = sensor_size
 
     # 1. Dark Launch / Light OFF State (returns dark sensor noise)
     if not is_light_on or channel.upper() in ["OFF", "NONE", ""]:
-        np.random.seed(0)
-        dark_noise = np.random.normal(loc=2.5, scale=1.0, size=(h, w, 3)).astype(np.int16)
-        return np.clip(dark_noise, 0, 255).astype(np.uint8)
+        if _DARK_NOISE_FRAME is None or _DARK_NOISE_FRAME.shape != (h, w, 3):
+            np.random.seed(0)
+            _DARK_NOISE_FRAME = np.random.poisson(lam=2.5, size=(h, w, 3)).clip(0, 255).astype(np.uint8)
+        return _DARK_NOISE_FRAME
 
     # 2. Light ON State
     p_val = led_power if led_power is not None else power
@@ -206,7 +216,7 @@ def generate_well_plate_cell_frame(
 
     ch_l = channel.lower()
 
-    # Determine Base Colors for Active Channel LUT (BGR)
+    # Determine Base Colors for Active Channel LUT (BGR format)
     if "blue" in ch_l or "dapi" in ch_l:
         bg_color = np.array([25, 10, 5], dtype=np.float32)
         cell_color = np.array([255, 180, 40], dtype=np.float32)   # Pure Blue BGR
@@ -274,14 +284,14 @@ def generate_well_plate_cell_frame(
 
             # Draw cell colonies inside well
             cell_list = _CELL_CACHE.get((r_idx % 16, c_idx % 24), [])
-            for dx, dy, cr_mm in cell_list:
+            for dx, dy, cr_px in cell_list:
                 cx_mm = wx + dx
                 cy_mm = wy + dy
                 if math.hypot(dx, dy) < (well_r_mm - 0.05):
                     if fov_left - 0.1 <= cx_mm <= fov_right + 0.1 and fov_bottom - 0.1 <= cy_mm <= fov_top + 0.1:
                         c_px_x = int(((cx_mm - fov_left) / fov_w) * w)
                         c_px_y = int(((fov_top - cy_mm) / fov_h) * h)
-                        c_r_px = max(2, int((cr_mm / fov_w) * w))
+                        c_r_px = max(2, int((cr_px / 512.0) * (1.2 / fov_w) * w))
                         if 0 <= c_px_x < w and 0 <= c_px_y < h:
                             cv2.circle(frame, (c_px_x, c_px_y), c_r_px, cell_c, -1)
 
