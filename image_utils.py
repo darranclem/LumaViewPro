@@ -1,5 +1,5 @@
 """
-image_utils.py - Fast, cached image processing, shading correction, focus metrics,
+image_utils.py - Fast, cached image processing, flat-field shading correction, focus metrics,
 and optically accurate synthetic camera frame generation for LumaViewPro.
 """
 
@@ -10,9 +10,32 @@ import numpy as np
 import math
 from typing import Optional, Tuple, Union, Dict, List
 
-# Pre-computed cell colony coordinate cache for fast live simulation (20 FPS)
-_CELL_COORDINATES_CACHE: Dict[int, Dict[str, object]] = {}
-_DARK_FRAME_CACHE: Optional[np.ndarray] = None
+# Pre-computed cell colony coordinate cache for fast 20 FPS live simulation
+_CELL_CACHE: Dict[Tuple[int, int], List[Tuple[float, float, float]]] = {}
+
+
+def _init_cell_cache():
+    global _CELL_CACHE
+    if _CELL_CACHE:
+        return
+    for r in range(16):
+        for c in range(24):
+            seed = (r * 24 + c + 1) * 1000
+            np.random.seed(seed)
+            num_cells = 45
+            angles = np.random.uniform(0, 2 * np.pi, num_cells)
+            radii = np.random.uniform(0.1, 3.2, num_cells)
+            cell_rs = np.random.uniform(0.015, 0.035, num_cells)
+
+            cell_list = []
+            for i in range(num_cells):
+                dx = radii[i] * np.cos(angles[i])
+                dy = radii[i] * np.sin(angles[i])
+                cell_list.append((dx, dy, cell_rs[i]))
+            _CELL_CACHE[(r, c)] = cell_list
+
+
+_init_cell_cache()
 
 
 def load_image(filepath: str) -> Optional[np.ndarray]:
@@ -100,10 +123,113 @@ def compute_focus_score(img: np.ndarray, method: str = "laplacian") -> float:
         return float(np.var(lap))
 
 
-def _get_cached_cell_positions(num_wells: int = 96):
-    if num_wells in _CELL_COORDINATES_CACHE:
-        d = _CELL_COORDINATES_CACHE[num_wells]
-        return d["by_well"], d["wells"], d["params"]
+def generate_well_plate_cell_frame(
+    stage_x: float = -49.5,
+    stage_y: float = 31.5,
+    stage_z: float = 0.0,
+    best_z: float = 0.0,
+    channel: str = "Brightfield",
+    exposure_ms: float = 20.0,
+    gain: float = 1.0,
+    led_power: float = 100.0,
+    power: float = 100.0,
+    sensor_size: Tuple[int, int] = (512, 512),
+    fov_size_mm: Tuple[float, float] = (0.60, 0.45),
+    is_light_on: bool = True,
+    num_wells: int = 96,
+    **kwargs
+) -> np.ndarray:
+    w, h = sensor_size
+
+    # DARK SENSOR LAUNCH STATE (Light OFF)
+    if not is_light_on:
+        dark_noise = np.random.normal(2.5, 1.0, (h, w, 3)).astype(np.int16)
+        return np.clip(dark_noise, 0, 255).astype(np.uint8)
+
+    p_val = led_power if led_power is not None else power
+    p_factor = max(0.05, min(1.0, float(p_val) / 100.0))
+    exp_factor = max(0.1, min(3.0, (exposure_ms / 20.0) * gain))
+    brightness = p_factor * exp_factor
+
+    fov_w, fov_h = fov_size_mm
+    fov_w = max(0.05, float(fov_w))
+    fov_h = max(0.05, float(fov_h))
+
+    px_per_mm_x = w / fov_w
+    px_per_mm_y = h / fov_h
+
+    fov_left = stage_x - fov_w / 2.0
+    fov_right = stage_x + fov_w / 2.0
+    fov_bottom = stage_y - fov_h / 2.0
+    fov_top = stage_y + fov_h / 2.0
+
+    # Plate footprint bounds (ANSI/SLAS standard 127.76mm x 85.48mm)
+    plate_w_mm = 127.76
+    plate_h_mm = 85.48
+    plate_left = -plate_w_mm / 2.0
+    plate_right = plate_w_mm / 2.0
+    plate_bottom = -plate_h_mm / 2.0
+    plate_top = plate_h_mm / 2.0
+
+    ch_l = channel.lower()
+    if "blue" in ch_l or "dapi" in ch_l:
+        bg_plastic = np.array([12, 5, 2], dtype=np.float32)
+        bg_well = np.array([35, 12, 5], dtype=np.float32)
+        cell_color = np.array([255, 180, 30], dtype=np.float32)
+        rim_color = np.array([160, 80, 30], dtype=np.float32)
+        skirt_color = np.array([5, 2, 1], dtype=np.float32)
+    elif "green" in ch_l or "fitc" in ch_l or "gfp" in ch_l:
+        bg_plastic = np.array([4, 12, 2], dtype=np.float32)
+        bg_well = np.array([8, 30, 5], dtype=np.float32)
+        cell_color = np.array([30, 255, 60], dtype=np.float32)
+        rim_color = np.array([40, 160, 50], dtype=np.float32)
+        skirt_color = np.array([2, 5, 1], dtype=np.float32)
+    elif "red" in ch_l or "txred" in ch_l or "mcherry" in ch_l or "cy5" in ch_l:
+        bg_plastic = np.array([2, 2, 12], dtype=np.float32)
+        bg_well = np.array([5, 5, 30], dtype=np.float32)
+        cell_color = np.array([20, 30, 255], dtype=np.float32)
+        rim_color = np.array([30, 40, 160], dtype=np.float32)
+        skirt_color = np.array([1, 1, 5], dtype=np.float32)
+    elif "darkfield" in ch_l or "df" in ch_l:
+        bg_plastic = np.array([10, 10, 12], dtype=np.float32)
+        bg_well = np.array([25, 25, 30], dtype=np.float32)
+        cell_color = np.array([230, 230, 250], dtype=np.float32)
+        rim_color = np.array([190, 190, 210], dtype=np.float32)
+        skirt_color = np.array([5, 5, 6], dtype=np.float32)
+    elif "phase" in ch_l:
+        bg_plastic = np.array([130, 130, 135], dtype=np.float32)
+        bg_well = np.array([185, 185, 190], dtype=np.float32)
+        cell_color = np.array([40, 40, 45], dtype=np.float32)
+        rim_color = np.array([90, 90, 100], dtype=np.float32)
+        skirt_color = np.array([70, 70, 75], dtype=np.float32)
+    else:  # Brightfield
+        bg_plastic = np.array([140, 140, 145], dtype=np.float32)
+        bg_well = np.array([225, 225, 230], dtype=np.float32)
+        cell_color = np.array([60, 60, 70], dtype=np.float32)
+        rim_color = np.array([100, 100, 110], dtype=np.float32)
+        skirt_color = np.array([60, 60, 65], dtype=np.float32)
+
+    bg_p_c = tuple(float(x) for x in np.clip(bg_plastic * brightness, 0, 255))
+    bg_w_c = tuple(float(x) for x in np.clip(bg_well * brightness, 0, 255))
+    cell_c = tuple(float(x) for x in np.clip(cell_color * brightness, 0, 255))
+    rim_c = tuple(float(x) for x in np.clip(rim_color * brightness, 0, 255))
+    skirt_c = tuple(float(x) for x in np.clip(skirt_color * brightness, 0, 255))
+
+    frame = np.zeros((h, w, 3), dtype=np.float32)
+
+    # Fill stage aperture metal outside plate
+    cv2.rectangle(frame, (0, 0), (w, h), (15, 15, 18), -1)
+
+    # Fill plate plastic body
+    p_px_l = int(((plate_left - fov_left) / fov_w) * w)
+    p_px_r = int(((plate_right - fov_left) / fov_w) * w)
+    p_px_t = int(((fov_top - plate_top) / fov_h) * h)
+    p_px_b = int(((fov_top - plate_bottom) / fov_h) * h)
+
+    cv2.rectangle(frame, (max(0, p_px_l), max(0, p_px_t)), (min(w, p_px_r), min(h, p_px_b)), bg_p_c, -1)
+
+    # Draw plate outer skirt border line
+    cv2.rectangle(frame, (p_px_l, p_px_t), (p_px_r, p_px_b), skirt_c, max(3, int(0.5 * px_per_mm_x)))
 
     well_formats = {
         6: (2, 3, 39.12, 39.12, 34.8, -39.12, 19.56),
@@ -114,155 +240,64 @@ def _get_cached_cell_positions(num_wells: int = 96):
         384: (16, 24, 4.5, 4.5, 3.8, -51.75, 33.75)
     }
     rows, cols, pitch_x, pitch_y, well_diameter, a1_x, a1_y = well_formats.get(num_wells, well_formats[96])
+    well_r_mm = well_diameter / 2.0
 
-    wells = []
-    by_well = {}
+    # Draw grid lines for well plate structure
+    for r in range(rows):
+        wy = a1_y - r * pitch_y
+        wy_px = int(((fov_top - wy) / fov_h) * h)
+        if -5 <= wy_px <= h + 5:
+            cv2.line(frame, (0, wy_px), (w, wy_px), skirt_c, 1)
 
-    np.random.seed(42 + num_wells)
+    for c in range(cols):
+        wx = a1_x + c * pitch_x
+        wx_px = int(((wx - fov_left) / fov_w) * w)
+        if -5 <= wx_px <= w + 5:
+            cv2.line(frame, (wx_px, 0), (wx_px, h), skirt_c, 1)
+
+    # Draw wells
     for r in range(rows):
         wy = a1_y - r * pitch_y
         for c in range(cols):
             wx = a1_x + c * pitch_x
-            w_name = f"{chr(65+r)}{c+1}"
-            wells.append((wx, wy, r, c, w_name))
 
-            num_cells = np.random.randint(25, 55)
-            angles = np.random.uniform(0, 2 * np.pi, num_cells)
-            radii = np.random.uniform(0, pitch_x * 0.32, num_cells)
-            cx = wx + radii * np.cos(angles)
-            cy = wy + radii * np.sin(angles)
-            cr = np.random.uniform(0.015, 0.035, num_cells)
+            # Spatial filter
+            if abs(wx - stage_x) > (fov_w / 2.0 + well_r_mm + 1.0) or abs(wy - stage_y) > (fov_h / 2.0 + well_r_mm + 1.0):
+                continue
 
-            by_well[(r, c)] = (
-                cx.astype(np.float32),
-                cy.astype(np.float32),
-                cr.astype(np.float32)
-            )
-
-    params = (rows, cols, pitch_x, pitch_y, well_diameter, a1_x, a1_y)
-    _CELL_COORDINATES_CACHE[num_wells] = {
-        "by_well": by_well, "wells": wells, "params": params
-    }
-    return by_well, wells, params
-
-
-def generate_well_plate_cell_frame(
-    stage_x: float = -49.5,
-    stage_y: float = 31.5,
-    stage_z: float = 0.0,
-    best_z: float = 0.0,
-    channel: str = "Brightfield",
-    exposure_ms: float = 20.0,
-    gain: float = 1.0,
-    led_power: float = 100.0,
-    is_light_on: bool = True,
-    fov_size_mm: Tuple[float, float] = (0.60, 0.45),
-    num_wells: int = 96,
-    sensor_size: Tuple[int, int] = (512, 512),
-    **kwargs
-) -> np.ndarray:
-    """
-    Generates synthetic high-resolution camera frames with ultra-fast OpenCV rendering.
-    - Outside well rims: 0 intensity (pure black plastic background)
-    - Inside wells: filled background + cell colonies + well rim borders
-    - Dark launch state: low Poisson sensor noise
-    """
-    global _DARK_FRAME_CACHE
-    w, h = sensor_size
-
-    # 1. Dark Launch / Light OFF State (returns dark sensor noise instantaneously - 0.001 ms CPU time)
-    if not is_light_on or led_power <= 0:
-        if _DARK_FRAME_CACHE is None or _DARK_FRAME_CACHE.shape != (h, w, 3):
-            np.random.seed(0)
-            _DARK_FRAME_CACHE = np.random.poisson(lam=2.5, size=(h, w, 3)).clip(0, 255).astype(np.uint8)
-        return _DARK_FRAME_CACHE
-
-    # 2. Light ON State: Calculate brightness factor
-    brightness = max(0.1, min(3.0, (exposure_ms / 20.0) * (led_power / 100.0) * gain))
-
-    fov_w, fov_h = fov_size_mm
-    fov_w = max(0.05, float(fov_w))
-    fov_h = max(0.05, float(fov_h))
-
-    px_per_mm_x = w / fov_w
-
-    fov_left = stage_x - fov_w / 2.0
-    fov_right = stage_x + fov_w / 2.0
-    fov_bottom = stage_y - fov_h / 2.0
-    fov_top = stage_y + fov_h / 2.0
-
-    by_well, wells, (rows, cols, pitch_x, pitch_y, well_diameter, a1_x, a1_y) = _get_cached_cell_positions(num_wells)
-    well_r_mm = well_diameter / 2.0
-
-    ch_l = channel.lower()
-
-    # Determine Base Background Color & LUT (BGR format)
-    if "blue" in ch_l or "dapi" in ch_l:
-        bg_color = np.array([25, 8, 4], dtype=np.float32)
-        cell_color = np.array([255, 180, 40], dtype=np.float32)  # Pure Blue
-        rim_color = np.array([120, 60, 20], dtype=np.float32)
-    elif "green" in ch_l or "fitc" in ch_l or "gfp" in ch_l:
-        bg_color = np.array([8, 20, 4], dtype=np.float32)
-        cell_color = np.array([40, 240, 60], dtype=np.float32)   # Pure Green
-        rim_color = np.array([40, 120, 40], dtype=np.float32)
-    elif "red" in ch_l or "txred" in ch_l or "mcherry" in ch_l or "cy5" in ch_l:
-        bg_color = np.array([4, 4, 20], dtype=np.float32)
-        cell_color = np.array([20, 30, 255], dtype=np.float32)   # Pure Red
-        rim_color = np.array([30, 40, 120], dtype=np.float32)
-    elif "darkfield" in ch_l or "df" in ch_l:
-        bg_color = np.array([15, 15, 20], dtype=np.float32)      # Darkfield
-        cell_color = np.array([220, 220, 240], dtype=np.float32)
-        rim_color = np.array([180, 180, 200], dtype=np.float32)
-    elif "phase" in ch_l:
-        bg_color = np.array([175, 175, 180], dtype=np.float32)   # Phase Contrast
-        cell_color = np.array([45, 45, 50], dtype=np.float32)
-        rim_color = np.array([100, 100, 110], dtype=np.float32)
-    else:  # Brightfield
-        bg_color = np.array([220, 220, 220], dtype=np.float32)   # Brightfield Grayscale
-        cell_color = np.array([55, 55, 65], dtype=np.float32)
-        rim_color = np.array([110, 110, 120], dtype=np.float32)
-
-    # Frame starts as 0 intensity (pure black plastic between wells)
-    frame = np.zeros((h, w, 3), dtype=np.float32)
-
-    bg_c = tuple(float(x) for x in np.clip(bg_color * brightness, 0, 255))
-    cell_c = tuple(float(x) for x in np.clip(cell_color * brightness, 0, 255))
-    rim_c = tuple(float(x) for x in np.clip(rim_color * brightness, 0, 255))
-
-    # Render wells overlapping active FOV
-    max_fov_radius = math.hypot(fov_w / 2.0, fov_h / 2.0)
-    
-    for wx, wy, r_idx, c_idx, w_name in wells:
-        dist_well = math.hypot(wx - stage_x, wy - stage_y)
-        if dist_well <= (max_fov_radius + well_r_mm + 1.0):
             well_px_x = int(((wx - fov_left) / fov_w) * w)
             well_px_y = int(((fov_top - wy) / fov_h) * h)
             well_r_px = int(well_r_mm * px_per_mm_x)
 
             # Draw filled well interior
-            cv2.circle(frame, (well_px_x, well_px_y), well_r_px, bg_c, -1)
+            cv2.circle(frame, (well_px_x, well_px_y), well_r_px, bg_w_c, -1)
 
-            # Draw cells in this well directly from dict
-            sub_x, sub_y, sub_r = by_well[(r_idx, c_idx)]
+            # Draw cell colonies
+            cell_list = _CELL_CACHE.get((r % 16, c % 24), [])
+            for dx, dy, cr_mm in cell_list:
+                cx_mm = wx + dx
+                cy_mm = wy + dy
+                if math.hypot(dx, dy) < (well_r_mm - 0.05):
+                    c_px_x = int(((cx_mm - fov_left) / fov_w) * w)
+                    c_px_y = int(((fov_top - cy_mm) / fov_h) * h)
+                    c_r_px = max(2, int(cr_mm * px_per_mm_x * 12.0))
 
-            for cx, cy, cr in zip(sub_x, sub_y, sub_r):
-                if fov_left - 0.1 <= cx <= fov_right + 0.1 and fov_bottom - 0.1 <= cy <= fov_top + 0.1:
-                    c_px_x = int(((cx - fov_left) / fov_w) * w)
-                    c_px_y = int(((fov_top - cy) / fov_h) * h)
-                    c_r_px = max(2, int(cr * px_per_mm_x * 12.0))
                     if -c_r_px <= c_px_x <= w + c_r_px and -c_r_px <= c_px_y <= h + c_r_px:
                         cv2.circle(frame, (c_px_x, c_px_y), c_r_px, cell_c, -1)
+                        if "phase" in ch_l or "brightfield" in ch_l:
+                            cv2.circle(frame, (c_px_x, c_px_y), c_r_px, (30, 30, 35), 1)
 
-            # Draw well rim border line
-            rim_w_px = max(2, int(0.12 * px_per_mm_x))
+            # Double ring well edge rim
+            rim_w_px = max(2, int(0.18 * px_per_mm_x))
             cv2.circle(frame, (well_px_x, well_px_y), well_r_px, rim_c, rim_w_px)
+            cv2.circle(frame, (well_px_x, well_px_y), max(1, well_r_px - rim_w_px), (40, 40, 45), 1)
 
     out_img = np.clip(frame, 0, 255).astype(np.uint8)
 
-    # Z defocus blur
+    # Z-defocus blur simulation
     dist_z = abs(stage_z - best_z)
     if dist_z > 0.001:
-        blur_k = int(dist_z * 25.0)
+        blur_k = int(dist_z * 35.0)
         if blur_k % 2 == 0:
             blur_k += 1
         blur_k = max(1, min(blur_k, 31))

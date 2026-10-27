@@ -1,18 +1,16 @@
 """
 labware.py - Labware representations, well plate registration, focus map gradient engine,
-tiled FOV management, autofocus camera binning, objective lens presets, and hardware protocol compilation for LumaViewPro.
+tiled FOV management, autofocus camera binning, objective presets, motorised turret configuration,
+and time-lapse cycle skip configuration for LumaViewPro.
 
 Features:
 - Standard ANSI/SLAS multi-well plate specifications (6, 12, 24, 48, 96, 384 well plates)
 - Top-Left A1 Orientation (Row letters A,B,C... down left; Column numbers 1,2,3... across top)
 - Precision 6-Point Target Plate Registration Engine (2D Affine Transformation)
 - Primary Autofocus Channel, Camera Binning & Per-Channel Z-Offset Architecture
-- Objective Lens Presets (1.25x, 4x, 5x, 10x, 20x Air, 40x, 60x Oil, 63x, 100x Oil) with Scaled Sample FOV
-- Conditional Motorised Objective Turret Configuration and Per-Channel Slot Assignments
+- Objective Lens Presets (1.25x, 4x, 5x, 10x, 20x Air, 20x, 40x, 60x Oil, 63x, 100x Oil) with NA, Mag, and true FOV dimensions
 - Autofocus Search Range (+/- um), Nyquist Step Calculator (DoF, NA, Wavelength, Immersion Index)
-- Autofocus Skip Cycle Control: Configures AF frequency (every 1st, 2nd, 3rd, N-th cycle)
-- Time-Lapse Schedule Engine: Interval (mins), Total Cycles, and estimated total duration calculation
-- Secondary Chromatic Z-Offset Correction: Per-channel optical shift compensation
+- Autofocus Skip Cycle Control & Time-Lapse Schedule Engine
 - Tiled Field-Of-View (FOV) Matrix Generator (1x1 up to 12x12 tiles per well)
 - Hardware Protocol Generator bridging software settings to underlying motion/camera layers.
 """
@@ -30,121 +28,111 @@ OBJECTIVE_PRESETS = {
         "mag": 1.25,
         "magnification": 1.25,
         "na": 0.04,
-        "refractive_index": 1.0,  # Air
+        "refractive_index": 1.0,
         "fov_width_mm": 9.60,
         "fov_height_mm": 7.20,
         "fov_w_mm": 9.60,
         "fov_h_mm": 7.20,
-        "turret_slot": 1,
         "desc": "1.25x Ultra-Wide Objective (Air, NA 0.04)"
     },
     "4x": {
         "mag": 4.0,
         "magnification": 4.0,
         "na": 0.13,
-        "refractive_index": 1.0,  # Air
+        "refractive_index": 1.0,
         "fov_width_mm": 3.00,
         "fov_height_mm": 2.25,
         "fov_w_mm": 3.00,
         "fov_h_mm": 2.25,
-        "turret_slot": 1,
         "desc": "4x Scanner Objective (Air, NA 0.13)"
     },
     "5x": {
         "mag": 5.0,
         "magnification": 5.0,
         "na": 0.16,
-        "refractive_index": 1.0,  # Air
+        "refractive_index": 1.0,
         "fov_width_mm": 2.40,
         "fov_height_mm": 1.80,
         "fov_w_mm": 2.40,
         "fov_h_mm": 1.80,
-        "turret_slot": 2,
         "desc": "5x Wide-field Objective (Air, NA 0.16)"
     },
     "10x": {
         "mag": 10.0,
         "magnification": 10.0,
         "na": 0.30,
-        "refractive_index": 1.0,  # Air
+        "refractive_index": 1.0,
         "fov_width_mm": 1.20,
         "fov_height_mm": 0.90,
         "fov_w_mm": 1.20,
         "fov_h_mm": 0.90,
-        "turret_slot": 2,
         "desc": "10x Plan Fluor Objective (Air, NA 0.30)"
     },
     "20x Air": {
         "mag": 20.0,
         "magnification": 20.0,
         "na": 0.45,
-        "refractive_index": 1.0,  # Air
+        "refractive_index": 1.0,
         "fov_width_mm": 0.60,
         "fov_height_mm": 0.45,
         "fov_w_mm": 0.60,
         "fov_h_mm": 0.45,
-        "turret_slot": 3,
         "desc": "20x LWD Plan Fluor Objective (Air, NA 0.45)"
     },
     "20x": {
         "mag": 20.0,
         "magnification": 20.0,
         "na": 0.45,
-        "refractive_index": 1.0,  # Air
+        "refractive_index": 1.0,
         "fov_width_mm": 0.60,
         "fov_height_mm": 0.45,
         "fov_w_mm": 0.60,
         "fov_h_mm": 0.45,
-        "turret_slot": 3,
         "desc": "20x Objective (Air, NA 0.45)"
     },
     "40x": {
         "mag": 40.0,
         "magnification": 40.0,
         "na": 0.60,
-        "refractive_index": 1.0,  # Air
+        "refractive_index": 1.0,
         "fov_width_mm": 0.30,
         "fov_height_mm": 0.225,
         "fov_w_mm": 0.30,
         "fov_h_mm": 0.225,
-        "turret_slot": 4,
         "desc": "40x High-Mag Objective (Air, NA 0.60)"
     },
     "60x Oil": {
         "mag": 60.0,
         "magnification": 60.0,
         "na": 1.40,
-        "refractive_index": 1.518,  # Oil Immersion
+        "refractive_index": 1.518,
         "fov_width_mm": 0.20,
         "fov_height_mm": 0.15,
         "fov_w_mm": 0.20,
         "fov_h_mm": 0.15,
-        "turret_slot": 5,
         "desc": "60x Oil Immersion Objective (Oil, NA 1.40)"
     },
     "63x": {
         "mag": 63.0,
         "magnification": 63.0,
         "na": 1.40,
-        "refractive_index": 1.518,  # Oil Immersion
+        "refractive_index": 1.518,
         "fov_width_mm": 0.19,
-        "fov_height_mm": 0.143,
+        "fov_height_mm": 0.1425,
         "fov_w_mm": 0.19,
-        "fov_h_mm": 0.143,
-        "turret_slot": 5,
+        "fov_h_mm": 0.1425,
         "desc": "63x Oil Immersion Objective (Oil, NA 1.40)"
     },
     "100x Oil": {
         "mag": 100.0,
         "magnification": 100.0,
         "na": 1.40,
-        "refractive_index": 1.518,  # Oil Immersion
+        "refractive_index": 1.518,
         "fov_width_mm": 0.12,
         "fov_height_mm": 0.09,
         "fov_w_mm": 0.12,
         "fov_h_mm": 0.09,
-        "turret_slot": 6,
-        "desc": "100x High-NA Oil Objective (Oil, NA 1.40)"
+        "desc": "100x Objective (Oil, NA 1.40)"
     }
 }
 
@@ -184,17 +172,16 @@ class WellPlateFormat:
         self.a1_offset_y: float = cfg["a1_offset_y"]
 
     def get_well_name(self, row_idx: int, col_idx: int) -> str:
-        row_str = chr(ord('A') + row_idx)
-        col_str = str(col_idx + 1)
-        return f"{row_str}{col_str}"
+        if not (0 <= row_idx < self.rows and 0 <= col_idx < self.cols):
+            raise IndexError(f"Well index ({row_idx}, {col_idx}) out of bounds")
+        return f"{chr(ord('A') + row_idx)}{col_idx + 1}"
 
     def parse_well_name(self, well_name: str) -> Tuple[int, int]:
-        well_name = well_name.strip().upper()
-        match = re.match(r"([A-Za-z]+)(\d+)", well_name)
+        match = re.match(r"([A-Za-z]+)(\d+)", well_name.strip().upper())
         if not match:
             raise ValueError(f"Invalid well name: {well_name}")
         r_str, c_str = match.groups()
-        row_idx = ord(r_str.upper()) - ord('A')
+        row_idx = ord(r_str) - ord('A')
         col_idx = int(c_str) - 1
         return row_idx, col_idx
 
@@ -253,17 +240,16 @@ class NavigatorPlateCalibration:
 
 
 class FocusPoint:
-    def __init__(self, x: float, y: float, z: float, pt_type: str = "auto", label: str = ""):
-        self.x_stage: float = x
-        self.y_stage: float = y
-        self.z_stage: float = z
-        self.z_primary: float = z
-        self.pt_type: str = pt_type
-        self.label: str = label
+    def __init__(self, x_stage: float, y_stage: float, z_primary: float = 0.0, point_type: str = "SET"):
+        self.x_stage = x_stage
+        self.y_stage = y_stage
+        self.z_primary = z_primary
+        self.point_type = point_type
 
 
 class FocusMap:
     SUPPORTED_PRIMARY_CHANNELS = ["Brightfield", "Phase", "Darkfield", "Blue", "Green", "Red"]
+    SUPPORTED_BINNING_MODES = ["1x1", "2x2", "4x4", "8x8"]
 
     def __init__(self):
         self.primary_af_channel: str = "Brightfield"
@@ -278,7 +264,7 @@ class FocusMap:
         self.timelapse_interval_mins: float = 10.0
         self.timelapse_total_cycles: int = 24
 
-        self.active_objective_preset: str = "20x Air"
+        self.selected_objective: str = "20x Air"
         self.lens_na: float = 0.45
         self.lens_mag: float = 20.0
         self.wavelength_nm: float = 525.0
@@ -288,24 +274,15 @@ class FocusMap:
         self.set_points: List[FocusPoint] = []
         self.channel_chromatic_offsets_mm: Dict[str, float] = {ch: 0.0 for ch in self.SUPPORTED_PRIMARY_CHANNELS}
         self.accepted_channels: Dict[str, bool] = {ch: True for ch in self.SUPPORTED_PRIMARY_CHANNELS}
-        self.plane_params: Optional[Tuple[float, float, float]] = None
-
-    @property
-    def selected_objective(self) -> str:
-        return self.active_objective_preset
-
-    @selected_objective.setter
-    def selected_objective(self, val: str):
-        self.set_objective_preset(val)
 
     @property
     def fov_width_mm(self) -> float:
-        preset = OBJECTIVE_PRESETS.get(self.active_objective_preset, OBJECTIVE_PRESETS["20x Air"])
+        preset = OBJECTIVE_PRESETS.get(self.selected_objective, OBJECTIVE_PRESETS["20x Air"])
         return float(preset["fov_width_mm"])
 
     @property
     def fov_height_mm(self) -> float:
-        preset = OBJECTIVE_PRESETS.get(self.active_objective_preset, OBJECTIVE_PRESETS["20x Air"])
+        preset = OBJECTIVE_PRESETS.get(self.selected_objective, OBJECTIVE_PRESETS["20x Air"])
         return float(preset["fov_height_mm"])
 
     @property
@@ -318,7 +295,7 @@ class FocusMap:
 
     def set_objective_preset(self, preset_name: str):
         if preset_name in OBJECTIVE_PRESETS:
-            self.active_objective_preset = preset_name
+            self.selected_objective = preset_name
             cfg = OBJECTIVE_PRESETS[preset_name]
             self.lens_mag = float(cfg.get("mag", cfg.get("magnification", 20.0)))
             self.lens_na = float(cfg.get("na", 0.45))
@@ -342,8 +319,9 @@ class FocusMap:
             self.primary_af_channel = channel_name
 
     def set_af_camera_config(self, binning: str, exposure_ms: float):
-        self.af_binning = binning
-        self.af_exposure_ms = max(1.0, float(exposure_ms))
+        if binning in self.SUPPORTED_BINNING_MODES:
+            self.af_binning = binning
+        self.af_exposure_ms = max(0.1, exposure_ms)
 
     def set_af_cycle_interval(self, cycle_interval: int):
         self.af_cycle_interval = max(1, int(cycle_interval))
@@ -354,19 +332,14 @@ class FocusMap:
         self.timelapse_total_cycles = max(1, int(cycles))
 
     def set_master_auto_point(self, x_stage: float, y_stage: float, z_primary: float):
-        self.master_auto_point = FocusPoint(x_stage, y_stage, z_primary, pt_type='AUTO')
-
-    def add_set_point(self, x_stage: float, y_stage: float, z_primary: float) -> FocusPoint:
-        pt = FocusPoint(x_stage, y_stage, z_primary, pt_type='SET')
-        self.set_points.append(pt)
-        return pt
+        self.master_auto_point = FocusPoint(x_stage, y_stage, z_primary, point_type="AUTO")
 
     def set_chromatic_z_offset(self, channel_name: str, z_channel_val: float):
         if self.master_auto_point is not None:
-            self.channel_chromatic_offsets_mm[channel_name] = z_channel_val - self.master_auto_point.z_stage
+            self.channel_chromatic_offsets_mm[channel_name] = z_channel_val - self.master_auto_point.z_primary
 
     def interpolate_z(self, x_stage: float, y_stage: float, channel_name: str = "Brightfield") -> float:
-        base_z = self.master_auto_point.z_stage if self.master_auto_point else 0.0
+        base_z = self.master_auto_point.z_primary if self.master_auto_point else 0.0
         chromatic_offset = self.channel_chromatic_offsets_mm.get(channel_name, 0.0)
         return float(base_z + chromatic_offset)
 
@@ -381,20 +354,19 @@ class TileSquareFOV:
 
 
 class TiledFOVGroup:
-    def __init__(self, well_name: str, row_idx: int = 0, col_idx: int = 0, grid_rows: int = 1, grid_cols: int = 1):
+    def __init__(self, well_name: str, row_idx: int = 0, col_idx: int = 0, rows: int = 1, cols: int = 1, fov_w_mm: float = 0.6, fov_h_mm: float = 0.45):
         self.well_name = well_name
         self.row_idx = row_idx
         self.col_idx = col_idx
-        self.grid_rows = grid_rows
-        self.grid_cols = grid_cols
+        self.grid_rows = rows
+        self.grid_cols = cols
+        self.fov_width_mm = fov_w_mm
+        self.fov_height_mm = fov_h_mm
         self.single_af_per_tiled_area = True
-
-        self.fov_width_mm = 0.60
-        self.fov_height_mm = 0.45
         self.tiles: List[TileSquareFOV] = []
-        self.generate_tiles()
+        self._generate_tiles()
 
-    def generate_tiles(self):
+    def _generate_tiles(self):
         self.tiles.clear()
         total_w = self.grid_cols * self.fov_width_mm
         total_h = self.grid_rows * self.fov_height_mm
@@ -415,18 +387,8 @@ class PlateFOVManager:
         self.plate_format = plate_format
         self.calibration = calibration
         self.focus_map = focus_map
-
         self.selected_wells: Set[str] = set()
         self.tiled_groups: Dict[str, TiledFOVGroup] = {}
-        self.default_grid_rows: int = 1
-        self.default_grid_cols: int = 1
-        self.default_single_af: bool = True
-
-    def set_grid_dimensions(self, rows: int, cols: int, single_af: bool = True):
-        self.default_grid_rows = min(12, max(1, rows))
-        self.default_grid_cols = min(12, max(1, cols))
-        self.default_single_af = single_af
-        self._rebuild_all_groups()
 
     def toggle_well_selected(self, well_name: str) -> bool:
         if well_name in self.selected_wells:
@@ -437,11 +399,7 @@ class PlateFOVManager:
         else:
             self.selected_wells.add(well_name)
             r_idx, c_idx = self.plate_format.parse_well_name(well_name)
-            group = TiledFOVGroup(well_name, r_idx, c_idx, self.default_grid_rows, self.default_grid_cols)
-            group.fov_width_mm = self.focus_map.fov_width_mm
-            group.fov_height_mm = self.focus_map.fov_height_mm
-            group.generate_tiles()
-            self.tiled_groups[well_name] = group
+            self.tiled_groups[well_name] = TiledFOVGroup(well_name, r_idx, c_idx, 1, 1, self.focus_map.fov_width_mm, self.focus_map.fov_height_mm)
             return True
 
     def select_all_wells(self):
@@ -455,17 +413,10 @@ class PlateFOVManager:
         self.selected_wells.clear()
         self.tiled_groups.clear()
 
-    def apply_channels_to_all_selected(self, channels: List[str]):
-        pass
-
     def _rebuild_all_groups(self):
         for w_name in list(self.selected_wells):
             r_idx, c_idx = self.plate_format.parse_well_name(w_name)
-            group = TiledFOVGroup(w_name, r_idx, c_idx, self.default_grid_rows, self.default_grid_cols)
-            group.fov_width_mm = self.focus_map.fov_width_mm
-            group.fov_height_mm = self.focus_map.fov_height_mm
-            group.generate_tiles()
-            self.tiled_groups[w_name] = group
+            self.tiled_groups[w_name] = TiledFOVGroup(w_name, r_idx, c_idx, 1, 1, self.focus_map.fov_width_mm, self.focus_map.fov_height_mm)
 
 
 class ExperimentProtocol:
@@ -486,7 +437,6 @@ class ExperimentProtocol:
             })
         return {
             "num_wells": plate_format.num_wells,
-            "selected_wells_count": len(protocol_wells),
             "total_selected_wells": len(protocol_wells),
             "wells": protocol_wells
         }
