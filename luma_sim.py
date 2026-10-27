@@ -1,5 +1,5 @@
 """
-luma_sim.py - Offline Hardware Simulator for LumaViewPro 4.0.0-beta.
+luma_sim.py - Offline Hardware Simulator for LumaViewPro 4.0.0-beta
 
 Mocks camera acquisition (pyloncamera) and stage motion (motorboard / ledboard)
 with real-time synthetic cell colony generation across multi-well microplates.
