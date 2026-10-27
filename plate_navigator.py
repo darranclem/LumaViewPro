@@ -3,9 +3,9 @@ plate_navigator.py - Modular Plate Navigator & Microplate Registration Studio fo
 
 Provides:
 - InteractiveScaledPlateCanvas: Physically accurate microplate canvas with Top-Left A1 orientation,
-  bright 6-point target calibration overlays, step numbers, and double-click stage navigation anywhere on plate.
+  bright target calibration overlays, cyan active FOV reticle box, red center dot, and double-click stage navigation.
 - ZoomPanCameraWidget: Interactive live camera viewport with mouse wheel zooming, right-click panning,
-  center reticle crosshairs, and double-click pixel centering.
+  reticle crosshairs overlay, and double-click pixel stage centering.
 - PlateNavigatorPopup: Modal studio window with single-child content architecture.
 - attach_navigator_to_lumaviewpro(): Bridge attaching data models and handlers to any LumaViewPro instance.
 """
@@ -32,7 +32,6 @@ kivy.require('2.0.0')
 
 from kivy.app import App
 from kivy.lang import Builder
-from kivy.clock import Clock
 from kivy.graphics.texture import Texture
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.gridlayout import GridLayout
@@ -48,7 +47,7 @@ from kivy.graphics import Color, Ellipse, Line, Rectangle, PushMatrix, PopMatrix
 from kivy.properties import StringProperty, BooleanProperty, NumericProperty, ObjectProperty, ListProperty
 
 # Load plate_navigator.kv layout safely exactly once
-_kv_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'plate_navigator.kv')
+_kv_file = os.path.join(script_dir, 'plate_navigator.kv')
 if os.path.exists(_kv_file) and _kv_file not in Builder.files:
     try:
         Builder.load_file(_kv_file)
@@ -60,10 +59,9 @@ class ZoomPanCameraWidget(Widget):
     """
     Interactive Live Camera Viewport Widget supporting:
     - NumPy image frame conversion via set_frame(frame_array)
-    - Mouse Wheel Zooming (Zoom In / Zoom Out)
-    - Right-Click Drag Panning in X and Y
     - Center Reticle Crosshairs Overlay
-    - Double-Click Pixel Centering (jogs stage so clicked point moves to reticle center)
+    - Mouse Wheel Zooming & Right-Click Drag Panning
+    - Double-Click Pixel Stage Centering
     """
     zoom_level = NumericProperty(1.0)
     pan_x = NumericProperty(0.0)
@@ -95,11 +93,12 @@ class ZoomPanCameraWidget(Widget):
             else:
                 rgb_buf = frame_array[:, :, :3]
 
-            texture = Texture.create(size=(w, h), colorfmt='rgb')
-            texture.blit_buffer(rgb_buf.tobytes(), colorfmt='rgb', bufferfmt='ubyte')
-            texture.flip_vertical()
+            buf = np.ascontiguousarray(rgb_buf[::-1, :, :], dtype=np.uint8).tobytes()
 
-            self.current_texture = texture
+            if self.current_texture is None or self.current_texture.width != w or self.current_texture.height != h:
+                self.current_texture = Texture.create(size=(w, h), colorfmt='rgb')
+
+            self.current_texture.blit_buffer(buf, colorfmt='rgb', bufferfmt='ubyte')
             self.redraw_viewport()
         except Exception as e:
             print(f"[ZoomPanCameraWidget set_frame error] {e}")
@@ -131,13 +130,13 @@ class ZoomPanCameraWidget(Widget):
                 Color(1.0, 1.0, 1.0, 1.0)
                 Rectangle(texture=self.current_texture, pos=(draw_x, draw_y), size=(draw_w, draw_h))
             else:
-                Color(0.2, 0.2, 0.25, 1.0)
+                Color(0.12, 0.14, 0.18, 1.0)
                 Rectangle(pos=self.pos, size=self.size)
 
             # Draw Center Reticle Crosshairs Overlay
             cx = self.x + self.width / 2.0
             cy = self.y + self.height / 2.0
-            Color(1.0, 0.2, 0.2, 0.85)  # Bright Red Crosshairs
+            Color(1.0, 0.2, 0.2, 0.8) # Bright Red Crosshairs
             Line(points=[cx - 20, cy, cx + 20, cy], width=1.5)
             Line(points=[cx, cy - 20, cx, cy + 20], width=1.5)
             Line(circle=(cx, cy, 8), width=1.2)
@@ -148,24 +147,10 @@ class ZoomPanCameraWidget(Widget):
 
         # Double-click pixel centering in live viewport
         if touch.is_double_tap and touch.button == 'left':
-            center_x = self.x + self.width / 2.0
-            center_y = self.y + self.height / 2.0
-            dx_px = touch.x - center_x
-            dy_px = touch.y - center_y
-
             app = App.get_running_app()
-            if app and hasattr(app, 'focus_map'):
-                fov_w = getattr(app.focus_map, 'fov_width_mm', 0.60)
-                fov_h = getattr(app.focus_map, 'fov_height_mm', 0.45)
-                scale_x = fov_w / float(self.width)
-                scale_y = fov_h / float(self.height)
-
-                dx_mm = dx_px * scale_x
-                dy_mm = dy_px * scale_y  # Double click above center (+y in Kivy) moves stage +Y
-
-                if hasattr(app, 'jog_stage'):
-                    app.jog_stage(dx_mm, dy_mm, 0.0)
-                return True
+            if app and hasattr(app, 'center_fov_on_pixel'):
+                app.center_fov_on_pixel(self, touch.x, touch.y)
+            return True
 
         if touch.is_mouse_scrolling:
             if touch.button == 'scrolldown':
@@ -203,7 +188,6 @@ class InteractiveScaledPlateCanvas(Widget):
     Custom Kivy canvas widget rendering a physically accurate representation
     of the labware plate based on ANSI/SLAS standards and 2D Affine calibration matrix.
     Orientation: Well A1 is positioned at the TOP-LEFT corner.
-    Features DOUBLE-CLICK navigation anywhere on physical plate map!
     """
 
     def __init__(self, **kwargs):
@@ -280,7 +264,50 @@ class InteractiveScaledPlateCanvas(Widget):
                         Color(0.35, 0.38, 0.45, 1.0)
                         Line(ellipse=(wx_px - well_r_px, wy_px - well_r_px, 2 * well_r_px, 2 * well_r_px), width=1.0)
 
-            # Draw Active Microscope Stage FOV Reticle Indicator (Cyan box + Red center dot)
+                    # Tiled FOV Overlay
+                    if is_selected and w_name in self.fov_manager.tiled_groups:
+                        group = self.fov_manager.tiled_groups[w_name]
+                        Color(1.0, 0.8, 0.2, 0.8)
+                        for tile in group.tiles:
+                            tx_px = wx_px + tile.offset_x_mm * scale
+                            ty_px = wy_px - tile.offset_y_mm * scale
+                            tw_px = max(1.0, group.fov_width_mm * scale * 0.35)
+                            th_px = max(1.0, group.fov_height_mm * scale * 0.35)
+                            Line(rectangle=(tx_px - tw_px/2, ty_px - th_px/2, tw_px, th_px), width=1.0)
+
+            # Calibration Target Overlays (Yellow/Green)
+            cal_steps = self.calibration.CALIBRATION_STEPS
+            for idx, step_info in enumerate(cal_steps):
+                step_id = step_info["id"]
+                is_recorded = step_id in self.calibration.recorded_points
+                is_active = (idx == self.calibration.current_step_index) and not self.calibration.is_calibrated
+
+                tx_px, ty_px = self._get_step_target_px(step_id, offset_x, offset_y, scale)
+
+                if is_recorded:
+                    Color(0.2, 0.9, 0.3, 1.0)
+                    Ellipse(pos=(tx_px - 6, ty_px - 6), size=(12, 12))
+                    Line(circle=(tx_px, ty_px, 10), width=1.5)
+                elif is_active:
+                    Color(1.0, 0.9, 0.1, 1.0)
+                    Ellipse(pos=(tx_px - 8, ty_px - 8), size=(16, 16))
+                    Line(circle=(tx_px, ty_px, 12), width=1.8)
+                    Line(circle=(tx_px, ty_px, 5), width=1.0)
+                else:
+                    Color(0.6, 0.6, 0.2, 0.5)
+                    Ellipse(pos=(tx_px - 4, ty_px - 4), size=(8, 8))
+
+            # Master Auto Focus Point (Red)
+            if self.focus_map.master_auto_point is not None:
+                pt = self.focus_map.master_auto_point
+                ax_px = offset_x + (pt.x_stage + plate_w_mm / 2.0) * scale
+                ay_px = offset_y - (plate_h_mm / 2.0 - pt.y_stage) * scale
+                Color(1.0, 0.1, 0.1, 1.0)
+                Ellipse(pos=(ax_px - 6, ay_px - 6), size=(12, 12))
+                Color(1.0, 0.5, 0.5, 1.0)
+                Line(circle=(ax_px, ay_px, 10), width=1.5)
+
+            # Draw Active Stage Position Indicator (Cyan FOV Box + Red Center Dot)
             app = App.get_running_app()
             if app and hasattr(app, 'stage_x') and hasattr(app, 'stage_y'):
                 sx_px = offset_x + (app.stage_x + plate_w_mm / 2.0) * scale
@@ -291,7 +318,7 @@ class InteractiveScaledPlateCanvas(Widget):
                 fov_w_px = max(6.0, fov_w_mm * scale)
                 fov_h_px = max(4.0, fov_h_mm * scale)
 
-                # Cyan active FOV box
+                # Cyan FOV box
                 Color(0.0, 0.9, 1.0, 0.9)
                 Line(rectangle=(sx_px - fov_w_px / 2.0, sy_px - fov_h_px / 2.0, fov_w_px, fov_h_px), width=1.5)
                 # Red stage center point
@@ -340,42 +367,47 @@ class InteractiveScaledPlateCanvas(Widget):
         scale_y = (self.height - 2 * margin) / draw_h
         scale = min(scale_x, scale_y)
 
-        draw_w_px = draw_w * scale
-        draw_h_px = draw_h * scale
-
-        offset_x = self.x + (self.width - draw_w_px) / 2.0
-        offset_y = self.y + (self.height + draw_h_px) / 2.0
+        offset_x = self.x + (self.width - draw_w * scale) / 2.0
+        offset_y = self.y + (self.height + draw_h) / 2.0
 
         app = App.get_running_app()
 
-        # Handle double-click ANYWHERE on drawn microplate footprint to move stage FOV center directly there
-        if offset_x <= touch.x <= offset_x + draw_w_px and offset_y - draw_h_px <= touch.y <= offset_y:
-            click_rel_x_mm = (touch.x - offset_x) / scale
-            click_rel_y_mm = (offset_y - touch.y) / scale
+        # Handle Double-Click Stage Navigation Anywhere on Plate Template
+        if touch.is_double_tap:
+            clicked_mm_x = (touch.x - offset_x) / scale
+            clicked_mm_y = (offset_y - touch.y) / scale
 
-            target_stage_x = -draw_w / 2.0 + click_rel_x_mm
-            target_stage_y = +draw_h / 2.0 - click_rel_y_mm
+            # Convert to stage coordinates (0,0 is center of plate)
+            target_x = clicked_mm_x - draw_w / 2.0
+            target_y = draw_h / 2.0 - clicked_mm_y
 
-            if touch.is_double_tap:
-                if app and hasattr(app, 'jog_stage_to'):
-                    app.jog_stage_to(target_stage_x, target_stage_y)
-                self.redraw_canvas()
-                return True
+            if app and hasattr(app, 'jog_stage_to'):
+                app.jog_stage_to(target_x, target_y)
+            elif app and hasattr(app, 'stage_x'):
+                cx, cy, _ = app.clamp_stage_position(target_x, target_y)
+                app.stage_x = cx
+                app.stage_y = cy
+                app.root_layout.stage_coord_str = f"Stage: X={cx:.2f}, Y={cy:.2f}, Z={app.stage_z:.3f} mm"
+                app.update_active_well_display()
+                app.update_live_feed(0)
 
-            # Single tap inside well circle toggles well selection
-            for r in range(self.plate_format.rows):
-                for c in range(self.plate_format.cols):
-                    x_nom, y_nom = self.plate_format.get_nominal_position(r, c)
-                    wx_px = offset_x + (self.plate_format.a1_offset_x + x_nom) * scale
-                    wy_px = offset_y - (self.plate_format.a1_offset_y + y_nom) * scale
-                    well_r_px = max(2.0, (self.plate_format.well_diameter / 2.0) * scale)
+            self.redraw_canvas()
+            return True
 
-                    dist = math.hypot(touch.x - wx_px, touch.y - wy_px)
-                    if dist <= well_r_px:
-                        w_name = self.plate_format.get_well_name(r, c)
-                        self.fov_manager.toggle_well_selected(w_name)
-                        self.redraw_canvas()
-                        return True
+        # Single tap: toggle well selection
+        for r in range(self.plate_format.rows):
+            for c in range(self.plate_format.cols):
+                x_nom, y_nom = self.plate_format.get_nominal_position(r, c)
+                wx_px = offset_x + (self.plate_format.a1_offset_x + x_nom) * scale
+                wy_px = offset_y - (self.plate_format.a1_offset_y + y_nom) * scale
+                well_r_px = max(2.0, (self.plate_format.well_diameter / 2.0) * scale)
+
+                dist = math.hypot(touch.x - wx_px, touch.y - wy_px)
+                if dist <= well_r_px:
+                    w_name = self.plate_format.get_well_name(r, c)
+                    self.fov_manager.toggle_well_selected(w_name)
+                    self.redraw_canvas()
+                    return True
 
         return super().on_touch_down(touch)
 

@@ -1,12 +1,12 @@
+from __future__ import annotations
 """
 luma_sim.py - Offline Hardware Simulator for LumaViewPro 4.0.0-beta
 
-Mocks camera acquisition (pyloncamera), stage motion (motorboard), and illumination (ledboard)
-with real-time synthetic cell colony generation across SBS microplates.
-Enables offline desktop development and testing of LumaViewPro without physical hardware.
+Mocks camera acquisition (pyloncamera) and stage motion (motorboard / ledboard)
+with real-time synthetic cell colony generation across SBS 96-well microplates.
+Enables offline desktop development and testing of LumaViewPro and Plate Navigator without physical hardware.
 """
 
-from __future__ import annotations
 import sys
 import os
 import types
@@ -17,16 +17,15 @@ if script_dir not in sys.path:
 
 import image_utils
 
-print("[LumaViewPro Simulator] Initializing offline hardware & synthetic camera mocks...")
+print("[LumaViewPro Simulator] Initializing offline hardware & camera mocks...")
 
 
 class MockCamera:
     def __init__(self):
         self.is_connected = True
-        self.is_live = True
-        self.is_light_on = False  # Default launch state: Light OFF (dark camera feed)
-        self.exposure_ms = 20.0
+        self.exposure_ms = 100.0
         self.gain = 1.0
+        self.is_light_on = False  # Starts OFF (black window) by default
         self.led_power = 100.0
         self.active_channel = "Brightfield"
         self.stage_x = -49.5  # Well A1 default
@@ -40,21 +39,6 @@ class MockCamera:
     def disconnect(self):
         pass
 
-    def set_exposure(self, exp: float):
-        self.exposure_ms = float(exp)
-
-    def set_gain(self, g: float):
-        self.gain = float(g)
-
-    def set_led_power(self, power: float):
-        self.led_power = float(power)
-
-    def set_channel(self, channel_name: str):
-        self.active_channel = channel_name
-
-    def set_stage_position(self, x: float, y: float, z: float):
-        self.stage_x, self.stage_y, self.stage_z = x, y, z
-
     def get_frame(self):
         return image_utils.generate_well_plate_cell_frame(
             stage_x=self.stage_x,
@@ -63,11 +47,26 @@ class MockCamera:
             best_z=self.best_z,
             channel=self.active_channel,
             is_light_on=self.is_light_on,
+            led_power=self.led_power,
             exposure_ms=self.exposure_ms,
             gain=self.gain,
-            led_power=self.led_power,
             sensor_size=(512, 512)
         )
+
+    def set_exposure(self, exp: float):
+        self.exposure_ms = exp
+
+    def set_gain(self, g: float):
+        self.gain = g
+
+    def set_light_on(self, on: bool):
+        self.is_light_on = on
+
+    def set_led_power(self, power: float):
+        self.led_power = power
+
+    def set_channel(self, channel: str):
+        self.active_channel = channel
 
 
 mock_pylon = types.ModuleType("pyloncamera")
@@ -105,13 +104,15 @@ class MockLEDBoard:
     def __init__(self):
         self.active_channel = "Brightfield"
         self.power = 100
+        self.is_on = False
 
     def set_led(self, channel: str, power: int):
         self.active_channel = channel
         self.power = power
+        self.is_on = True
 
     def off(self):
-        self.power = 0
+        self.is_on = False
 
 
 mock_led = types.ModuleType("ledboard")

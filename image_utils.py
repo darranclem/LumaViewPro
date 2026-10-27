@@ -10,10 +10,9 @@ import numpy as np
 import math
 from typing import Optional, Tuple, Union, Dict, List
 
-# Pre-computed cell colony coordinate cache for fast live simulation
-_WELL_CELLS_CACHE: Dict[int, Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray, np.ndarray]]] = {}
-_WELL_GRID_CACHE: Dict[int, Tuple[List[Tuple[float, float, int, int, str]], Tuple[int, int, float, float, float, float, float]]] = {}
-_DARK_NOISE_FRAME: Optional[np.ndarray] = None
+# Pre-computed cell colony coordinate cache for fast live simulation (20 FPS)
+_CELL_COORDINATES_CACHE: Dict[int, Dict[str, object]] = {}
+_DARK_FRAME_CACHE: Optional[np.ndarray] = None
 
 
 def load_image(filepath: str) -> Optional[np.ndarray]:
@@ -101,9 +100,10 @@ def compute_focus_score(img: np.ndarray, method: str = "laplacian") -> float:
         return float(np.var(lap))
 
 
-def _get_cached_plate_grid(num_wells: int = 96):
-    if num_wells in _WELL_GRID_CACHE:
-        return _WELL_GRID_CACHE[num_wells]
+def _get_cached_cell_positions(num_wells: int = 96):
+    if num_wells in _CELL_COORDINATES_CACHE:
+        d = _CELL_COORDINATES_CACHE[num_wells]
+        return d["by_well"], d["wells"], d["params"]
 
     well_formats = {
         6: (2, 3, 39.12, 39.12, 34.8, -39.12, 19.56),
@@ -113,12 +113,10 @@ def _get_cached_plate_grid(num_wells: int = 96):
         96: (8, 12, 9.0, 9.0, 6.4, -49.5, 31.5),
         384: (16, 24, 4.5, 4.5, 3.8, -51.75, 33.75)
     }
-    params = well_formats.get(num_wells, well_formats[96])
-    rows, cols, pitch_x, pitch_y, well_diameter, a1_x, a1_y = params
-    well_radius_mm = well_diameter / 2.0
+    rows, cols, pitch_x, pitch_y, well_diameter, a1_x, a1_y = well_formats.get(num_wells, well_formats[96])
 
     wells = []
-    cell_dict = {}
+    by_well = {}
 
     np.random.seed(42 + num_wells)
     for r in range(rows):
@@ -128,34 +126,24 @@ def _get_cached_plate_grid(num_wells: int = 96):
             w_name = f"{chr(65+r)}{c+1}"
             wells.append((wx, wy, r, c, w_name))
 
-            # Cellular colony & organelle distribution inside each well
-            num_cells = 300
+            num_cells = np.random.randint(25, 55)
             angles = np.random.uniform(0, 2 * np.pi, num_cells)
-            radii = np.random.uniform(0, well_radius_mm * 0.92, num_cells)
+            radii = np.random.uniform(0, pitch_x * 0.32, num_cells)
             cx = wx + radii * np.cos(angles)
             cy = wy + radii * np.sin(angles)
-            cr = np.random.uniform(0.018, 0.040, num_cells)  # Cell radius in mm
+            cr = np.random.uniform(0.015, 0.035, num_cells)
 
-            cell_dict[(r, c)] = (
+            by_well[(r, c)] = (
                 cx.astype(np.float32),
                 cy.astype(np.float32),
                 cr.astype(np.float32)
             )
 
-    _WELL_GRID_CACHE[num_wells] = (wells, params)
-    _WELL_CELLS_CACHE[num_wells] = cell_dict
-    return wells, params
-
-
-def generate_disconnected_camera_frame(sensor_size: Tuple[int, int] = (512, 512)) -> np.ndarray:
-    """Generates a high-contrast CAMERA DISCONNECTED warning frame when USB camera is not attached."""
-    w, h = sensor_size
-    frame = np.zeros((h, w, 3), dtype=np.uint8)
-    cv2.rectangle(frame, (15, 15), (w - 15, h - 15), (35, 30, 80), -1)
-    cv2.rectangle(frame, (15, 15), (w - 15, h - 15), (80, 80, 220), 2)
-    cv2.putText(frame, "CAMERA DISCONNECTED", (w // 2 - 160, h // 2 - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 255), 2)
-    cv2.putText(frame, "Microscope Stage & Focus Active", (w // 2 - 140, h // 2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 220), 1)
-    return frame
+    params = (rows, cols, pitch_x, pitch_y, well_diameter, a1_x, a1_y)
+    _CELL_COORDINATES_CACHE[num_wells] = {
+        "by_well": by_well, "wells": wells, "params": params
+    }
+    return by_well, wells, params
 
 
 def generate_well_plate_cell_frame(
@@ -167,33 +155,29 @@ def generate_well_plate_cell_frame(
     exposure_ms: float = 20.0,
     gain: float = 1.0,
     led_power: float = 100.0,
-    is_light_on: bool = False,
+    is_light_on: bool = True,
     fov_size_mm: Tuple[float, float] = (0.60, 0.45),
     num_wells: int = 96,
     sensor_size: Tuple[int, int] = (512, 512),
     **kwargs
 ) -> np.ndarray:
     """
-    Optically realistic synthetic camera frame generator:
-    - Light OFF: Dark sensor Poisson noise
-    - Light ON:
-      1. Inter-well plastic deck surface with structural molding grid lines
-      2. Outer plate skirt boundaries & metal stage frame edges when approaching physical bounds
-      3. High-contrast double-ring well wall rims
-      4. Rich internal cellular colony structures (cytoplasm, nuclei, membrane borders)
-      5. Z-focus Gaussian defocus blur
+    Generates synthetic high-resolution camera frames with ultra-fast OpenCV rendering.
+    - Outside well rims: 0 intensity (pure black plastic background)
+    - Inside wells: filled background + cell colonies + well rim borders
+    - Dark launch state: low Poisson sensor noise
     """
-    global _DARK_NOISE_FRAME
+    global _DARK_FRAME_CACHE
     w, h = sensor_size
 
-    # 1. Dark Launch / Light OFF State (returns dark sensor noise)
+    # 1. Dark Launch / Light OFF State (returns dark sensor noise instantaneously - 0.001 ms CPU time)
     if not is_light_on or led_power <= 0:
-        if _DARK_NOISE_FRAME is None or _DARK_NOISE_FRAME.shape != (h, w, 3):
+        if _DARK_FRAME_CACHE is None or _DARK_FRAME_CACHE.shape != (h, w, 3):
             np.random.seed(0)
-            _DARK_NOISE_FRAME = np.random.poisson(lam=2.5, size=(h, w, 3)).clip(0, 255).astype(np.uint8)
-        return _DARK_NOISE_FRAME
+            _DARK_FRAME_CACHE = np.random.poisson(lam=2.5, size=(h, w, 3)).clip(0, 255).astype(np.uint8)
+        return _DARK_FRAME_CACHE
 
-    # 2. Light ON State: Calculate illumination brightness
+    # 2. Light ON State: Calculate brightness factor
     brightness = max(0.1, min(3.0, (exposure_ms / 20.0) * (led_power / 100.0) * gain))
 
     fov_w, fov_h = fov_size_mm
@@ -201,147 +185,77 @@ def generate_well_plate_cell_frame(
     fov_h = max(0.05, float(fov_h))
 
     px_per_mm_x = w / fov_w
-    px_per_mm_y = h / fov_h
 
     fov_left = stage_x - fov_w / 2.0
     fov_right = stage_x + fov_w / 2.0
     fov_bottom = stage_y - fov_h / 2.0
     fov_top = stage_y + fov_h / 2.0
 
-    wells, (rows, cols, pitch_x, pitch_y, well_diameter, a1_x, a1_y) = _get_cached_plate_grid(num_wells)
-    cell_dict = _WELL_CELLS_CACHE[num_wells]
+    by_well, wells, (rows, cols, pitch_x, pitch_y, well_diameter, a1_x, a1_y) = _get_cached_cell_positions(num_wells)
     well_r_mm = well_diameter / 2.0
 
     ch_l = channel.lower()
 
-    # Determine Base Background Color, Cell Color, Nucleus Color & Rim Color (BGR)
+    # Determine Base Background Color & LUT (BGR format)
     if "blue" in ch_l or "dapi" in ch_l:
-        bg_color = np.array([25, 10, 5], dtype=np.float32)
-        cell_color = np.array([255, 180, 40], dtype=np.float32)
-        nuc_color = np.array([255, 240, 160], dtype=np.float32)
-        rim_color = np.array([140, 70, 30], dtype=np.float32)
-        deck_color = np.array([12, 5, 2], dtype=np.float32)
+        bg_color = np.array([25, 8, 4], dtype=np.float32)
+        cell_color = np.array([255, 180, 40], dtype=np.float32)  # Pure Blue
+        rim_color = np.array([120, 60, 20], dtype=np.float32)
     elif "green" in ch_l or "fitc" in ch_l or "gfp" in ch_l:
-        bg_color = np.array([10, 22, 5], dtype=np.float32)
-        cell_color = np.array([40, 245, 60], dtype=np.float32)
-        nuc_color = np.array([180, 255, 180], dtype=np.float32)
-        rim_color = np.array([30, 130, 40], dtype=np.float32)
-        deck_color = np.array([5, 12, 2], dtype=np.float32)
+        bg_color = np.array([8, 20, 4], dtype=np.float32)
+        cell_color = np.array([40, 240, 60], dtype=np.float32)   # Pure Green
+        rim_color = np.array([40, 120, 40], dtype=np.float32)
     elif "red" in ch_l or "txred" in ch_l or "mcherry" in ch_l or "cy5" in ch_l:
-        bg_color = np.array([5, 5, 22], dtype=np.float32)
-        cell_color = np.array([20, 30, 255], dtype=np.float32)
-        nuc_color = np.array([160, 180, 255], dtype=np.float32)
-        rim_color = np.array([30, 40, 130], dtype=np.float32)
-        deck_color = np.array([2, 2, 12], dtype=np.float32)
+        bg_color = np.array([4, 4, 20], dtype=np.float32)
+        cell_color = np.array([20, 30, 255], dtype=np.float32)   # Pure Red
+        rim_color = np.array([30, 40, 120], dtype=np.float32)
     elif "darkfield" in ch_l or "df" in ch_l:
-        bg_color = np.array([18, 18, 22], dtype=np.float32)
+        bg_color = np.array([15, 15, 20], dtype=np.float32)      # Darkfield
         cell_color = np.array([220, 220, 240], dtype=np.float32)
-        nuc_color = np.array([255, 255, 255], dtype=np.float32)
         rim_color = np.array([180, 180, 200], dtype=np.float32)
-        deck_color = np.array([10, 10, 12], dtype=np.float32)
     elif "phase" in ch_l:
-        bg_color = np.array([175, 175, 180], dtype=np.float32)
+        bg_color = np.array([175, 175, 180], dtype=np.float32)   # Phase Contrast
         cell_color = np.array([45, 45, 50], dtype=np.float32)
-        nuc_color = np.array([220, 220, 230], dtype=np.float32)
-        rim_color = np.array([90, 90, 100], dtype=np.float32)
-        deck_color = np.array([60, 60, 65], dtype=np.float32)
-    else:  # Brightfield
-        bg_color = np.array([225, 225, 225], dtype=np.float32)
-        cell_color = np.array([60, 60, 70], dtype=np.float32)
-        nuc_color = np.array([25, 25, 30], dtype=np.float32)
         rim_color = np.array([100, 100, 110], dtype=np.float32)
-        deck_color = np.array([80, 80, 85], dtype=np.float32)
+    else:  # Brightfield
+        bg_color = np.array([220, 220, 220], dtype=np.float32)   # Brightfield Grayscale
+        cell_color = np.array([55, 55, 65], dtype=np.float32)
+        rim_color = np.array([110, 110, 120], dtype=np.float32)
 
-    # Base deck frame
-    deck_c = tuple(float(x) for x in np.clip(deck_color * brightness, 0, 255))
-    frame = np.full((h, w, 3), deck_c, dtype=np.float32)
+    # Frame starts as 0 intensity (pure black plastic between wells)
+    frame = np.zeros((h, w, 3), dtype=np.float32)
 
     bg_c = tuple(float(x) for x in np.clip(bg_color * brightness, 0, 255))
     cell_c = tuple(float(x) for x in np.clip(cell_color * brightness, 0, 255))
-    nuc_c = tuple(float(x) for x in np.clip(nuc_color * brightness, 0, 255))
     rim_c = tuple(float(x) for x in np.clip(rim_color * brightness, 0, 255))
 
-    # Render Inter-Well Plastic Grid Structural Ribs
-    grid_c = tuple(float(x) for x in np.clip(rim_color * brightness * 0.4, 0, 255))
-    grid_w_px = max(1, int(0.10 * px_per_mm_x))
-
-    for r in range(rows):
-        wy = a1_y - r * pitch_y
-        if fov_bottom - 0.5 <= wy <= fov_top + 0.5:
-            ry_px = int(((fov_top - wy) / fov_h) * h)
-            if 0 <= ry_px < h:
-                cv2.line(frame, (0, ry_px), (w, ry_px), grid_c, grid_w_px)
-
-    for c in range(cols):
-        wx = a1_x + c * pitch_x
-        if fov_left - 0.5 <= wx <= fov_right + 0.5:
-            cx_px = int(((wx - fov_left) / fov_w) * w)
-            if 0 <= cx_px < w:
-                cv2.line(frame, (cx_px, 0), (cx_px, h), grid_c, grid_w_px)
-
-    # Spatial filtering for wells overlapping FOV
+    # Render wells overlapping active FOV
     max_fov_radius = math.hypot(fov_w / 2.0, fov_h / 2.0)
     
     for wx, wy, r_idx, c_idx, w_name in wells:
         dist_well = math.hypot(wx - stage_x, wy - stage_y)
-        if dist_well <= (max_fov_radius + well_r_mm + 0.5):
+        if dist_well <= (max_fov_radius + well_r_mm + 1.0):
             well_px_x = int(((wx - fov_left) / fov_w) * w)
             well_px_y = int(((fov_top - wy) / fov_h) * h)
             well_r_px = int(well_r_mm * px_per_mm_x)
 
-            # Draw filled well interior disk
+            # Draw filled well interior
             cv2.circle(frame, (well_px_x, well_px_y), well_r_px, bg_c, -1)
 
-            # Draw cell bodies and internal nuclei structures inside well
-            sub_x, sub_y, sub_r = cell_dict[(r_idx, c_idx)]
+            # Draw cells in this well directly from dict
+            sub_x, sub_y, sub_r = by_well[(r_idx, c_idx)]
+
             for cx, cy, cr in zip(sub_x, sub_y, sub_r):
                 if fov_left - 0.1 <= cx <= fov_right + 0.1 and fov_bottom - 0.1 <= cy <= fov_top + 0.1:
                     c_px_x = int(((cx - fov_left) / fov_w) * w)
                     c_px_y = int(((fov_top - cy) / fov_h) * h)
-                    c_r_px = max(2, int(cr * px_per_mm_x))
+                    c_r_px = max(2, int(cr * px_per_mm_x * 12.0))
                     if -c_r_px <= c_px_x <= w + c_r_px and -c_r_px <= c_px_y <= h + c_r_px:
-                        # Cell cytoplasm body
                         cv2.circle(frame, (c_px_x, c_px_y), c_r_px, cell_c, -1)
-                        # Internal nucleus structure
-                        if c_r_px >= 3:
-                            cv2.circle(frame, (c_px_x, c_px_y), max(1, c_r_px // 2), nuc_c, -1)
 
-            # Draw Double-Ring Well Rim Wall
-            rim_outer_px = max(2, int(0.12 * px_per_mm_x))
-            rim_inner_px = max(1, int(0.06 * px_per_mm_x))
-            cv2.circle(frame, (well_px_x, well_px_y), well_r_px, rim_c, rim_outer_px)
-            if well_r_px > 10:
-                cv2.circle(frame, (well_px_x, well_px_y), well_r_px - rim_outer_px, (30, 30, 35), rim_inner_px)
-
-    # Render Physical Plate Outer Skirt Borders & Metal Stage Holder (when approaching plate boundaries)
-    plate_max_x = 127.76 / 2.0  # 63.88 mm
-    plate_max_y = 85.48 / 2.0   # 42.74 mm
-    border_c = (40, 40, 45)
-    holder_c = (15, 15, 18)
-
-    # Left plate edge
-    if fov_left <= -plate_max_x <= fov_right:
-        edge_px = int(((-plate_max_x - fov_left) / fov_w) * w)
-        cv2.rectangle(frame, (0, 0), (edge_px, h), holder_c, -1)
-        cv2.line(frame, (edge_px, 0), (edge_px, h), border_c, max(2, int(0.2 * px_per_mm_x)))
-
-    # Right plate edge
-    if fov_left <= plate_max_x <= fov_right:
-        edge_px = int(((plate_max_x - fov_left) / fov_w) * w)
-        cv2.rectangle(frame, (edge_px, 0), (w, h), holder_c, -1)
-        cv2.line(frame, (edge_px, 0), (edge_px, h), border_c, max(2, int(0.2 * px_per_mm_x)))
-
-    # Top plate edge
-    if fov_bottom <= plate_max_y <= fov_top:
-        edge_py = int(((fov_top - plate_max_y) / fov_h) * h)
-        cv2.rectangle(frame, (0, 0), (w, edge_py), holder_c, -1)
-        cv2.line(frame, (0, edge_py), (w, edge_py), border_c, max(2, int(0.2 * px_per_mm_y)))
-
-    # Bottom plate edge
-    if fov_bottom <= -plate_max_y <= fov_top:
-        edge_py = int(((fov_top - (-plate_max_y)) / fov_h) * h)
-        cv2.rectangle(frame, (0, edge_py), (w, h), holder_c, -1)
-        cv2.line(frame, (0, edge_py), (w, edge_py), border_c, max(2, int(0.2 * px_per_mm_y)))
+            # Draw well rim border line
+            rim_w_px = max(2, int(0.12 * px_per_mm_x))
+            cv2.circle(frame, (well_px_x, well_px_y), well_r_px, rim_c, rim_w_px)
 
     out_img = np.clip(frame, 0, 255).astype(np.uint8)
 
