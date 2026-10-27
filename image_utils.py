@@ -1,6 +1,6 @@
 """
 image_utils.py - Fast, cached image processing, flat-field shading correction, focus metrics,
-and optically accurate synthetic camera frame generator for LumaViewPro.
+and optically accurate synthetic camera frame generation for LumaViewPro.
 """
 
 from __future__ import annotations
@@ -124,16 +124,17 @@ def compute_focus_score(img: np.ndarray, method: str = "laplacian") -> float:
 
 
 def generate_disconnected_camera_frame(sensor_size: Tuple[int, int] = (512, 512)) -> np.ndarray:
-    """Generates a 'CAMERA DISCONNECTED' overlay frame when run on PC without USB camera hardware."""
+    """Generates a clear 'CAMERA DISCONNECTED' overlay frame for offline/unconnected PCs."""
     w, h = sensor_size
     frame = np.zeros((h, w, 3), dtype=np.uint8)
-    # Dark blue-gray warning frame
-    cv2.rectangle(frame, (15, 15), (w - 15, h - 15), (20, 22, 35), -1)
-    cv2.rectangle(frame, (15, 15), (w - 15, h - 15), (60, 70, 160), 2)
+    # Dark blue-gray background with warning box
+    cv2.rectangle(frame, (10, 10), (w - 10, h - 10), (25, 25, 35), -1)
+    cv2.rectangle(frame, (10, 10), (w - 10, h - 10), (60, 60, 120), 2)
 
-    cv2.putText(frame, "CAMERA DISCONNECTED", (w // 2 - 160, h // 2 - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (80, 90, 255), 2)
-    cv2.putText(frame, "Connect USB Microscope Hardware", (w // 2 - 160, h // 2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 220), 1)
-    cv2.putText(frame, "Or launch luma_sim.py for simulator", (w // 2 - 160, h // 2 + 55), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (140, 140, 160), 1)
+    cv2.putText(frame, "MICROSCOPE DISCONNECTED", (w // 2 - 180, h // 2 - 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (100, 100, 255), 2)
+    cv2.putText(frame, "Connect USB Camera & Stage Controller", (w // 2 - 180, h // 2 + 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.50, (180, 180, 220), 1)
     return frame
 
 
@@ -154,7 +155,7 @@ def generate_well_plate_cell_frame(
     **kwargs
 ) -> np.ndarray:
     """
-    Generates synthetic high-resolution camera frames with ultra-fast OpenCV rendering.
+    Generates synthetic high-resolution camera frames with ultra-fast rendering.
     - If is_light_on is False: Returns dark camera sensor noise frame (black window).
     - If is_light_on is True: Renders well interior disks, cell colonies, well rim outlines,
       inter-well structural grid lines, outer plate skirt borders, and Z defocus blur.
@@ -178,6 +179,7 @@ def generate_well_plate_cell_frame(
     fov_h = max(0.05, float(fov_h))
 
     px_per_mm_x = w / fov_w
+    px_per_mm_y = h / fov_h
 
     fov_left = stage_x - fov_w / 2.0
     fov_right = stage_x + fov_w / 2.0
@@ -270,7 +272,7 @@ def generate_well_plate_cell_frame(
             # Draw filled well interior
             cv2.circle(frame, (well_px_x, well_px_y), well_r_px, bg_c, -1)
 
-            # Draw cell colonies inside well - MAGNIFICATION PROPORTIONAL RADIUS
+            # Draw cell colonies inside well
             cell_list = _CELL_CACHE.get((r_idx % 16, c_idx % 24), [])
             for dx, dy, cr_mm in cell_list:
                 cx_mm = wx + dx
@@ -279,7 +281,6 @@ def generate_well_plate_cell_frame(
                     if fov_left - 0.1 <= cx_mm <= fov_right + 0.1 and fov_bottom - 0.1 <= cy_mm <= fov_top + 0.1:
                         c_px_x = int(((cx_mm - fov_left) / fov_w) * w)
                         c_px_y = int(((fov_top - cy_mm) / fov_h) * h)
-                        # Correct magnification-aware cell radius scaling in pixels
                         c_r_px = max(2, int((cr_mm / fov_w) * w))
                         if 0 <= c_px_x < w and 0 <= c_px_y < h:
                             cv2.circle(frame, (c_px_x, c_px_y), c_r_px, cell_c, -1)

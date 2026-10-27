@@ -4,7 +4,7 @@ plate_navigator.py - Microplate Registration Canvas & Viewport Utilities for Lum
 Provides:
 - InteractiveScaledPlateCanvas: Physically accurate microplate canvas with Top-Left A1 orientation,
   active FOV reticle indicator, and double-click navigation to jump FOV center directly to well/click coordinates.
-- ZoomPanCameraWidget: Live camera viewport with reticle crosshairs & double-click pixel centering.
+- ZoomPanCameraWidget: Live camera viewport with aspect-preserved texture rendering, reticle crosshairs & double-click pixel centering.
 """
 
 from __future__ import annotations
@@ -47,6 +47,7 @@ from kivy.properties import (
 class ZoomPanCameraWidget(Widget):
     """
     Interactive Live Camera Viewport Widget supporting:
+    - Aspect-Preserved Texture Rendering (Zero horizontal distortion)
     - Reticle Crosshairs Overlay at center of field of view
     - Double-click on pixel to center field of view at that coordinate
     - Mouse Wheel Zooming & Right-Click Drag Panning
@@ -90,8 +91,25 @@ class ZoomPanCameraWidget(Widget):
             Rectangle(pos=self.pos, size=self.size)
 
             if self.texture is not None:
+                tw, th = self.texture.size
+                widget_aspect = self.width / float(self.height)
+                tex_aspect = tw / float(th)
+
+                if widget_aspect > tex_aspect:
+                    draw_h = self.height * self.zoom_level
+                    draw_w = draw_h * tex_aspect
+                else:
+                    draw_w = self.width * self.zoom_level
+                    draw_h = draw_w / tex_aspect
+
+                center_x = self.x + self.width / 2.0 + self.pan_x
+                center_y = self.y + self.height / 2.0 + self.pan_y
+
+                draw_x = center_x - draw_w / 2.0
+                draw_y = center_y - draw_h / 2.0
+
                 Color(1.0, 1.0, 1.0, 1.0)
-                Rectangle(texture=self.texture, pos=self.pos, size=self.size)
+                Rectangle(texture=self.texture, pos=(draw_x, draw_y), size=(draw_w, draw_h))
 
             # Central Reticle Crosshairs Overlay
             cx = self.x + self.width / 2.0
@@ -119,14 +137,28 @@ class ZoomPanCameraWidget(Widget):
                 fov_w = getattr(app.focus_map, 'fov_width_mm', 0.60)
                 fov_h = getattr(app.focus_map, 'fov_height_mm', 0.45)
 
-                draw_w = max(1.0, self.width * self.zoom_level)
-                draw_h = max(1.0, self.height * self.zoom_level)
+                if self.texture is not None:
+                    tw, th = self.texture.size
+                    widget_aspect = self.width / float(self.height)
+                    tex_aspect = tw / float(th)
+
+                    if widget_aspect > tex_aspect:
+                        draw_h = self.height * self.zoom_level
+                        draw_w = draw_h * tex_aspect
+                    else:
+                        draw_w = self.width * self.zoom_level
+                        draw_h = draw_w / tex_aspect
+                else:
+                    draw_w = max(1.0, self.width * self.zoom_level)
+                    draw_h = max(1.0, self.height * self.zoom_level)
 
                 dx_mm = (dx_px / draw_w) * fov_w
                 dy_mm = (dy_px / draw_h) * fov_h
 
                 if hasattr(app, 'move_stage_abs'):
                     app.move_stage_abs(app.stage_x + dx_mm, app.stage_y + dy_mm)
+                elif hasattr(app, 'jog_stage_to'):
+                    app.jog_stage_to(app.stage_x + dx_mm, app.stage_y + dy_mm)
                 elif hasattr(app, 'jog_stage'):
                     app.jog_stage(dx_mm, dy_mm, 0.0)
                 return True
@@ -251,7 +283,7 @@ class InteractiveScaledPlateCanvas(Widget):
                         Color(0.35, 0.38, 0.45, 1.0)
                         Line(ellipse=(wx_px - well_r_px, wy_px - well_r_px, 2 * well_r_px, 2 * well_r_px), width=1.0)
 
-            # Draw 6-Point Target Registration Indicators ONLY when is_calibrating or is_calibrated is True!
+            # Draw 6-Point Target Registration Indicators (Yellow / Green)
             if self.calibration.is_calibrating or self.calibration.is_calibrated:
                 cal_steps = self.calibration.CALIBRATION_STEPS
                 for idx, step_info in enumerate(cal_steps):
@@ -262,18 +294,15 @@ class InteractiveScaledPlateCanvas(Widget):
                     tx_px, ty_px = self._get_step_target_px(step_id, offset_x, offset_y, scale)
 
                     if is_recorded:
-                        Color(0.2, 0.9, 0.3, 1.0) # Solid Green
+                        Color(0.2, 0.9, 0.3, 1.0)
                         Ellipse(pos=(tx_px - 5, ty_px - 5), size=(10, 10))
                         Line(circle=(tx_px, ty_px, 8), width=1.5)
                     elif is_active:
-                        Color(1.0, 0.9, 0.1, 1.0) # Pulsing Yellow Active Target
+                        Color(1.0, 0.9, 0.1, 1.0)
                         Ellipse(pos=(tx_px - 6, ty_px - 6), size=(12, 12))
                         Line(circle=(tx_px, ty_px, 10), width=1.8)
-                        Line(circle=(tx_px, ty_px, 4), width=1.0)
-                        Line(points=[tx_px - 10, ty_px, tx_px + 10, ty_px], width=1.2)
-                        Line(points=[tx_px, ty_px - 10, tx_px, ty_px + 10], width=1.2)
                     else:
-                        Color(0.8, 0.8, 0.2, 0.5) # Translucent Yellow
+                        Color(0.8, 0.8, 0.2, 0.5)
                         Ellipse(pos=(tx_px - 4, ty_px - 4), size=(8, 8))
                         Line(circle=(tx_px, ty_px, 6), width=1.0)
 
@@ -283,8 +312,8 @@ class InteractiveScaledPlateCanvas(Widget):
                 sx_px = offset_x + (app.stage_x + plate_w_mm / 2.0) * scale
                 sy_px = offset_y - (plate_h_mm / 2.0 - app.stage_y) * scale
 
-                fov_w = getattr(app.focus_map, 'fov_width_mm', 0.60)
-                fov_h = getattr(app.focus_map, 'fov_height_mm', 0.45)
+                fov_w = getattr(self.focus_map, 'fov_width_mm', 0.60)
+                fov_h = getattr(self.focus_map, 'fov_height_mm', 0.45)
                 fov_w_px = max(8.0, fov_w * scale)
                 fov_h_px = max(6.0, fov_h * scale)
 
@@ -398,3 +427,23 @@ def attach_navigator_to_lumaviewpro(app_instance):
             app_instance.plate_calibration,
             app_instance.focus_map
         )
+
+    if hasattr(app_instance, 'navigator_popup') and app_instance.navigator_popup:
+        try:
+            app_instance.navigator_popup.dismiss()
+        except Exception:
+            pass
+
+    popup = PlateNavigatorPopup(app_instance)
+    app_instance.navigator_popup = popup
+
+    if hasattr(popup, 'ids') and 'scaled_canvas_tab1' in popup.ids:
+        popup.ids.scaled_canvas_tab1.set_references(
+            app_instance.well_plate_format,
+            app_instance.plate_calibration,
+            app_instance.focus_map,
+            app_instance.fov_manager
+        )
+
+    popup.open()
+    return popup
