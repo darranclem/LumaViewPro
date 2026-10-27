@@ -42,8 +42,7 @@
 
 
 <ZoomPanCameraWidget>:
-    # ZoomPanCameraWidget canvas is handled dynamically in Python (redraw_viewport)
-    Widget:
+    # Clean texture canvas rendering handled dynamically in Python set_frame / redraw_viewport
 
 
 <LumaViewProMainLayout>:
@@ -51,10 +50,10 @@
     padding: '8dp'
     spacing: '8dp'
 
-    # Top Navigation & Status Bar
+    # Top Navigation & Active Well Header Bar
     BoxLayout:
         size_hint_y: None
-        height: '40dp'
+        height: '42dp'
         spacing: '10dp'
         padding: '6dp'
         canvas.before:
@@ -83,6 +82,7 @@
             text: root.stage_coord_str
             size_hint_x: 0.30
             font_size: '11sp'
+            bold: True
             color: (0.4, 0.8, 1.0, 1)
 
         Label:
@@ -147,7 +147,7 @@
                 id: main_plate_canvas
 
             Label:
-                text: "Double-click well to jump stage | Single-click to select FOV"
+                text: "Double-click map or well to jump stage position; Arrow keys = XY, PageUp/Down = Z"
                 font_size: '9sp'
                 size_hint_y: None
                 height: '16dp'
@@ -359,16 +359,45 @@
 
         # BOTTOM-RIGHT (50% width): Registration, Focus & Optical Channels Studio
         BoxLayout:
-            orientation: 'vertical'
+            orientation: 'horizontal'
             size_hint_x: 0.50
             spacing: '6dp'
+
+            # Optical Channels Selection Panel (Single Selected)
+            BoxLayout:
+                orientation: 'vertical'
+                size_hint_x: 0.45
+                spacing: '4dp'
+                padding: '4dp'
+                canvas.before:
+                    Color:
+                        rgba: 0.10, 0.11, 0.14, 1
+                    Rectangle:
+                        pos: self.pos
+                        size: self.size
+
+                Label:
+                    text: "Optical Channels"
+                    font_size: '11sp'
+                    bold: True
+                    size_hint_y: None
+                    height: '18dp'
+                    color: (0.3, 0.8, 1.0, 1)
+
+                ScrollView:
+                    BoxLayout:
+                        id: main_channel_container
+                        orientation: 'vertical'
+                        size_hint_y: None
+                        height: self.minimum_height
+                        spacing: '3dp'
 
             # 3-Tab Studio Panel
             TabbedPanel:
                 id: main_tabbed_panel
                 do_default_tab: False
-                tab_width: '120dp'
-                size_hint_y: 0.55
+                tab_width: '110dp'
+                size_hint_x: 0.55
 
                 # TAB 1: Calibration Wizard
                 TabbedPanelItem:
@@ -378,6 +407,71 @@
                         padding: '4dp'
                         spacing: '4dp'
 
+                        # Wizard Start / Reset Control Bar
+                        BoxLayout:
+                            size_hint_y: None
+                            height: '26dp'
+                            spacing: '4dp'
+
+                            Button:
+                                text: "Start Calib"
+                                background_color: (0.2, 0.7, 0.4, 1)
+                                bold: True
+                                font_size: '9sp'
+                                on_release: app.start_calibration_wizard()
+
+                            Button:
+                                text: "Reset Calib"
+                                background_color: (0.7, 0.3, 0.3, 1)
+                                font_size: '9sp'
+                                on_release: app.reset_calibration()
+
+                        # Instruction Banner Label
+                        Label:
+                            id: wizard_instruction_label
+                            text: root.calibration_wizard_text
+                            font_size: '9sp'
+                            bold: True
+                            color: (0.9, 0.9, 0.2, 1)
+                            size_hint_y: None
+                            height: '24dp'
+                            halign: 'center'
+                            valign: 'middle'
+                            text_size: self.size
+
+                        # Wizard Action Buttons: Mark, Next, Previous, Done
+                        GridLayout:
+                            cols: 4
+                            spacing: '4dp'
+                            size_hint_y: None
+                            height: '28dp'
+
+                            Button:
+                                text: "Mark"
+                                background_color: (0.2, 0.8, 0.3, 1)
+                                bold: True
+                                font_size: '9sp'
+                                on_release: app.mark_calibration_step()
+
+                            Button:
+                                text: "Next"
+                                background_color: (0.2, 0.6, 0.8, 1)
+                                font_size: '9sp'
+                                on_release: app.next_calibration_step()
+
+                            Button:
+                                text: "Previous"
+                                font_size: '9sp'
+                                on_release: app.previous_calibration_step()
+
+                            Button:
+                                text: "Done"
+                                background_color: (0.8, 0.5, 0.2, 1)
+                                bold: True
+                                font_size: '9sp'
+                                on_release: app.finish_plate_calibration()
+
+                        # Well Selection Utilities Row
                         BoxLayout:
                             size_hint_y: None
                             height: '24dp'
@@ -389,52 +483,9 @@
                                 on_release: app.fov_manager.select_all_wells(); main_plate_canvas.redraw_canvas()
 
                             Button:
-                                text: "Clear Selections"
+                                text: "Clear All"
                                 font_size: '9sp'
                                 on_release: app.fov_manager.clear_all_wells(); main_plate_canvas.redraw_canvas()
-
-                            Button:
-                                text: "Sync Channels"
-                                background_color: (0.2, 0.5, 0.8, 1)
-                                font_size: '9sp'
-                                bold: True
-                                on_release: app.global_sync_active_channels()
-
-                        BoxLayout:
-                            orientation: 'vertical'
-                            padding: '4dp'
-                            spacing: '3dp'
-                            canvas.before:
-                                Color:
-                                    rgba: 0.14, 0.14, 0.20, 1
-                                Rectangle:
-                                    pos: self.pos
-                                    size: self.size
-
-                            Label:
-                                text: "6-Point Target Registration Wizard"
-                                bold: True
-                                font_size: '10sp'
-                                color: (0.3, 0.8, 1.0, 1)
-
-                            BoxLayout:
-                                size_hint_y: None
-                                height: '26dp'
-                                spacing: '6dp'
-
-                                Button:
-                                    text: "Mark Stage Position"
-                                    background_color: (0.2, 0.7, 0.3, 1)
-                                    bold: True
-                                    font_size: '9sp'
-                                    on_release: app.record_calibration_step(); main_plate_canvas.redraw_canvas()
-
-                                Button:
-                                    text: "Finish Calibration"
-                                    background_color: (0.8, 0.4, 0.2, 1)
-                                    bold: True
-                                    font_size: '9sp'
-                                    on_release: app.finish_plate_calibration(); main_plate_canvas.redraw_canvas()
 
                 # TAB 2: AF & Schedule
                 TabbedPanelItem:
@@ -524,28 +575,6 @@
                             bold: True
                             font_size: '10sp'
                             on_release: app.generate_and_apply_protocol()
-
-            # Optical Channels Selection Panel (Single Selected)
-            BoxLayout:
-                orientation: 'vertical'
-                size_hint_y: 0.45
-                spacing: '4dp'
-
-                Label:
-                    text: "Optical Channels (Select One to Turn ON)"
-                    font_size: '11sp'
-                    bold: True
-                    size_hint_y: None
-                    height: '18dp'
-                    color: (0.3, 0.8, 1.0, 1)
-
-                ScrollView:
-                    BoxLayout:
-                        id: main_channel_container
-                        orientation: 'vertical'
-                        size_hint_y: None
-                        height: self.minimum_height
-                        spacing: '3dp'
 
     # Bottom Status Bar
     BoxLayout:
