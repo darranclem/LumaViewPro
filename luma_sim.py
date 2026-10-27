@@ -1,12 +1,11 @@
 """
-luma_sim.py - Offline Hardware Simulator for LumaViewPro 4.0.0-beta
+luma_sim.py - Offline Hardware Simulator for LumaViewPro.
 
-Mocks camera acquisition (pyloncamera), stage motion (motorboard), and illumination (ledboard)
-with real-time synthetic cell colony generation across SBS 96-well microplates.
-Launches the full, stock LumaViewPro UI offline so development can proceed seamlessly on desktop PCs.
+Mocks camera acquisition (pyloncamera) and stage motion (motorboard / ledboard)
+with real-time synthetic cell colony generation across multi-well microplates.
+Enables offline desktop development and testing without physical microscope hardware.
 """
 
-from __future__ import annotations
 import sys
 import os
 import types
@@ -25,6 +24,15 @@ class MockCamera:
         self.is_connected = True
         self.exposure_ms = 100.0
         self.gain = 1.0
+        self.is_light_on = False
+        self.led_power = 100.0
+        self.active_channel = "Brightfield"
+        self.stage_x = -49.5
+        self.stage_y = 31.5
+        self.stage_z = 0.0
+        self.best_z = 2.5
+        self.fov_size_mm = (0.60, 0.45)
+        self.num_wells = 96
 
     def connect(self) -> bool:
         return True
@@ -33,13 +41,20 @@ class MockCamera:
         pass
 
     def get_frame(self):
-        return None
-
-    def set_exposure(self, exp: float):
-        self.exposure_ms = float(exp)
-
-    def set_gain(self, g: float):
-        self.gain = float(g)
+        return image_utils.generate_well_plate_cell_frame(
+            stage_x=self.stage_x,
+            stage_y=self.stage_y,
+            stage_z=self.stage_z,
+            best_z=self.best_z,
+            channel=self.active_channel,
+            is_light_on=self.is_light_on,
+            exposure_ms=self.exposure_ms,
+            gain=self.gain,
+            led_power=self.led_power,
+            fov_size_mm=self.fov_size_mm,
+            num_wells=self.num_wells,
+            sensor_size=(512, 512)
+        )
 
 
 mock_pylon = types.ModuleType("pyloncamera")

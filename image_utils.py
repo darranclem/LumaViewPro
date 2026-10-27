@@ -1,15 +1,16 @@
 """
-image_utils.py - Fast, cached image processing, shading correction, focus metrics,
-and optically accurate synthetic camera frame generation for LumaViewPro.
+image_utils.py - Fast, cached image processing, flat-field shading correction, focus metrics,
+and synthetic camera frame generation for LumaViewPro.
 """
 
 from __future__ import annotations
 import os
 import cv2
 import numpy as np
-from typing import Optional, Tuple, Union, List, Dict
+import math
+from typing import Optional, Tuple, Union, Dict, List
 
-# Pre-computed cell colony coordinate cache for 20 FPS live simulation
+# Pre-computed cell colony coordinate cache
 _CELL_CACHE: Dict[Tuple[int, int], List[Tuple[float, float, float]]] = {}
 
 
@@ -24,7 +25,7 @@ def _init_cell_cache():
             num_cells = 45
             angles = np.random.uniform(0, 2 * np.pi, num_cells)
             radii = np.random.uniform(0.1, 3.2, num_cells)
-            cell_rs = np.random.uniform(10, 22, num_cells)
+            cell_rs = np.random.uniform(0.015, 0.035, num_cells)
             
             cell_list = []
             for i in range(num_cells):
@@ -122,39 +123,23 @@ def compute_focus_score(img: np.ndarray, method: str = "laplacian") -> float:
         return float(np.var(lap))
 
 
-def _get_cached_cell_positions(num_wells: int = 96):
-    rows, cols = 8, 12
-    pitch_x, pitch_y = 9.0, 9.0
-    a1_x, a1_y = -49.5, 31.5
+def generate_disconnected_camera_frame(sensor_size: Tuple[int, int] = (512, 512)) -> np.ndarray:
+    """Generates a dark frame with 'CAMERA DISCONNECTED' overlay for stock lumaviewpro.py when hardware is absent."""
+    w, h = sensor_size
+    frame = np.zeros((h, w, 3), dtype=np.uint8)
+    
+    # Subtle dark noise
+    noise = np.random.normal(loc=4.0, scale=1.5, size=(h, w, 3)).astype(np.int16)
+    frame = np.clip(noise, 0, 255).astype(np.uint8)
 
-    if num_wells == 6:
-        rows, cols, pitch_x, pitch_y, a1_x, a1_y = 2, 3, 39.12, 39.12, -39.12, 19.56
-    elif num_wells == 12:
-        rows, cols, pitch_x, pitch_y, a1_x, a1_y = 3, 4, 26.0, 26.0, -39.0, 26.0
-    elif num_wells == 24:
-        rows, cols, pitch_x, pitch_y, a1_x, a1_y = 4, 6, 19.3, 19.3, -48.25, 28.95
-    elif num_wells == 48:
-        rows, cols, pitch_x, pitch_y, a1_x, a1_y = 6, 8, 13.0, 13.0, -45.5, 32.5
-    elif num_wells == 384:
-        rows, cols, pitch_x, pitch_y, a1_x, a1_y = 16, 24, 4.5, 4.5, -51.75, 33.75
+    # Disconnected Camera Icon / Text Overlay
+    cx, cy = w // 2, h // 2
+    cv2.circle(frame, (cx, cy - 30), 40, (50, 50, 180), 2)
+    cv2.line(frame, (cx - 30, cy - 60), (cx + 30, cy), (50, 50, 180), 3)
 
-    wells = []
-    all_x, all_y, all_r = [], [], []
-
-    for r in range(rows):
-        wy = a1_y - r * pitch_y
-        for c in range(cols):
-            wx = a1_x + c * pitch_x
-            w_name = f"{chr(65+r)}{c+1}"
-            wells.append((wx, wy, w_name))
-
-            cell_list = _CELL_CACHE.get((r % 16, c % 24), [])
-            for dx, dy, cr in cell_list:
-                all_x.append(wx + dx)
-                all_y.append(wy + dy)
-                all_r.append(cr * 0.002)
-
-    return np.array(all_x, dtype=np.float32), np.array(all_y, dtype=np.float32), np.array(all_r, dtype=np.float32), wells
+    cv2.putText(frame, "CAMERA DISCONNECTED", (cx - 150, cy + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 80, 220), 2)
+    cv2.putText(frame, "No Microscope Hardware Detected", (cx - 165, cy + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 120, 150), 1)
+    return frame
 
 
 def generate_well_plate_cell_frame(
@@ -173,107 +158,128 @@ def generate_well_plate_cell_frame(
     num_wells: int = 96,
     **kwargs
 ) -> np.ndarray:
+    """
+    Generates synthetic high-resolution camera frames for offline simulator.
+    - If is_light_on is False: Returns dark camera sensor noise frame (black window).
+    - If is_light_on is True: Renders well interior disks, cell colonies, well rim outlines,
+      and 0 intensity (pitch black) outside all well rims.
+    - Z Defocus Blur: Gaussian blur increases smoothly with distance |stage_z - best_z|.
+    """
     w, h = sensor_size
 
-    # DARK SENSOR LAUNCH STATE
-    if not is_light_on or led_power <= 0:
-        dark_noise = np.random.poisson(lam=2.0, size=(h, w, 3)).astype(np.uint8)
-        return dark_noise
+    # 1. Dark Launch / Light OFF State (Black camera feed)
+    if not is_light_on or channel.upper() in ["OFF", "NONE", ""]:
+        dark_noise = np.random.normal(loc=2.5, scale=1.0, size=(h, w, 3)).astype(np.int16)
+        return np.clip(dark_noise, 0, 255).astype(np.uint8)
 
     p_val = led_power if led_power is not None else power
-    brightness = (exposure_ms / 20.0) * (p_val / 100.0) * gain
-    brightness = max(0.1, min(3.0, brightness))
+    p_factor = max(0.05, min(1.5, float(p_val) / 100.0))
+    exp_factor = max(0.1, min(3.0, (exposure_ms / 20.0) * gain))
+    brightness = p_factor * exp_factor
 
     fov_w, fov_h = fov_size_mm
     fov_w = max(0.05, float(fov_w))
     fov_h = max(0.05, float(fov_h))
-
-    px_per_mm = w / fov_w
 
     fov_left = stage_x - fov_w / 2.0
     fov_right = stage_x + fov_w / 2.0
     fov_bottom = stage_y - fov_h / 2.0
     fov_top = stage_y + fov_h / 2.0
 
-    cells_x, cells_y, cells_r, wells = _get_cached_cell_positions(num_wells)
+    # Well plate physical layouts (SLAS standard specifications)
+    well_specs = {
+        6: (2, 3, 39.12, 39.12, 34.8, -39.12, 19.56),
+        12: (3, 4, 26.0, 26.0, 22.1, -39.0, 26.0),
+        24: (4, 6, 19.3, 19.3, 15.6, -48.25, 28.95),
+        48: (6, 8, 13.0, 13.0, 11.0, -45.5, 32.5),
+        96: (8, 12, 9.0, 9.0, 6.4, -49.5, 31.5),
+        384: (16, 24, 4.5, 4.5, 3.8, -51.75, 33.75)
+    }
+    rows, cols, pitch_x, pitch_y, well_d, a1_x, a1_y = well_specs.get(num_wells, well_specs[96])
+    well_r_mm = well_d / 2.0
 
-    # Filter visible cells inside active FOV
-    mask = (cells_x >= fov_left - 0.05) & (cells_x <= fov_right + 0.05) & \
-           (cells_y >= fov_bottom - 0.05) & (cells_y <= fov_top + 0.05)
-
-    vis_x = cells_x[mask]
-    vis_y = cells_y[mask]
-    vis_r = cells_r[mask]
-
-    vis_px_x = ((vis_x - fov_left) / fov_w) * w
-    vis_px_y = ((fov_top - vis_y) / fov_h) * h
-    vis_px_r = vis_r * px_per_mm
-
-    frame = np.zeros((h, w, 3), dtype=np.float32)
+    wells = []
+    for r in range(rows):
+        wy = a1_y - r * pitch_y
+        for c in range(cols):
+            wx = a1_x + c * pitch_x
+            wells.append((wx, wy, r, c))
 
     ch_l = channel.lower()
+
+    # Define color LUT for well interior background and cells (BGR format)
     if "blue" in ch_l or "dapi" in ch_l:
-        bg_color = np.array([15, 10, 5], dtype=np.float32)
-        cell_color = np.array([255, 180, 40], dtype=np.float32)
+        bg_color = np.array([25, 10, 5], dtype=np.float32)
+        cell_color = np.array([255, 180, 40], dtype=np.float32)   # Pure Blue BGR
+        rim_color = np.array([120, 60, 20], dtype=np.float32)
     elif "green" in ch_l or "fitc" in ch_l or "gfp" in ch_l:
         bg_color = np.array([10, 20, 10], dtype=np.float32)
-        cell_color = np.array([40, 240, 60], dtype=np.float32)
+        cell_color = np.array([40, 240, 60], dtype=np.float32)    # Pure Green BGR
+        rim_color = np.array([30, 120, 30], dtype=np.float32)
     elif "red" in ch_l or "txred" in ch_l or "mcherry" in ch_l or "cy5" in ch_l:
         bg_color = np.array([20, 10, 10], dtype=np.float32)
-        cell_color = np.array([30, 40, 250], dtype=np.float32)
+        cell_color = np.array([30, 40, 250], dtype=np.float32)    # Pure Red BGR
+        rim_color = np.array([30, 30, 120], dtype=np.float32)
     elif "darkfield" in ch_l or "df" in ch_l:
         bg_color = np.array([15, 15, 20], dtype=np.float32)
         cell_color = np.array([220, 220, 240], dtype=np.float32)
+        rim_color = np.array([180, 180, 200], dtype=np.float32)
     elif "phase" in ch_l:
-        bg_color = np.array([170, 170, 175], dtype=np.float32)
-        cell_color = np.array([45, 45, 50], dtype=np.float32)
-    else:  # Brightfield
-        bg_color = np.array([215, 215, 215], dtype=np.float32)
-        cell_color = np.array([55, 55, 65], dtype=np.float32)
+        bg_color = np.array([175, 175, 180], dtype=np.float32)
+        cell_color = np.array([40, 40, 45], dtype=np.float32)
+        rim_color = np.array([100, 100, 110], dtype=np.float32)
+    else:  # Brightfield (Monochrome Grayscale)
+        bg_color = np.array([220, 220, 220], dtype=np.float32)
+        cell_color = np.array([70, 70, 80], dtype=np.float32)
+        rim_color = np.array([110, 110, 120], dtype=np.float32)
 
-    frame[:] = bg_color * brightness
-    c_draw_color = tuple(float(x) for x in np.clip(cell_color * brightness, 0, 255))
-    halo_color = tuple(float(x) for x in np.clip(np.array([240, 240, 245]) * brightness, 0, 255))
+    bg_c = tuple(int(x) for x in np.clip(bg_color * brightness, 0, 255))
+    cell_c = tuple(int(x) for x in np.clip(cell_color * brightness, 0, 255))
+    rim_c = tuple(int(x) for x in np.clip(rim_color * brightness, 0, 255))
 
-    # Draw visible cell bodies
-    for px, py, pr in zip(vis_px_x, vis_px_y, vis_px_r):
-        ix, iy, ir = int(px), int(py), max(2, int(pr))
-        if -ir <= ix <= w + ir and -ir <= iy <= h + ir:
-            cv2.circle(frame, (ix, iy), ir, c_draw_color, -1)
-            if "phase" in ch_l:
-                cv2.circle(frame, (ix, iy), ir + 1, halo_color, 1)
+    # Frame starts as 0 intensity (pitch black outside all wells)
+    frame = np.zeros((h, w, 3), dtype=np.float32)
 
-    # Well rim outline if well center is close to active FOV
-    well_diameter_mm = 6.4
-    if num_wells in [6, 12, 24, 48, 96, 384]:
-        formats = {6: 34.8, 12: 22.1, 24: 15.6, 48: 11.0, 96: 6.4, 384: 3.8}
-        well_diameter_mm = formats[num_wells]
-
-    well_r_mm = well_diameter_mm / 2.0
-    rim_color = tuple(float(x) for x in np.clip(np.array([100, 110, 120]) * brightness, 0, 255))
-    for wx, wy, _ in wells:
-        if abs(wx - stage_x) <= (fov_w / 2.0 + well_r_mm) and abs(wy - stage_y) <= (fov_h / 2.0 + well_r_mm):
+    # Render wells overlapping active FOV
+    for wx, wy, r_idx, c_idx in wells:
+        dist_well = math.hypot(wx - stage_x, wy - stage_y)
+        if dist_well <= (max(fov_w, fov_h) + well_r_mm + 1.0):
             well_px_x = int(((wx - fov_left) / fov_w) * w)
             well_px_y = int(((fov_top - wy) / fov_h) * h)
-            well_r_px = int(well_r_mm * px_per_mm)
-            cv2.circle(frame, (well_px_x, well_px_y), well_r_px, rim_color, 2)
+            well_r_px = int((well_r_mm / fov_w) * w)
 
-    # In-between wells (outside all well boundaries): set background intensity to 0
-    min_dist_to_well = min([np.hypot(stage_x - wx, stage_y - wy) for wx, wy, _ in wells])
-    if min_dist_to_well > well_r_mm + max(fov_w, fov_h):
-        frame[:] = 0.0
+            # Draw filled well interior
+            cv2.circle(frame, (well_px_x, well_px_y), well_r_px, bg_c, -1)
+
+            # Draw cell colonies inside well
+            cell_list = _CELL_CACHE.get((r_idx % 16, c_idx % 24), [])
+            for dx, dy, cr_px in cell_list:
+                cx_mm = wx + dx
+                cy_mm = wy + dy
+                if math.hypot(dx, dy) < (well_r_mm - 0.05):
+                    if fov_left - 0.1 <= cx_mm <= fov_right + 0.1 and fov_bottom - 0.1 <= cy_mm <= fov_top + 0.1:
+                        c_px_x = int(((cx_mm - fov_left) / fov_w) * w)
+                        c_px_y = int(((fov_top - cy_mm) / fov_h) * h)
+                        c_r_px = max(2, int((cr_px / 512.0) * (1.2 / fov_w) * w))
+                        if 0 <= c_px_x < w and 0 <= c_px_y < h:
+                            cv2.circle(frame, (c_px_x, c_px_y), c_r_px, cell_c, -1)
+
+            # Draw well edge rim line
+            rim_w_px = max(2, int((0.15 / fov_w) * w))
+            cv2.circle(frame, (well_px_x, well_px_y), well_r_px, rim_c, rim_w_px)
+
+    out_img = np.clip(frame, 0, 255).astype(np.uint8)
 
     # Z defocus blur simulation
     dist_z = abs(stage_z - best_z)
     if dist_z > 0.001:
-        blur_k = int(dist_z * 25.0)
+        blur_k = int(dist_z * 35.0)
         if blur_k % 2 == 0:
             blur_k += 1
         blur_k = max(1, min(blur_k, 31))
         if blur_k > 1:
-            frame = cv2.GaussianBlur(frame, (blur_k, blur_k), 0)
+            out_img = cv2.GaussianBlur(out_img, (blur_k, blur_k), 0)
 
-    out_img = np.clip(frame, 0, 255).astype(np.uint8)
     return out_img
 
 
