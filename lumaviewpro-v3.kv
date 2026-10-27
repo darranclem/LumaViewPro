@@ -1,0 +1,197 @@
+#:kivy 2.0.0
+
+<ChannelControlWidget>:
+    orientation: 'horizontal'
+    size_hint_y: None
+    height: '42dp'
+    spacing: '8dp'
+    padding: ['4dp', '2dp']
+
+    ToggleButton:
+        id: channel_toggle
+        text: root.channel_name
+        active: root.is_active
+        state: 'down' if root.is_active else 'normal'
+        size_hint_x: 0.28
+        background_normal: ''
+        background_down: ''
+        background_color: root.btn_bg_color if root.is_active else [root.btn_bg_color[0]*0.35, root.btn_bg_color[1]*0.35, root.btn_bg_color[2]*0.35, 1.0]
+        color: (1, 1, 1, 1)
+        bold: True
+        on_state: app.channel_manager.set_channel_active(root.channel_name, self.state == 'down')
+
+    BoxLayout:
+        orientation: 'vertical'
+        size_hint_x: 0.5
+        spacing: '1dp'
+
+        Label:
+            text: root.channel_spec_info
+            font_size: '10sp'
+            halign: 'left'
+            valign: 'middle'
+            text_size: self.size
+            color: (0.85, 0.85, 0.85, 1)
+
+        Label:
+            text: "Ref: " + root.ref_image_path
+            font_size: '10sp'
+            halign: 'left'
+            valign: 'middle'
+            text_size: self.size
+            color: (0.6, 0.7, 0.8, 1)
+
+    Button:
+        text: "Load Ref"
+        size_hint_x: 0.22
+        font_size: '11sp'
+        on_release: root.open_ref_chooser()
+
+
+<LumaViewProMainLayout>:
+    orientation: 'vertical'
+    padding: '10dp'
+    spacing: '10dp'
+
+    # Top Header Bar matching original LumaViewPro with Plate Navigator button
+    BoxLayout:
+        size_hint_y: None
+        height: '45dp'
+        spacing: '10dp'
+        canvas.before:
+            Color:
+                rgba: 0.15, 0.15, 0.2, 1
+            Rectangle:
+                pos: self.pos
+                size: self.size
+
+        Label:
+            text: "LumaViewPro"
+            font_size: '18sp'
+            bold: True
+            size_hint_x: 0.25
+            padding_x: '10dp'
+
+        Button:
+            text: "Microscope Control"
+            size_hint_x: 0.2
+            background_color: (0.3, 0.3, 0.4, 1)
+
+        Button:
+            text: "Protocol"
+            size_hint_x: 0.2
+            background_color: (0.3, 0.3, 0.4, 1)
+
+        Button:
+            text: "Plate Navigator"
+            size_hint_x: 0.25
+            background_color: (0.2, 0.6, 0.4, 1)
+            bold: True
+            on_release: app.open_plate_navigator()
+
+        Label:
+            text: root.calibrated_status
+            size_hint_x: 0.2
+            color: (0.2, 0.8, 0.4, 1) if "Calibrated" in root.calibrated_status else (0.9, 0.3, 0.3, 1)
+
+    # Main Application Control Window Layout
+    BoxLayout:
+        orientation: 'horizontal'
+        spacing: '10dp'
+
+        # Live Camera Viewport (Main Control View)
+        BoxLayout:
+            orientation: 'vertical'
+            size_hint_x: 0.65
+            spacing: '8dp'
+            canvas.before:
+                Color:
+                    rgba: 0.05, 0.05, 0.05, 1
+                Rectangle:
+                    pos: self.pos
+                    size: self.size
+
+            ZoomPanCameraWidget:
+                id: main_camera_viewport
+                size_hint_y: 0.85
+
+            # Stock Hardware Control Dock with Plate Navigator button
+            BoxLayout:
+                size_hint_y: None
+                height: '45dp'
+                spacing: '10dp'
+                padding: ['5dp', '2dp']
+
+                Label:
+                    text: root.stage_coord_str
+                    size_hint_x: 0.4
+                    color: (0.4, 0.8, 1.0, 1)
+
+                Button:
+                    text: "Plate Navigator"
+                    size_hint_x: 0.3
+                    background_color: (0.2, 0.6, 0.4, 1)
+                    bold: True
+                    on_release: app.open_plate_navigator()
+
+                Button:
+                    text: "Capture Image"
+                    size_hint_x: 0.3
+                    background_color: (0.2, 0.5, 0.8, 1)
+
+        # Channel & Hardware Settings Side Panel
+        BoxLayout:
+            orientation: 'vertical'
+            size_hint_x: 0.35
+            spacing: '10dp'
+
+            Label:
+                text: "Optical Channels (6 Channels)"
+                font_size: '15sp'
+                bold: True
+                size_hint_y: None
+                height: '30dp'
+
+            ScrollView:
+                BoxLayout:
+                    id: main_channel_container
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: self.minimum_height
+                    spacing: '6dp'
+
+            Button:
+                text: "Global Sync / Update All Active Channels"
+                size_hint_y: None
+                height: '38dp'
+                background_color: (0.2, 0.5, 0.8, 1)
+                bold: True
+                on_release: app.global_sync_active_channels()
+
+            Button:
+                text: "Launch Plate Navigator & Registration Studio"
+                size_hint_y: None
+                height: '45dp'
+                background_color: (0.2, 0.7, 0.4, 1)
+                bold: True
+                font_size: '13sp'
+                on_release: app.open_navigator_popup()
+
+    # Bottom Status Bar
+    BoxLayout:
+        size_hint_y: None
+        height: '30dp'
+        canvas.before:
+            Color:
+                rgba: 0.1, 0.1, 0.1, 1
+            Rectangle:
+                pos: self.pos
+                size: self.size
+
+        Label:
+            text: root.status_msg
+            halign: 'left'
+            valign: 'middle'
+            text_size: self.size
+            padding_x: '10dp'
+            color: (0.7, 0.7, 0.7, 1)
