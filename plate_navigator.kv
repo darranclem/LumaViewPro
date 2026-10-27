@@ -1,3 +1,48 @@
 #:kivy 2.0.0
 
-# plate_navigator.kv - Additional widget definitions for LumaViewPro
+<ZoomPanCameraWidget>:
+    canvas.before:
+        Color:
+            rgba: 0.05, 0.05, 0.08, 1
+        Rectangle:
+            pos: self.pos
+            size: self.size
+
+    BoxLayout:
+        orientation: 'vertical'
+        padding: '4dp'
+        spacing: '4dp'
+
+        Label:
+            text: "[ Live Camera Feed - Optical Viewport ]"
+            size_hint_y: None
+            height: '20dp'
+            font_size: '11sp'
+            bold: True
+            color: (0.3, 0.8, 1.0, 1)
+
+        Widget:
+            id: viewport_box
+            canvas:
+                Color:
+                    rgba: 0.12, 0.14, 0.18, 1
+                Rectangle:
+                    pos: self.pos
+                    size: self.size
+
+        BoxLayout:
+            size_hint_y: None
+            height: '24dp'
+            spacing: '8dp'
+
+            Label:
+                text: "Mouse Wheel = Zoom | Right-Click Drag = Pan"
+                font_size: '10sp'
+                color: (0.7, 0.7, 0.7, 1)
+
+            Button:
+                text: "Reset View"
+                size_hint_x: None
+                width: '75dp'
+                font_size: '10sp'
+                on_release: root.reset_zoom_pan()

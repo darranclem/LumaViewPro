@@ -1,10 +1,9 @@
-from __future__ import annotations
 """
-luma_sim.py - Offline Hardware Simulator for LumaViewPro 4.0.0-beta
+luma_sim.py - Offline Hardware Simulator for LumaViewPro 4.0.0-beta.
 
 Mocks camera acquisition (pyloncamera) and stage motion (motorboard / ledboard)
-so LumaViewPro and Plate Navigator can be developed and tested offline without
-triggering "No Microscope Detected" hardware failure popups.
+with real-time synthetic cell colony generation across multi-well microplates.
+Enables offline desktop development and testing without physical microscope hardware.
 """
 
 import sys
@@ -49,8 +48,8 @@ sys.modules["pyloncamera"] = mock_pylon
 
 class MockStage:
     def __init__(self):
-        self.x = -49.5
-        self.y = 31.5
+        self.x = 0.0
+        self.y = 0.0
         self.z = 0.0
 
     def connect(self) -> bool:
@@ -75,7 +74,7 @@ sys.modules["motorboard"] = mock_motor
 
 class MockLEDBoard:
     def __init__(self):
-        self.active_channel = "BF"
+        self.active_channel = "Brightfield"
         self.power = 100
 
     def set_led(self, channel: str, power: int):
@@ -95,5 +94,4 @@ print("[LumaViewPro Simulator] Hardware Mocks Ready. Starting LumaViewPro...")
 import lumaviewpro
 
 if __name__ == "__main__":
-    app = lumaviewpro.LumaViewProApp()
-    app.run()
+    lumaviewpro.LumaViewProApp().run()
