@@ -1,12 +1,11 @@
 """
-luma_sim.py - Offline Hardware Simulator for LumaViewPro 4.0.0-beta.
+luma_sim.py - Offline Hardware Simulator for LumaViewPro.
 
-Mocks camera acquisition (pyloncamera), stage motion (motorboard), and illumination (ledboard)
+Mocks camera acquisition (pyloncamera) and stage motion (motorboard / ledboard)
 with real-time synthetic cell colony generation across multi-well microplates.
-Launches the full, stock LumaViewPro UI offline so development can proceed seamlessly on desktop PCs.
+Enables offline desktop development and testing without physical microscope hardware.
 """
 
-from __future__ import annotations
 import sys
 import os
 import types
@@ -23,15 +22,15 @@ print("[LumaViewPro Simulator] Initializing offline hardware & camera mocks...")
 class MockCamera:
     def __init__(self):
         self.is_connected = True
-        self.exposure_ms = 20.0
+        self.exposure_ms = 100.0
         self.gain = 1.0
-        self.stage_x = -49.5  # Well A1 default
+        self.is_light_on = False
+        self.led_power = 100.0
+        self.active_channel = "Brightfield"
+        self.stage_x = -49.5
         self.stage_y = 31.5
         self.stage_z = 0.0
-        self.best_z = 0.0
-        self.active_channel = "Brightfield"
-        self.is_light_on = False  # Starts OFF (dark sensor noise)
-        self.led_power = 100.0
+        self.best_z = 2.5
         self.fov_size_mm = (0.60, 0.45)
         self.num_wells = 96
 
@@ -57,21 +56,6 @@ class MockCamera:
             sensor_size=(512, 512)
         )
 
-    def set_exposure(self, exp: float):
-        self.exposure_ms = float(exp)
-
-    def set_gain(self, g: float):
-        self.gain = float(g)
-
-    def set_light_on(self, on: bool):
-        self.is_light_on = bool(on)
-
-    def set_led_power(self, power: float):
-        self.led_power = float(power)
-
-    def set_channel(self, channel: str):
-        self.active_channel = str(channel)
-
 
 mock_pylon = types.ModuleType("pyloncamera")
 mock_pylon.PylonCamera = MockCamera
@@ -87,15 +71,13 @@ class MockStage:
     def connect(self) -> bool:
         return True
 
-    def move_abs(self, x: float, y: float, z: float = 0.0):
-        self.x = float(x)
-        self.y = float(y)
-        self.z = float(z)
+    def move_abs(self, x: float, y: float, z: float):
+        self.x, self.y, self.z = x, y, z
 
-    def move_rel(self, dx: float, dy: float, dz: float = 0.0):
-        self.x += float(dx)
-        self.y += float(dy)
-        self.z += float(dz)
+    def move_rel(self, dx: float, dy: float, dz: float):
+        self.x += dx
+        self.y += dy
+        self.z += dz
 
     def get_pos(self):
         return (self.x, self.y, self.z)
@@ -110,15 +92,13 @@ class MockLEDBoard:
     def __init__(self):
         self.active_channel = "Brightfield"
         self.power = 100
-        self.is_on = False
 
     def set_led(self, channel: str, power: int):
         self.active_channel = channel
         self.power = power
-        self.is_on = True
 
     def off(self):
-        self.is_on = False
+        self.power = 0
 
 
 mock_led = types.ModuleType("ledboard")
