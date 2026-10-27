@@ -22,7 +22,7 @@
     Label:
         text: root.channel_spec_info
         size_hint_x: 0.45
-        font_size: '10sp'
+        font_size: '9sp'
         halign: 'left'
         valign: 'middle'
         text_size: self.size
@@ -43,52 +43,13 @@
             pos: self.pos
             size: self.size
 
-    BoxLayout:
-        orientation: 'vertical'
-        padding: '4dp'
-        spacing: '4dp'
-
-        Label:
-            text: "[ Live Camera Feed - Optical Viewport ]"
-            size_hint_y: None
-            height: '20dp'
-            font_size: '11sp'
-            bold: True
-            color: (0.3, 0.8, 1.0, 1)
-
-        Widget:
-            id: viewport_box
-            canvas:
-                Color:
-                    rgba: 0.12, 0.14, 0.18, 1
-                Rectangle:
-                    pos: self.pos
-                    size: self.size
-
-        BoxLayout:
-            size_hint_y: None
-            height: '24dp'
-            spacing: '8dp'
-
-            Label:
-                text: "Wheel = Zoom | Right Drag = Pan | Double-Click = Center Pixel"
-                font_size: '10sp'
-                color: (0.7, 0.7, 0.7, 1)
-
-            Button:
-                text: "Reset View"
-                size_hint_x: None
-                width: '75dp'
-                font_size: '10sp'
-                on_release: root.reset_zoom_pan()
-
 
 <LumaViewProMainLayout>:
     orientation: 'vertical'
     padding: '8dp'
     spacing: '8dp'
 
-    # Top Navigation & Stage Coordinates Bar
+    # Top Header Bar: Title, Well Indicator, Stage Coords, Calibration Status
     BoxLayout:
         size_hint_y: None
         height: '42dp'
@@ -109,15 +70,15 @@
             color: (1, 1, 1, 1)
 
         Label:
-            text: "Active Well: " + root.current_well_display
+            text: "Well: " + root.current_well_display
             font_size: '12sp'
             bold: True
-            size_hint_x: 0.18
+            size_hint_x: 0.15
             color: (0.3, 0.8, 1.0, 1)
 
         Label:
             text: root.stage_coord_str
-            size_hint_x: 0.30
+            size_hint_x: 0.33
             font_size: '11sp'
             bold: True
             color: (0.4, 0.8, 1.0, 1)
@@ -129,23 +90,23 @@
             bold: True
             color: (0.2, 0.9, 0.4, 1) if "Calibrated" in root.calibrated_status else (0.9, 0.3, 0.3, 1)
 
-    # Main Unified Single-Window Layout: 2 Columns
+    # Main Single-Window UI Body: Left & Right Columns
     BoxLayout:
         orientation: 'horizontal'
         spacing: '10dp'
 
-        # LEFT COLUMN: Live Camera Feed & Hardware Control Deck (Width: 50%)
+        # LEFT COLUMN (Width: 48%): Live Viewport & Hardware Controls Deck
         BoxLayout:
             orientation: 'vertical'
-            size_hint_x: 0.50
+            size_hint_x: 0.48
             spacing: '8dp'
 
-            # Embedded Live Camera Feed
+            # Live Camera Feed Viewport (With Reticle Crosshair & Double-Click Centering)
             ZoomPanCameraWidget:
                 id: main_camera_viewport
                 size_hint_y: 0.58
 
-            # Hardware Control Deck Panel
+            # Hardware Control Deck
             ScrollView:
                 size_hint_y: 0.42
                 BoxLayout:
@@ -162,14 +123,14 @@
                             size: self.size
 
                     Label:
-                        text: "Hardware Motion, Light & Camera Deck"
+                        text: "Hardware & Illumination Controls"
                         font_size: '12sp'
                         bold: True
                         size_hint_y: None
                         height: '20dp'
                         color: (0.3, 0.8, 1.0, 1)
 
-                    # Camera Setup & Illumination Controls
+                    # Camera Settings & Illumination Toggle
                     GridLayout:
                         cols: 2
                         spacing: '6dp'
@@ -185,7 +146,7 @@
                                     text: "Exp (ms):"
                                     font_size: '10sp'
                                 TextInput:
-                                    text: str(app.exposure_ms)
+                                    text: str(app.camera_exposure_ms)
                                     multiline: False
                                     font_size: '10sp'
                                     on_text_validate: app.set_af_exposure(self.text)
@@ -195,7 +156,7 @@
                                     text: "Gain:"
                                     font_size: '10sp'
                                 TextInput:
-                                    text: str(app.gain)
+                                    text: str(app.camera_gain)
                                     multiline: False
                                     font_size: '10sp'
 
@@ -209,7 +170,7 @@
                                 font_size: '11sp'
                                 bold: True
                                 background_color: (0.2, 0.8, 0.4, 1) if app.is_light_on else (0.4, 0.4, 0.4, 1)
-                                on_release: app.toggle_light_state(self.state == 'down')
+                                on_release: app.toggle_light_state()
 
                             BoxLayout:
                                 Label:
@@ -219,377 +180,255 @@
                                     text: str(app.led_power)
                                     multiline: False
                                     font_size: '10sp'
-                                    on_text_validate: app.led_power = float(self.text) if self.text else 100.0
+                                    on_text_validate: app.set_led_power(self.text)
 
-                    # Motion Stage XY & Z Focus Motion Deck
-                    GridLayout:
-                        cols: 2
-                        spacing: '6dp'
+                    # Coarse & Fine Stage Motion Deck
+                    BoxLayout:
+                        orientation: 'vertical'
+                        spacing: '4dp'
                         size_hint_y: None
                         height: '115dp'
-
-                        # XY Stage Jogging (Large & Fine Step Buttons)
-                        BoxLayout:
-                            orientation: 'vertical'
-                            spacing: '2dp'
-
-                            Label:
-                                text: "XY Stage Motion"
-                                font_size: '10sp'
-                                bold: True
-
-                            GridLayout:
-                                cols: 5
-                                spacing: '2dp'
-                                size_hint_y: None
-                                height: '55dp'
-
-                                Widget:
-                                Button:
-                                    text: "++Y"
-                                    font_size: '9sp'
-                                    on_release: app.jog_stage(0, 5.0, 0)
-                                Button:
-                                    text: "+Y"
-                                    font_size: '9sp'
-                                    on_release: app.jog_stage(0, 0.5, 0)
-                                Button:
-                                    text: "--Y"
-                                    font_size: '9sp'
-                                    on_release: app.jog_stage(0, -5.0, 0)
-                                Widget:
-
-                                Button:
-                                    text: "--X"
-                                    font_size: '9sp'
-                                    on_release: app.jog_stage(-5.0, 0, 0)
-                                Button:
-                                    text: "-X"
-                                    font_size: '9sp'
-                                    on_release: app.jog_stage(-0.5, 0, 0)
-                                Button:
-                                    text: "0"
-                                    font_size: '9sp'
-                                    on_release: app.jog_stage_to(-49.5, 31.5)
-                                Button:
-                                    text: "+X"
-                                    font_size: '9sp'
-                                    on_release: app.jog_stage(0.5, 0, 0)
-                                Button:
-                                    text: "++X"
-                                    font_size: '9sp'
-                                    on_release: app.jog_stage(5.0, 0, 0)
-
-                                Widget:
-                                Widget:
-                                Button:
-                                    text: "-Y"
-                                    font_size: '9sp'
-                                    on_release: app.jog_stage(0, -0.5, 0)
-                                Widget:
-                                Widget:
-
-                        # Z Focus Fine & Coarse Jogging
-                        BoxLayout:
-                            orientation: 'vertical'
-                            spacing: '2dp'
-
-                            Label:
-                                text: "Z Focus Motor Controls"
-                                font_size: '10sp'
-                                bold: True
-
-                            GridLayout:
-                                cols: 3
-                                spacing: '2dp'
-
-                                Button:
-                                    text: "+100u"
-                                    font_size: '9sp'
-                                    on_release: app.jog_z_focus(100.0)
-                                Button:
-                                    text: "+10u"
-                                    font_size: '9sp'
-                                    on_release: app.jog_z_focus(10.0)
-                                Button:
-                                    text: "+1u"
-                                    font_size: '9sp'
-                                    on_release: app.jog_z_focus(1.0)
-
-                                Button:
-                                    text: "-100u"
-                                    font_size: '9sp'
-                                    on_release: app.jog_z_focus(-100.0)
-                                Button:
-                                    text: "-10u"
-                                    font_size: '9sp'
-                                    on_release: app.jog_z_focus(-10.0)
-                                Button:
-                                    text: "-1u"
-                                    font_size: '9sp'
-                                    on_release: app.jog_z_focus(-1.0)
-
-                            BoxLayout:
-                                Label:
-                                    text: "AF Range (+/-um):"
-                                    font_size: '9sp'
-                                TextInput:
-                                    text: str(app.focus_map.af_search_range_um)
-                                    multiline: False
-                                    font_size: '9sp'
-                                    on_text_validate: app.set_af_search_range(self.text)
-
-                    # Objective Preset Spinner & Capture Snapshot
-                    BoxLayout:
-                        size_hint_y: None
-                        height: '28dp'
-                        spacing: '6dp'
+                        padding: '4dp'
+                        canvas.before:
+                            Color:
+                                rgba: 0.14, 0.16, 0.20, 1
+                            Rectangle:
+                                pos: self.pos
+                                size: self.size
 
                         Label:
-                            text: "Objective Preset:"
-                            size_hint_x: 0.35
-                            font_size: '10sp'
+                            text: "XY Stage & Z Focus Jogging (Coarse / Fine)"
+                            font_size: '11sp'
                             bold: True
+                            color: (0.3, 0.8, 1.0, 1)
 
-                        Spinner:
-                            text: "20x Air"
-                            values: ["1.25x", "4x", "5x", "10x", "20x Air", "20x", "40x", "60x Oil", "63x", "100x Oil"]
-                            size_hint_x: 0.40
-                            font_size: '10sp'
-                            on_text: app.set_objective_preset(self.text)
+                        # XY Stage Controls (Coarse ++ and Fine +)
+                        GridLayout:
+                            cols: 5
+                            spacing: '2dp'
+                            size_hint_y: None
+                            height: '52dp'
 
-                        Button:
-                            text: "Capture PNG"
-                            size_hint_x: 0.25
-                            background_color: (0.2, 0.6, 0.8, 1)
-                            font_size: '10sp'
-                            bold: True
-                            on_release: app.capture_snapshot()
+                            Widget:
+                            Button:
+                                text: "++Y (5mm)"
+                                font_size: '9sp'
+                                on_release: app.jog_stage(0, 5.0, 0)
+                            Button:
+                                text: "+Y (0.5mm)"
+                                font_size: '9sp'
+                                on_release: app.jog_stage(0, 0.5, 0)
+                            Widget:
+                            Widget:
 
-        # RIGHT COLUMN: Embedded Microplate Registration Studio (Width: 50%)
+                            Button:
+                                text: "--X (5mm)"
+                                font_size: '9sp'
+                                on_release: app.jog_stage(-5.0, 0, 0)
+                            Button:
+                                text: "-X (0.5mm)"
+                                font_size: '9sp'
+                                on_release: app.jog_stage(-0.5, 0, 0)
+                            Button:
+                                text: "0 (A1)"
+                                font_size: '9sp'
+                                bold: True
+                                on_release: app.jog_stage_to(-49.5, 31.5)
+                            Button:
+                                text: "+X (0.5mm)"
+                                font_size: '9sp'
+                                on_release: app.jog_stage(0.5, 0, 0)
+                            Button:
+                                text: "++X (5mm)"
+                                font_size: '9sp'
+                                on_release: app.jog_stage(5.0, 0, 0)
+
+                            Widget:
+                            Button:
+                                text: "--Y (5mm)"
+                                font_size: '9sp'
+                                on_release: app.jog_stage(0, -5.0, 0)
+                            Button:
+                                text: "-Y (0.5mm)"
+                                font_size: '9sp'
+                                on_release: app.jog_stage(0, -0.5, 0)
+                            Widget:
+                            Widget:
+
+                        # Z Focus Controls
+                        BoxLayout:
+                            spacing: '2dp'
+                            size_hint_y: None
+                            height: '24dp'
+
+                            Label:
+                                text: "Z Focus:"
+                                font_size: '10sp'
+                                bold: True
+                                size_hint_x: 0.2
+                            Button:
+                                text: "-100u"
+                                font_size: '8sp'
+                                on_release: app.jog_z_focus(-100.0)
+                            Button:
+                                text: "-10u"
+                                font_size: '8sp'
+                                on_release: app.jog_z_focus(-10.0)
+                            Button:
+                                text: "-1u"
+                                font_size: '8sp'
+                                on_release: app.jog_z_focus(-1.0)
+                            Button:
+                                text: "+1u"
+                                font_size: '8sp'
+                                on_release: app.jog_z_focus(1.0)
+                            Button:
+                                text: "+10u"
+                                font_size: '8sp'
+                                on_release: app.jog_z_focus(10.0)
+                            Button:
+                                text: "+100u"
+                                font_size: '8sp'
+                                on_release: app.jog_z_focus(100.0)
+
+                    Button:
+                        text: "Capture Snapshot PNG"
+                        size_hint_y: None
+                        height: '32dp'
+                        background_color: (0.2, 0.6, 0.8, 1)
+                        bold: True
+                        font_size: '11sp'
+                        on_release: app.capture_snapshot()
+
+        # RIGHT COLUMN (Width: 52%): Embedded Microplate Registration Map & Channels Studio
         BoxLayout:
             orientation: 'vertical'
-            size_hint_x: 0.50
-            spacing: '6dp'
+            size_hint_x: 0.52
+            spacing: '8dp'
 
-            # Microplate Map Format Selection Header
+            # Microplate Map & Objective Selection Bar
             BoxLayout:
                 size_hint_y: None
-                height: '32dp'
+                height: '34dp'
                 spacing: '8dp'
                 padding: '4dp'
                 canvas.before:
                     Color:
-                        rgba: 0.14, 0.16, 0.22, 1
+                        rgba: 0.12, 0.15, 0.20, 1
                     Rectangle:
                         pos: self.pos
                         size: self.size
 
                 Label:
-                    text: "Plate Format Map:"
+                    text: "Plate Map:"
                     bold: True
-                    font_size: '11sp'
-                    size_hint_x: 0.4
-                    color: (0.3, 0.8, 1.0, 1)
+                    font_size: '10sp'
+                    size_hint_x: 0.20
 
                 Spinner:
                     id: plate_format_spinner
                     text: "96-Well Plate"
                     values: ["6-Well Plate", "12-Well Plate", "24-Well Plate", "48-Well Plate", "96-Well Plate", "384-Well Plate"]
-                    size_hint_x: 0.6
-                    font_size: '11sp'
+                    size_hint_x: 0.30
+                    font_size: '10sp'
                     bold: True
-                    on_text: app.set_well_plate_format(self.text)
+                    on_text: app.change_well_plate_format(self.text)
 
-            # Embedded Studio Tabbed Panel
-            TabbedPanel:
-                id: main_tabbed_panel
-                do_default_tab: False
-                tab_width: '140dp'
+                Label:
+                    text: "Objective:"
+                    bold: True
+                    font_size: '10sp'
+                    size_hint_x: 0.20
 
-                # TAB 1: Calibration & Microplate Registration Studio
-                TabbedPanelItem:
-                    text: '1. Calibration'
-                    BoxLayout:
-                        orientation: 'vertical'
-                        spacing: '6dp'
-                        padding: '6dp'
+                Spinner:
+                    id: main_objective_spinner
+                    text: "20x Air"
+                    values: ["1.25x", "4x", "5x", "10x", "20x Air", "20x", "40x", "60x Oil", "63x", "100x Oil"]
+                    size_hint_x: 0.30
+                    font_size: '10sp'
+                    bold: True
+                    on_text: app.set_objective_preset(self.text)
 
-                        InteractiveScaledPlateCanvas:
-                            id: scaled_canvas_tab1
-                            size_hint_y: 0.65
+            # Embedded Microplate Canvas (Top-Right UI)
+            InteractiveScaledPlateCanvas:
+                id: scaled_canvas_tab1
+                size_hint_y: 0.58
 
-                        Label:
-                            text: "Double-click any well to move stage directly to well center."
-                            font_size: '10sp'
-                            size_hint_y: None
-                            height: '18dp'
-                            color: (0.7, 0.7, 0.7, 1)
-
-                        BoxLayout:
-                            size_hint_y: None
-                            height: '28dp'
-                            spacing: '6dp'
-
-                            Button:
-                                text: "Select All"
-                                font_size: '10sp'
-                                on_release: app.fov_manager.select_all_wells(); scaled_canvas_tab1.redraw_canvas()
-
-                            Button:
-                                text: "Clear All"
-                                font_size: '10sp'
-                                on_release: app.fov_manager.clear_all_wells(); scaled_canvas_tab1.redraw_canvas()
-
-                            Button:
-                                text: "Sync Channels"
-                                background_color: (0.2, 0.5, 0.8, 1)
-                                font_size: '10sp'
-                                bold: True
-                                on_release: app.global_sync_active_channels()
-
-                        # Precision 6-Point Target Registration Wizard
-                        BoxLayout:
-                            orientation: 'vertical'
-                            size_hint_y: None
-                            height: '110dp'
-                            padding: '4dp'
-                            spacing: '4dp'
-                            canvas.before:
-                                Color:
-                                    rgba: 0.14, 0.14, 0.20, 1
-                                Rectangle:
-                                    pos: self.pos
-                                    size: self.size
-
-                            BoxLayout:
-                                size_hint_y: None
-                                height: '22dp'
-                                spacing: '6dp'
-
-                                Label:
-                                    text: "Calib Channel:"
-                                    size_hint_x: 0.35
-                                    bold: True
-                                    font_size: '10sp'
-
-                                Spinner:
-                                    text: "Brightfield"
-                                    values: ["Brightfield", "Phase", "Darkfield", "Blue", "Green", "Red"]
-                                    size_hint_x: 0.65
-                                    font_size: '10sp'
-                                    on_text: app.set_primary_af_channel(self.text)
-
-                            Label:
-                                text: "Move stage to target rims on microplate map to compute registration."
-                                size_hint_y: None
-                                height: '18dp'
-                                color: (0.9, 0.9, 0.2, 1)
-                                font_size: '10sp'
-
-                            BoxLayout:
-                                size_hint_y: None
-                                height: '28dp'
-                                spacing: '8dp'
-
-                                Button:
-                                    text: "Mark Stage Position"
-                                    background_color: (0.2, 0.7, 0.3, 1)
-                                    bold: True
-                                    font_size: '10sp'
-                                    on_release: app.record_calibration_step(); scaled_canvas_tab1.redraw_canvas()
-
-                                Button:
-                                    text: "Finish Calibration"
-                                    background_color: (0.8, 0.4, 0.2, 1)
-                                    bold: True
-                                    font_size: '10sp'
-                                    on_release: app.finish_plate_calibration(); scaled_canvas_tab1.redraw_canvas()
-
-                # TAB 2: AF Dialogue & Time-Lapse Schedule
-                TabbedPanelItem:
-                    text: '2. AF Dialogue'
-                    BoxLayout:
-                        orientation: 'vertical'
-                        spacing: '8dp'
-                        padding: '8dp'
-
-                        Label:
-                            text: "Autofocus Search Scan & Time-Lapse Schedule"
-                            font_size: '13sp'
-                            bold: True
-                            size_hint_y: None
-                            height: '22dp'
-
-                        Button:
-                            text: "Set Stage Position as Master Auto Point (Red)"
-                            size_hint_y: None
-                            height: '28dp'
-                            background_color: (0.8, 0.2, 0.2, 1)
-                            bold: True
-                            font_size: '11sp'
-                            on_release: app.set_master_auto_point(); scaled_canvas_tab1.redraw_canvas()
-
-                        Button:
-                            text: "Test Autofocus Acquisition"
-                            size_hint_y: None
-                            height: '28dp'
-                            background_color: (0.2, 0.6, 0.8, 1)
-                            bold: True
-                            font_size: '11sp'
-                            on_release: app.test_autofocus_run()
-
-                        Widget:
-
-                # TAB 3: Hardware Protocol & Tiling Matrix
-                TabbedPanelItem:
-                    text: '3. Protocol Engine'
-                    BoxLayout:
-                        orientation: 'vertical'
-                        spacing: '8dp'
-                        padding: '8dp'
-
-                        Label:
-                            text: "Hardware Protocol Engine & 12x12 Tiling"
-                            font_size: '13sp'
-                            bold: True
-                            size_hint_y: None
-                            height: '22dp'
-
-                        Button:
-                            text: "Apply Protocol to Experiment Execution Engine & Save"
-                            size_hint_y: None
-                            height: '38dp'
-                            background_color: (0.2, 0.7, 0.4, 1)
-                            bold: True
-                            font_size: '12sp'
-                            on_release: app.generate_and_apply_protocol()
-
-                        Widget:
-
-            # Optical Channels Selection Panel (Single Channel Selected)
             Label:
-                text: "Optical Channels (Select One to Illuminate)"
-                font_size: '11sp'
-                bold: True
+                text: "Double-click any well to move stage focus directly to that well center."
+                font_size: '9sp'
                 size_hint_y: None
-                height: '20dp'
-                color: (0.4, 0.8, 1.0, 1)
+                height: '16dp'
+                color: (0.7, 0.7, 0.7, 1)
 
+            # Registration Target Wizard Buttons
             BoxLayout:
-                id: main_channel_container
-                orientation: 'vertical'
                 size_hint_y: None
-                height: self.minimum_height
-                spacing: '4dp'
+                height: '28dp'
+                spacing: '6dp'
 
-    # Bottom Status Bar
+                Button:
+                    text: "Mark Stage Position"
+                    background_color: (0.2, 0.7, 0.3, 1)
+                    bold: True
+                    font_size: '10sp'
+                    on_release: app.record_calibration_step(); scaled_canvas_tab1.redraw_canvas()
+
+                Button:
+                    text: "Finish Calibration"
+                    background_color: (0.8, 0.4, 0.2, 1)
+                    bold: True
+                    font_size: '10sp'
+                    on_release: app.finish_plate_calibration(); scaled_canvas_tab1.redraw_canvas()
+
+                Button:
+                    text: "Select All"
+                    font_size: '10sp'
+                    on_release: app.fov_manager.select_all_wells(); scaled_canvas_tab1.redraw_canvas()
+
+                Button:
+                    text: "Clear All"
+                    font_size: '10sp'
+                    on_release: app.fov_manager.clear_all_wells(); scaled_canvas_tab1.redraw_canvas()
+
+            # Optical Channels Panel (Single Active Channel Mutual Exclusion)
+            BoxLayout:
+                orientation: 'vertical'
+                spacing: '4dp'
+                size_hint_y: 0.42
+
+                Label:
+                    text: "Optical Channels (Click to Illuminate)"
+                    font_size: '12sp'
+                    bold: True
+                    size_hint_y: None
+                    height: '20dp'
+                    color: (0.3, 0.8, 1.0, 1)
+
+                ScrollView:
+                    BoxLayout:
+                        id: main_channel_container
+                        orientation: 'vertical'
+                        size_hint_y: None
+                        height: self.minimum_height
+                        spacing: '4dp'
+
+                Button:
+                    text: "[ Launch Plate Navigator Studio ]"
+                    size_hint_y: None
+                    height: '35dp'
+                    background_color: (0.2, 0.7, 0.4, 1)
+                    bold: True
+                    font_size: '12sp'
+                    on_release: app.open_navigator_popup()
+
+    # Footer Status Bar
     BoxLayout:
         size_hint_y: None
         height: '26dp'
         canvas.before:
             Color:
-                rgba: 0.1, 0.1, 0.1, 1
+                rgba: 0.10, 0.10, 0.12, 1
             Rectangle:
                 pos: self.pos
                 size: self.size

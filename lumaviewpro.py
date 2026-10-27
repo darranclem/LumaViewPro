@@ -31,8 +31,9 @@ import numpy as np
 
 import image_utils
 import labware
-import plate_navigator
+import plate_navigator  # TOP-LEVEL IMPORT REQUIRED FOR FACTORY REGISTRATION
 
+# Kivy framework imports
 import kivy
 kivy.require('2.0.0')
 
@@ -158,8 +159,7 @@ class ZoomPanCameraWidget(Widget):
     Interactive Live Camera Viewport Widget supporting:
     - Live Frame Texture Rendering
     - Red Reticle Crosshairs Overlay at Center of Viewport
-    - Mouse Wheel Zooming (Zoom In / Zoom Out)
-    - Right-Click Drag Panning in X and Y
+    - Mouse Wheel Zooming (0.5x to 5.0x) and Right-Click Drag Panning
     - Double-Click Pixel Centering (moves stage so clicked pixel becomes FOV center)
     """
     zoom_level = NumericProperty(1.0)
@@ -186,7 +186,7 @@ class ZoomPanCameraWidget(Widget):
 
         try:
             h, w = frame_array.shape[:2]
-            # Flip image vertically for Kivy coordinates using pure NumPy
+            # Flip image vertically for Kivy coordinate space using pure NumPy
             flipped = np.ascontiguousarray(frame_array[::-1, :, :])
             
             texture = Texture.create(size=(w, h), colorfmt='bgr')
@@ -197,7 +197,7 @@ class ZoomPanCameraWidget(Widget):
             print(f"[ZoomPanCameraWidget Error] set_frame failed: {e}")
 
     def redraw_viewport(self, *args):
-        """Draws camera frame texture + central red reticle crosshairs on canvas."""
+        """Draws camera texture centered on canvas with reticle crosshairs overlay."""
         self.canvas.clear()
         if self.width <= 0 or self.height <= 0:
             return
@@ -320,29 +320,24 @@ class LumaViewProMainLayout(BoxLayout):
 class LumaViewProApp(App):
     """Main Application Controller."""
 
-    # System State Properties
+    # Class-level Kivy Property Declarations (matching KV bindings)
     is_light_on = BooleanProperty(False)  # Sensor starts dark (black window) on launch
-    is_live_imaging = BooleanProperty(True)
     active_channel = StringProperty("Brightfield")
-    led_power = NumericProperty(100.0)
-    exposure_ms = NumericProperty(20.0)
-    camera_exposure_ms = NumericProperty(20.0)
-    gain = NumericProperty(1.0)
     camera_gain = NumericProperty(1.0)
+    gain = NumericProperty(1.0)
+    camera_exposure_ms = NumericProperty(20.0)
+    exposure_ms = NumericProperty(20.0)
+    led_power = NumericProperty(100.0)
     jog_step_mm = NumericProperty(1.0)
 
-    focus_map = ObjectProperty(None)
     fov_manager = ObjectProperty(None)
+    focus_map = ObjectProperty(None)
     plate_calibration = ObjectProperty(None)
     well_plate_format = ObjectProperty(None)
     channel_manager = ObjectProperty(None)
-    root_layout = ObjectProperty(None)
 
     def load_kv(self, filename=None):
-        """Single instance load guard to prevent duplicate UI parsing."""
-        if not hasattr(self, '_kv_loaded_flag'):
-            self._kv_loaded_flag = True
-            return super().load_kv(filename)
+        """Single-instance load guard: prevents Kivy App from loading lumaviewpro.kv a second time."""
         return None
 
     def build(self):
@@ -367,6 +362,12 @@ class LumaViewProApp(App):
 
         self.root_layout = LumaViewProMainLayout()
         self.build_channel_controls()
+
+        # Connect references to embedded plate canvas in right column
+        if hasattr(self.root_layout, 'ids') and 'scaled_canvas_tab1' in self.root_layout.ids:
+            self.root_layout.ids.scaled_canvas_tab1.set_references(
+                self.well_plate_format, self.plate_calibration, self.focus_map, self.fov_manager
+            )
 
         # Schedule live camera feed loop at 20 FPS
         Clock.schedule_interval(self.update_live_feed, 1.0 / 20.0)
@@ -459,38 +460,26 @@ class LumaViewProApp(App):
         """Alias for channel selection."""
         self.select_channel(channel_name)
 
-    def toggle_light_state(self, is_down: bool = True):
+    def toggle_light_state(self, is_on: bool = None):
         """Toggles camera illumination light ON or OFF."""
-        self.is_light_on = is_down
-        state_str = "ON" if self.is_light_on else "OFF (Dark Frame)"
+        if is_on is None:
+            self.is_light_on = not self.is_light_on
+        else:
+            self.is_light_on = is_on
+        state_str = "ON" if self.is_light_on else "OFF"
         self.root_layout.status_msg = f"Illumination Light set to {state_str}"
         self.build_channel_controls()
 
-    def build_channel_controls(self):
-        """Populates optical channel list in the UI safely."""
-        if getattr(self, '_updating_channel_ui', False):
-            return
-        if not hasattr(self.root_layout, 'ids') or 'main_channel_container' not in self.root_layout.ids:
-            return
+    def toggle_light(self):
+        self.toggle_light_state()
 
-        self._updating_channel_ui = True
+    def set_led_power(self, power_str: str):
         try:
-            container = self.root_layout.ids.main_channel_container
-            container.clear_widgets()
-
-            for ch_name, ch_cfg in self.channel_manager.channels.items():
-                widget = ChannelControlWidget()
-                widget.channel_name = ch_name
-                widget.is_active = (ch_name == self.active_channel and self.is_light_on)
-                widget.btn_bg_color = ch_cfg.btn_color
-                if ch_cfg.is_transmitted:
-                    widget.channel_spec_info = f"{ch_cfg.excitation_range_nm}"
-                else:
-                    widget.channel_spec_info = f"Ex: {ch_cfg.excitation_range_nm} | Em: {ch_cfg.emission_range_nm}"
-                widget.ref_image_path = os.path.basename(ch_cfg.ref_image_path) if ch_cfg.ref_image_path else "No Ref Image"
-                container.add_widget(widget)
-        finally:
-            self._updating_channel_ui = False
+            val = float(power_str)
+            self.led_power = max(0.0, min(100.0, val))
+            self.root_layout.status_msg = f"LED Power set to {self.led_power:.0f}%"
+        except ValueError:
+            pass
 
     def jog_stage(self, dx: float, dy: float, dz: float):
         """Jogs stage coordinates along X, Y, or Z axis."""
@@ -499,30 +488,17 @@ class LumaViewProApp(App):
         self.stage_z += dz
         self.root_layout.stage_coord_str = f"Stage: X={self.stage_x:.2f}, Y={self.stage_y:.2f}, Z={self.stage_z:.3f} mm"
 
-    def jog_z_focus(self, delta_um: float):
+    def jog_z_stage(self, delta_um: float):
         """Jogs Z focus in micrometers."""
         self.jog_stage(0.0, 0.0, delta_um / 1000.0)
 
+    def jog_z_focus(self, delta_um: float):
+        """Alias for Z focus jog."""
+        self.jog_z_stage(delta_um)
+
     def jog_z(self, delta_um: float):
         """Alias for Z focus jog."""
-        self.jog_z_focus(delta_um)
-
-    
-    def zero_stage(self):
-        self.jog_stage_to(-49.5, 31.5)
-
-    def set_exposure_ms(self, val):
-        self.set_af_exposure(val)
-
-    def set_led_power(self, val):
-        try:
-            self.led_power = float(val)
-            self.root_layout.status_msg = f"LED Power set to {self.led_power:.0f}%"
-        except Exception:
-            pass
-
-    def toggle_live_feed(self):
-        self.is_live_imaging = not self.is_live_imaging
+        self.jog_z_stage(delta_um)
 
     def jog_stage_to(self, x_mm: float, y_mm: float):
         """Moves stage directly to target X, Y coordinates (e.g. from double-clicking well canvas)."""
@@ -610,6 +586,8 @@ class LumaViewProApp(App):
     def set_af_exposure(self, exposure_str: str):
         try:
             val = float(exposure_str)
+            self.camera_exposure_ms = val
+            self.exposure_ms = val
             self.focus_map.set_af_camera_config(self.focus_map.af_binning, val)
             self.root_layout.status_msg = f"AF Exposure Time set to {val:.1f} ms"
         except ValueError:
@@ -649,7 +627,6 @@ class LumaViewProApp(App):
         sim_frame = image_utils.generate_simulated_frame(
             stage_z=self.stage_z,
             best_z=2.5,
-            binning=self.focus_map.af_binning,
             is_light_on=True
         )
         af_score = image_utils.compute_focus_score(sim_frame, method="laplacian")
@@ -661,12 +638,11 @@ class LumaViewProApp(App):
         af_frame = image_utils.generate_simulated_frame(
             stage_z=self.stage_z,
             best_z=self.stage_z,
-            binning=self.focus_map.af_binning,
             is_light_on=True
         )
         score = image_utils.compute_focus_score(af_frame, method="laplacian")
         del af_frame
-        self.root_layout.status_msg = f"[Test AF Run] Channel: {self.focus_map.primary_af_channel} | Binning: {self.focus_map.af_binning} | Focus Score: {score:.2f} (Frame Discarded)"
+        self.root_layout.status_msg = f"[Test AF Run] Channel: {self.focus_map.primary_af_channel} | Score: {score:.2f} (Frame Discarded)"
 
     def set_chromatic_z_offset(self, channel_name: str):
         self.focus_map.set_chromatic_z_offset(channel_name, self.stage_z)
@@ -678,7 +654,7 @@ class LumaViewProApp(App):
         self.focus_map.apply_nyquist_to_af_config()
         self.root_layout.status_msg = f"Nyquist Step Applied: {nyquist_step_um:.3f} um (Depth of Field: {dof_um:.3f} um, Total Steps: {self.focus_map.af_num_steps})"
 
-    def apply_grid_settings(self, rows_str: str, cols_str: str, single_af: bool):
+    def apply_grid_settings(self, rows_str: str, cols_str: str, single_af: bool = True):
         try:
             r = int(rows_str)
             c = int(cols_str)
@@ -700,11 +676,10 @@ class LumaViewProApp(App):
             self.fov_manager
         )
         print("[Protocol Generated]\n", json.dumps(protocol, indent=2))
-        self.root_layout.status_msg = f"Hardware Protocol Saved! Selected Wells: {protocol['total_selected_wells']}"
+        self.root_layout.status_msg = f"Hardware Protocol Saved! Selected Wells: {protocol['selected_wells_count']}"
         return protocol
 
     def capture_snapshot(self):
-        """Captures image snapshot from camera buffer."""
         active_ch = self.channel_manager.get_active_channel_name()
         frame = image_utils.generate_well_plate_cell_frame(
             stage_x=self.stage_x,
@@ -714,6 +689,7 @@ class LumaViewProApp(App):
             channel=active_ch,
             is_light_on=self.is_light_on,
             led_power=self.led_power,
+            sensor_size=(512, 512),
             fov_size_mm=(self.focus_map.fov_width_mm, self.focus_map.fov_height_mm),
             num_wells=self.well_plate_format.num_wells
         )
@@ -748,15 +724,25 @@ class LumaViewProApp(App):
         popup.open()
 
 
-# Register Kivy Factory Classes before loading KV rules
-Factory.register('ZoomPanCameraWidget', cls=ZoomPanCameraWidget)
-Factory.register('ChannelControlWidget', cls=ChannelControlWidget)
-Factory.register('LumaViewProMainLayout', cls=LumaViewProMainLayout)
-Factory.register('InteractiveScaledPlateCanvas', cls=plate_navigator.InteractiveScaledPlateCanvas)
+# Safe Factory registration
+if 'ZoomPanCameraWidget' not in Factory.classes:
+    Factory.register('ZoomPanCameraWidget', cls=ZoomPanCameraWidget)
+if 'ChannelControlWidget' not in Factory.classes:
+    Factory.register('ChannelControlWidget', cls=ChannelControlWidget)
+if 'LumaViewProMainLayout' not in Factory.classes:
+    Factory.register('LumaViewProMainLayout', cls=LumaViewProMainLayout)
+if 'InteractiveScaledPlateCanvas' not in Factory.classes:
+    Factory.register('InteractiveScaledPlateCanvas', cls=plate_navigator.InteractiveScaledPlateCanvas)
+if 'PlateNavigatorPopup' not in Factory.classes:
+    Factory.register('PlateNavigatorPopup', cls=plate_navigator.PlateNavigatorPopup)
 
 _main_kv = os.path.join(script_dir, 'lumaviewpro.kv')
 if os.path.exists(_main_kv) and _main_kv not in Builder.files:
     Builder.load_file(_main_kv)
+
+_nav_kv = os.path.join(script_dir, 'plate_navigator.kv')
+if os.path.exists(_nav_kv) and _nav_kv not in Builder.files:
+    Builder.load_file(_nav_kv)
 
 
 if __name__ == '__main__':

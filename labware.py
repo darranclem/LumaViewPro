@@ -3,14 +3,12 @@ labware.py - Labware representations, well plate registration, focus map gradien
 tiled FOV management, autofocus camera binning, objective presets, motorised turret configuration,
 and time-lapse cycle skip configuration for LumaViewPro.
 
-Provides:
+Features:
 - Standard ANSI/SLAS multi-well plate specifications (6, 12, 24, 48, 96, 384 well plates)
 - Top-Left A1 Orientation (Row letters A,B,C... down left; Column numbers 1,2,3... across top)
 - Precision 6-Point Target Plate Registration Engine (2D Affine Transformation)
 - Primary Autofocus Channel, Camera Binning & Per-Channel Z-Offset Architecture
-- Objective Lens Presets (1.25x, 4x, 5x, 10x, 20x Air, 20x, 40x, 60x Oil, 63x, 100x Oil) with NA, Mag, and true FOV dimensions
-- Autofocus Search Range (+/- um), Nyquist Step Calculator (DoF, NA, Wavelength, Immersion Index)
-- Autofocus Skip Cycle Control & Time-Lapse Schedule Engine
+- Objective Lens Presets (1.25x, 4x, 5x, 10x, 20x Air, 40x, 60x Oil, 63x, 100x Oil) with Scaled Sample FOV
 - Tiled Field-Of-View (FOV) Matrix Generator (1x1 up to 12x12 tiles per well)
 - Hardware Protocol Generator bridging software settings to underlying motion/camera layers.
 """
@@ -22,7 +20,7 @@ import numpy as np
 from typing import Dict, Tuple, List, Optional, Set, Union
 
 
-# Objective Lens Physical Specifications & Presets Dictionary
+# Objective Lens Presets Dictionary
 OBJECTIVE_PRESETS = {
     "1.25x": {
         "mag": 1.25,
@@ -189,12 +187,11 @@ class WellPlateFormat:
 
     def parse_well_name(self, well_name: str) -> Tuple[int, int]:
         """Parses well name string ('A1', 'H12') into 0-indexed (row_idx, col_idx)."""
-        well_name = well_name.strip().upper()
-        match = re.match(r"([A-Za-z]+)(\d+)", well_name)
+        match = re.match(r"([A-Za-z]+)(\d+)", well_name.strip())
         if not match:
             raise ValueError(f"Invalid well name: {well_name}")
         r_str, c_str = match.groups()
-        row_idx = ord(r_str[0]) - ord('A')
+        row_idx = ord(r_str.upper()) - ord('A')
         col_idx = int(c_str) - 1
         return row_idx, col_idx
 
@@ -355,8 +352,6 @@ class FocusMap:
         self.af_exposure_ms: float = 20.0
         self.save_af_images: bool = False
 
-        self.active_objective_preset: str = "20x Air"
-
         self.af_search_range_um: float = 50.0
         self.af_step_size_um: float = 2.0
         self.af_num_steps: int = 51
@@ -366,26 +361,27 @@ class FocusMap:
         self.timelapse_interval_mins: float = 10.0
         self.timelapse_total_cycles: int = 24
 
+        self.active_objective_preset: str = "20x Air"
         self.lens_na: float = 0.45
         self.lens_mag: float = 20.0
         self.wavelength_nm: float = 525.0
         self.refractive_index: float = 1.0
+
+        self.hardware_type: str = "Manual Nosepiece"
+        self.motorised_turret_enabled: bool = False
+        self.auto_switch_turret_on_start: bool = True
+        self.turret_slot_assignments: Dict[int, str] = {
+            1: "4x", 2: "10x", 3: "20x Air", 4: "40x", 5: "60x Oil", 6: "100x Oil"
+        }
+        self.per_channel_turret_slots: Dict[str, int] = {
+            ch: 3 for ch in self.SUPPORTED_PRIMARY_CHANNELS
+        }
 
         self.master_auto_point: Optional[FocusPoint] = None
         self.set_points: List[FocusPoint] = []
         self.channel_chromatic_offsets_mm: Dict[str, float] = {ch: 0.0 for ch in self.SUPPORTED_PRIMARY_CHANNELS}
         self.accepted_channels: Dict[str, bool] = {ch: True for ch in self.SUPPORTED_PRIMARY_CHANNELS}
         self.plane_params: Optional[Tuple[float, float, float]] = None
-
-    @property
-    def fov_width_mm(self) -> float:
-        preset = OBJECTIVE_PRESETS.get(self.active_objective_preset, OBJECTIVE_PRESETS["20x Air"])
-        return float(preset.get("fov_width_mm", preset.get("fov_w_mm", 0.60)))
-
-    @property
-    def fov_height_mm(self) -> float:
-        preset = OBJECTIVE_PRESETS.get(self.active_objective_preset, OBJECTIVE_PRESETS["20x Air"])
-        return float(preset.get("fov_height_mm", preset.get("fov_h_mm", 0.45)))
 
     @property
     def selected_objective(self) -> str:
@@ -395,13 +391,27 @@ class FocusMap:
     def selected_objective(self, val: str):
         self.set_objective_preset(val)
 
+    @property
+    def fov_width_mm(self) -> float:
+        preset = OBJECTIVE_PRESETS.get(self.active_objective_preset, OBJECTIVE_PRESETS["20x Air"])
+        return preset.get("fov_width_mm", preset.get("fov_w_mm", 0.60))
+
+    @property
+    def fov_height_mm(self) -> float:
+        preset = OBJECTIVE_PRESETS.get(self.active_objective_preset, OBJECTIVE_PRESETS["20x Air"])
+        return preset.get("fov_height_mm", preset.get("fov_h_mm", 0.45))
+
+    def set_hardware_nosepiece(self, hardware_type: str):
+        self.hardware_type = hardware_type
+        self.motorised_turret_enabled = (hardware_type == "Motorised Turret")
+
     def set_objective_preset(self, preset_name: str):
         if preset_name in OBJECTIVE_PRESETS:
             self.active_objective_preset = preset_name
             cfg = OBJECTIVE_PRESETS[preset_name]
-            self.lens_mag = float(cfg.get("mag", cfg.get("magnification", 20.0)))
-            self.lens_na = float(cfg.get("na", 0.45))
-            self.refractive_index = float(cfg.get("refractive_index", 1.0))
+            self.lens_mag = cfg.get("mag", cfg.get("magnification", 20.0))
+            self.lens_na = cfg["na"]
+            self.refractive_index = cfg["refractive_index"]
             self.apply_nyquist_to_af_config()
 
     def calculate_optical_nyquist(self) -> Tuple[float, float]:
@@ -419,25 +429,35 @@ class FocusMap:
             self.af_num_steps = int((2.0 * self.af_search_range_um) / self.af_step_size_um) + 1
 
     def set_primary_af_channel(self, channel_name: str):
-        if channel_name in self.SUPPORTED_PRIMARY_CHANNELS:
-            self.primary_af_channel = channel_name
+        alias_map = {"BF": "Brightfield", "Pseudo Darkfield": "Darkfield", "DAPI": "Blue", "FITC": "Green", "TxRed": "Red", "Cy5": "Red"}
+        resolved = alias_map.get(channel_name, channel_name)
+        if resolved in self.SUPPORTED_PRIMARY_CHANNELS:
+            self.primary_af_channel = resolved
 
     def set_af_camera_config(self, binning: str, exposure_ms: float):
         if binning in self.SUPPORTED_BINNING_MODES:
             self.af_binning = binning
         self.af_exposure_ms = max(0.1, float(exposure_ms))
 
-    def set_af_cycle_interval(self, val: int):
-        self.af_cycle_interval = max(1, int(val))
+    def set_af_cycle_interval(self, interval_cycles: int):
+        self.af_cycle_interval = max(1, int(interval_cycles))
 
     def set_time_lapse_config(self, enabled: bool, interval_mins: float, cycles: int):
         self.timelapse_enabled = enabled
-        self.time_interval_minutes = max(0.1, float(interval_mins))
-        self.total_cycles = max(1, int(cycles))
+        self.timelapse_interval_mins = max(0.1, float(interval_mins))
+        self.timelapse_total_cycles = max(1, int(cycles))
 
     def set_master_auto_point(self, x_stage: float, y_stage: float, z_primary: float):
         self.master_auto_point = FocusPoint('AUTO', 'Auto', x_stage, y_stage, z_primary, is_autofocus=True)
         self.fit_focus_plane()
+
+    def set_chromatic_z_offset(self, channel_name: str, z_channel_val: float):
+        alias_map = {"BF": "Brightfield", "Pseudo Darkfield": "Darkfield", "DAPI": "Blue", "FITC": "Green", "TxRed": "Red", "Cy5": "Red"}
+        resolved = alias_map.get(channel_name, channel_name)
+        if self.master_auto_point is not None:
+            self.channel_chromatic_offsets_mm[resolved] = z_channel_val - self.master_auto_point.z_primary
+        else:
+            self.channel_chromatic_offsets_mm[resolved] = 0.0
 
     def add_set_point(self, x_stage: float, y_stage: float, z_primary: float, is_autofocus: bool = True) -> FocusPoint:
         label = f"Set {len(self.set_points) + 1}"
@@ -446,11 +466,11 @@ class FocusMap:
         self.fit_focus_plane()
         return pt
 
-    def set_chromatic_z_offset(self, channel_name: str, z_channel_val: float):
-        if self.master_auto_point is not None:
-            self.channel_chromatic_offsets_mm[channel_name] = z_channel_val - self.master_auto_point.z_primary
-        else:
-            self.channel_chromatic_offsets_mm[channel_name] = 0.0
+    def clear_all(self):
+        self.master_auto_point = None
+        self.set_points.clear()
+        self.plane_params = None
+        self.channel_chromatic_offsets_mm = {ch: 0.0 for ch in self.SUPPORTED_PRIMARY_CHANNELS}
 
     def get_all_active_points(self) -> List[FocusPoint]:
         pts = []
@@ -478,7 +498,9 @@ class FocusMap:
             return False
 
     def interpolate_z(self, x_stage: float, y_stage: float, channel_name: str = "Brightfield") -> float:
-        chromatic_offset = self.channel_chromatic_offsets_mm.get(channel_name, 0.0)
+        alias_map = {"BF": "Brightfield", "Pseudo Darkfield": "Darkfield", "DAPI": "Blue", "FITC": "Green", "TxRed": "Red", "Cy5": "Red"}
+        resolved = alias_map.get(channel_name, channel_name)
+        chromatic_offset = self.channel_chromatic_offsets_mm.get(resolved, 0.0)
 
         if self.plane_params is not None:
             a, b, c = self.plane_params
@@ -607,7 +629,8 @@ class ExperimentProtocol:
         plate_format: WellPlateFormat,
         calibration: NavigatorPlateCalibration,
         focus_map: FocusMap,
-        fov_manager: PlateFOVManager
+        fov_manager: PlateFOVManager,
+        output_dir: Optional[str] = None
     ) -> dict:
         protocol_wells = []
         accepted_channel_list = [ch for ch, is_acc in focus_map.accepted_channels.items() if is_acc]
@@ -648,13 +671,27 @@ class ExperimentProtocol:
                 "tiles": tiles_data
             })
 
+        est_duration_hrs = (
+            (focus_map.timelapse_interval_mins * focus_map.timelapse_total_cycles) / 60.0
+            if focus_map.timelapse_enabled else 0.0
+        )
+
+        curr_preset_info = OBJECTIVE_PRESETS.get(focus_map.active_objective_preset, {})
+
         return {
+            "output_directory": output_dir or "~/LumaViewPro_Experiments",
             "labware_format": f"{plate_format.num_wells}-Well Plate",
             "is_calibrated": calibration.is_calibrated,
             "calibration_rotation_deg": float(calibration.rotation_angle_deg),
-            "selected_objective": focus_map.selected_objective,
-            "fov_width_mm": float(focus_map.fov_width_mm),
-            "fov_height_mm": float(focus_map.fov_height_mm),
+            "objective_lens_configuration": {
+                "selected_preset": focus_map.active_objective_preset,
+                "magnification": float(focus_map.lens_mag),
+                "numerical_aperture": float(focus_map.lens_na),
+                "refractive_index": float(focus_map.refractive_index),
+                "fov_width_mm": float(focus_map.fov_width_mm),
+                "fov_height_mm": float(focus_map.fov_height_mm),
+                "description": curr_preset_info.get("desc", "")
+            },
             "autofocus_configuration": {
                 "primary_autofocus_channel": focus_map.primary_af_channel,
                 "camera_binning": focus_map.af_binning,
@@ -663,6 +700,8 @@ class ExperimentProtocol:
                 "af_step_size_um": float(focus_map.af_step_size_um),
                 "af_num_steps": int(focus_map.af_num_steps),
                 "af_cycle_interval": int(focus_map.af_cycle_interval),
+                "optical_depth_of_field_um": float(dof_um),
+                "optical_nyquist_z_step_um": float(nyquist_step_um),
             },
             "total_selected_wells": len(protocol_wells),
             "wells": protocol_wells
