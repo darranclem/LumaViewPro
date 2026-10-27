@@ -1,11 +1,12 @@
 """
-luma_sim.py - Offline Hardware Simulator for LumaViewPro.
+luma_sim.py - Offline Hardware Simulator for LumaViewPro 4.0.0-beta
 
-Mocks camera acquisition (pyloncamera) and stage motion (motorboard / ledboard)
-with real-time synthetic cell colony generation across multi-well microplates.
-Enables offline desktop development and testing without physical microscope hardware.
+Mocks camera acquisition (pyloncamera), stage motion (motorboard), and illumination (ledboard)
+with real-time synthetic cell colony generation across SBS microplates.
+Enables offline desktop development and testing of LumaViewPro without physical hardware.
 """
 
+from __future__ import annotations
 import sys
 import os
 import types
@@ -16,29 +17,43 @@ if script_dir not in sys.path:
 
 import image_utils
 
-print("[LumaViewPro Simulator] Initializing offline hardware & camera mocks...")
+print("[LumaViewPro Simulator] Initializing offline hardware & synthetic camera mocks...")
 
 
 class MockCamera:
     def __init__(self):
         self.is_connected = True
-        self.exposure_ms = 100.0
+        self.is_live = True
+        self.is_light_on = False  # Default launch state: Light OFF (dark camera feed)
+        self.exposure_ms = 20.0
         self.gain = 1.0
-        self.is_light_on = False
         self.led_power = 100.0
         self.active_channel = "Brightfield"
-        self.stage_x = -49.5
+        self.stage_x = -49.5  # Well A1 default
         self.stage_y = 31.5
         self.stage_z = 0.0
-        self.best_z = 2.5
-        self.fov_size_mm = (0.60, 0.45)
-        self.num_wells = 96
+        self.best_z = 0.0
 
     def connect(self) -> bool:
         return True
 
     def disconnect(self):
         pass
+
+    def set_exposure(self, exp: float):
+        self.exposure_ms = float(exp)
+
+    def set_gain(self, g: float):
+        self.gain = float(g)
+
+    def set_led_power(self, power: float):
+        self.led_power = float(power)
+
+    def set_channel(self, channel_name: str):
+        self.active_channel = channel_name
+
+    def set_stage_position(self, x: float, y: float, z: float):
+        self.stage_x, self.stage_y, self.stage_z = x, y, z
 
     def get_frame(self):
         return image_utils.generate_well_plate_cell_frame(
@@ -51,8 +66,6 @@ class MockCamera:
             exposure_ms=self.exposure_ms,
             gain=self.gain,
             led_power=self.led_power,
-            fov_size_mm=self.fov_size_mm,
-            num_wells=self.num_wells,
             sensor_size=(512, 512)
         )
 
