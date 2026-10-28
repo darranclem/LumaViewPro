@@ -1,66 +1,55 @@
-# LumaViewPro Integration Guide & Dual-Execution Instructions
+# LumaViewPro Integration & User Guide
 
-LumaViewPro is a unified, single-window microscope automation and registration control software written in Python and Kivy.
+## Architectural Highlights
+
+1. **Unified Single-Window Kivy Architecture**:
+   - **Top Navigation Bar**: Active Well indicator, real-time stage motor coordinates `(X, Y, Z)`, and Calibration Status.
+   - **Top-Left Quadrant**: Live camera feed viewport (`ZoomPanCameraWidget`) with red reticle crosshairs and **1:1 double-click pixel centering**. Double-clicking any pixel feature in the camera image moves that specific feature directly under the central red reticle.
+   - **Bottom-Left Quadrant**: Microscope Motion, Illumination & Camera Control Deck (`Light: ON/OFF`, Exposure, Gain, LED Power, Grouped XY Motion Cross, Z Focus Column, Snapshot Capture).
+   - **Top-Right Quadrant**: Interactive Microplate Canvas Map (`InteractiveScaledPlateCanvas`) with **1:1 double-click stage navigation**. Double-clicking any well or coordinate jumps the FOV directly to that location.
+   - **Bottom-Right Quadrant**: Optical Channels Selection Panel (strict single-channel mutual exclusion) + 3-Tab Registration Studio.
+
+2. **Default Dark Sensor Launch State**:
+   - The application launches in a dark sensor state (`is_light_on = False`). The live camera feed renders dark sensor noise until illumination is explicitly toggled **ON** or an optical channel button is selected.
+
+3. **Selective Hardware Device Connectivity**:
+   - `lumaviewpro.py` independently checks USB connectivity for `camera_connected`, `stage_connected`, `focus_connected`, and `led_connected`.
+   - If the USB camera is not attached, the camera viewport displays a `CAMERA DISCONNECTED` warning frame while keeping stage motor controls, keyboard arrow shortcuts, Z focus, and microplate canvas navigation 100% active and responsive.
+
+4. **Interactive 6-Point Target Registration Wizard**:
+   - Located in Tab 1 (**`1. Calib`**) of the bottom-right Studio Panel:
+     - **`Start Calib`**: Turns illumination Light **ON** and drives stage to Step 1 target (Well A1 - 12 o'clock top rim).
+     - **`Mark Target`**: Records stage position for current target point and advances to the next step.
+     - **`< Prev`** & **`Next >`**: Cycles forward/backward through all 6 target calibration points.
+     - **`Done`**: Computes and applies the 2D Affine Transformation matrix (A1 center, well diameter, row/col pitch, rotation angle).
+     - **`Reset`**: Clears recorded calibration points.
+
+5. **Optically Accurate Frame Simulation & Z Defocus Blur**:
+   - Renders double-ring well wall rims, rich internal cellular colony structures (cytoplasm, nuclei, membrane borders), inter-well plastic molding grid lines, and outer plate skirt borders.
+   - Symmetrical Gaussian defocus blur simulates physical focus displacement `|stage_z - best_z|`.
 
 ---
 
-## Directory Structure
+## Execution Instructions
 
-```text
-LumaViewPro-main/
-├── lumaviewpro.py       # Main Application Controller & Kivy Event Engine
-├── lumaviewpro.kv       # Single-Window UI Layout Definition
-├── luma_sim.py          # Offline Desktop Hardware Simulator Launcher
-├── plate_navigator.py   # Microplate Registration Map & Canvas Engine
-├── plate_navigator.kv   # Canvas Layout Rules & Styling Definitions
-├── labware.py           # SLAS Specs, Objective Presets & 6-Point Target Calibration Matrix
-├── image_utils.py       # Camera Feed Generator, Defocus Blur, and Focus Metrics
-└── INTEGRATION_GUIDE.md # Execution Instructions
-```
-
----
-
-## Execution Modes
-
-### 1. Offline Desktop Simulator Mode (Upstairs PC)
-To run and test the complete single-window UI, microplate map, live camera feed, and 6-point wizard offline without microscope hardware:
-
+### Running in Offline Desktop Simulator Mode (Desktop PC)
 ```powershell
 Set-Location H:\Trae\Projects\LumaViewPro-main
 .\venv\Scripts\Activate.ps1
 python luma_sim.py
 ```
 
-* **Default Launch**: Launches in dark sensor state (`is_light_on = False`).
-* **Illumination Control**: Click the **`Light: OFF`** toggle or select any optical channel button (`Brightfield`, `Phase`, `Darkfield`, `Blue`, `Green`, `Red`) to turn illumination **ON**.
-* **Navigation**: Double-click any well on the top-right microplate map, or double-click any pixel in the camera feed to center that feature directly under the red reticle.
-
-### 2. Real Microscope Hardware Mode (Downstairs PC)
-To operate the physical microscope attached via USB:
-
+### Running on Physical Microscope PC (Downstairs Hardware)
 ```powershell
 Set-Location H:\Trae\Projects\LumaViewPro-main
 .\venv\Scripts\Activate.ps1
 python lumaviewpro.py
 ```
 
-* Connects directly to physical USB hardware drivers (`pyloncamera`, `motorboard`, `ledboard`).
-* If camera hardware is not detected, displays a **`CAMERA DISCONNECTED`** warning overlay while keeping stage and focus controls functional.
-
----
-
-## 6-Point Target Calibration Wizard Workflow
-
-Located in Tab 1 (**`1. Calib`**) of the bottom-right Studio Panel:
-
-1. **Click `Start Calib`**:
-   - Turns illumination Light **ON**.
-   - Displays the 6 target calibration marks on the microplate canvas map.
-   - Drives stage to Step 1: **Well A1 — 12 o'clock top rim**.
-2. **Align & Click `Mark`**:
-   - Align the central red reticle on the well rim edge using stage jog controls or live viewport double clicks.
-   - Click **`Mark`**: Records current position and drives the stage to the next target position.
-3. **`Next >` & `< Prev`**:
-   - Cycle forward or backward through the 6 calibration target points.
-4. **Click `Done`**:
-   - Computes and applies the 2D Affine Transformation matrix.
+### Git Commit & Push Checkpoint
+```powershell
+Set-Location H:\Trae\Projects\LumaViewPro-main
+git add .
+git commit -m "Update LumaViewPro single-window UI, 6-point wizard controls, and synthetic feed feature rendering"
+git push -u origin main
+```

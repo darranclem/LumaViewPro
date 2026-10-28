@@ -1,11 +1,21 @@
+# --- Kivy Graphical User Interface ---
 kivy==2.3.0
 kivy-deps.angle==0.4.0
 kivy-deps.glew==0.3.2
-kivy-deps.sdl2==0.8.0
-opencv-python
-numpy
-Pillow
-jgo
-scyjava
-imglyb
-pyimagej
+kivy-deps.sdl2==0.7.0
+
+# --- Core Computer Vision & Mathematical Processing ---
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# --- Hardware Communication & Microscope Drivers ---
+pypylon>=2.1.0        # Basler USB camera driver bindings
+pyserial>=3.5         # Serial communication for stage motor board and LED board
+pywin32>=306          # Windows low-level hardware device calls
+
+# --- Stock Java / ImageJ / SciJava Interoperability Bridge ---
+jgo>=1.0.5
+scyjava>=1.9.1
+imglyb>=2.1.0
+pyimagej>=1.4.1
