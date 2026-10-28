@@ -1,6 +1,5 @@
 """
-image_utils.py - Fast, cached image processing, flat-field shading correction, focus metrics,
-and synthetic camera frame generation for LumaViewPro.
+image_utils.py - Image processing, shading correction, focus metrics, and synthetic camera frame generator for LumaViewPro.
 """
 
 from __future__ import annotations
@@ -8,9 +7,9 @@ import os
 import cv2
 import numpy as np
 import math
-from typing import Optional, Tuple, Union, Dict, List
+from typing import Optional, Tuple, Union, List, Dict
 
-# Pre-computed cell colony coordinate cache
+# Pre-computed cell colony coordinate cache for 20 FPS live simulation
 _CELL_CACHE: Dict[Tuple[int, int], List[Tuple[float, float, float]]] = {}
 
 
@@ -39,6 +38,7 @@ _init_cell_cache()
 
 
 def load_image(filepath: str) -> Optional[np.ndarray]:
+    """Loads an image file (TIFF, PNG, JPG) into a numpy array."""
     if not os.path.exists(filepath):
         return None
     try:
@@ -50,12 +50,9 @@ def load_image(filepath: str) -> Optional[np.ndarray]:
 
 
 def save_image(filepath: str, img: np.ndarray) -> bool:
-    try:
-        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
-        return cv2.imwrite(filepath, img)
-    except Exception as e:
-        print(f"[Error] Failed to save image {filepath}: {e}")
-        return False
+    """Saves an image to disk preserving original depth."""
+    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+    return cv2.imwrite(filepath, img)
 
 
 def apply_shading_correction(
@@ -64,6 +61,7 @@ def apply_shading_correction(
     dark_img: Optional[np.ndarray] = None,
     clip_output: bool = True
 ) -> np.ndarray:
+    """Applies flat-field shading correction to normalize uneven illumination."""
     if raw_img is None or ref_img is None:
         return raw_img
 
@@ -98,6 +96,7 @@ def apply_shading_correction(
 
 
 def compute_focus_score(img: np.ndarray, method: str = "laplacian") -> float:
+    """Calculates image sharpness/focus metric for autofocus algorithms."""
     if img is None or img.size == 0:
         return 0.0
 
@@ -114,7 +113,8 @@ def compute_focus_score(img: np.ndarray, method: str = "laplacian") -> float:
     elif method.lower() == "tenengrad":
         sobel_x = cv2.Sobel(gray_f, cv2.CV_32F, 1, 0, ksize=3)
         sobel_y = cv2.Sobel(gray_f, cv2.CV_32F, 0, 1, ksize=3)
-        return float(np.mean(sobel_x**2 + sobel_y**2))
+        grad_sq = sobel_x**2 + sobel_y**2
+        return float(np.mean(grad_sq))
     elif method.lower() == "brenner":
         diff_x = gray_f[:, 2:] - gray_f[:, :-2]
         return float(np.mean(diff_x**2))
@@ -124,21 +124,27 @@ def compute_focus_score(img: np.ndarray, method: str = "laplacian") -> float:
 
 
 def generate_disconnected_camera_frame(sensor_size: Tuple[int, int] = (512, 512)) -> np.ndarray:
-    """Generates a dark frame with 'CAMERA DISCONNECTED' overlay for stock lumaviewpro.py when hardware is absent."""
+    """Generates a high-contrast dark frame displaying 'CAMERA DISCONNECTED' overlay."""
     w, h = sensor_size
     frame = np.zeros((h, w, 3), dtype=np.uint8)
     
-    # Subtle dark noise
-    noise = np.random.normal(loc=4.0, scale=1.5, size=(h, w, 3)).astype(np.int16)
-    frame = np.clip(noise, 0, 255).astype(np.uint8)
-
-    # Disconnected Camera Icon / Text Overlay
-    cx, cy = w // 2, h // 2
-    cv2.circle(frame, (cx, cy - 30), 40, (50, 50, 180), 2)
-    cv2.line(frame, (cx - 30, cy - 60), (cx + 30, cy), (50, 50, 180), 3)
-
-    cv2.putText(frame, "CAMERA DISCONNECTED", (cx - 150, cy + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 80, 220), 2)
-    cv2.putText(frame, "No Microscope Hardware Detected", (cx - 165, cy + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 120, 150), 1)
+    cv2.rectangle(frame, (15, 15), (w - 15, h - 15), (25, 25, 32), -1)
+    cv2.rectangle(frame, (15, 15), (w - 15, h - 15), (60, 60, 80), 2)
+    
+    cx, cy = w // 2, h // 2 - 30
+    cv2.circle(frame, (cx, cy), 35, (0, 0, 180), -1)
+    cv2.circle(frame, (cx, cy), 35, (0, 0, 255), 3)
+    cv2.line(frame, (cx - 15, cy - 15), (cx + 15, cy + 15), (255, 255, 255), 4)
+    cv2.line(frame, (cx + 15, cy - 15), (cx - 15, cy + 15), (255, 255, 255), 4)
+    
+    txt1 = "NO CAMERA DETECTED"
+    txt2 = "CAMERA FEED DISCONNECTED"
+    txt3 = "Stage & Hardware Motion Controls Active"
+    
+    cv2.putText(frame, txt1, (cx - 130, cy + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 100, 255), 2, cv2.LINE_AA)
+    cv2.putText(frame, txt2, (cx - 145, cy + 95), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(frame, txt3, (cx - 155, cy + 125), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 100), 1, cv2.LINE_AA)
+    
     return frame
 
 
@@ -154,26 +160,26 @@ def generate_well_plate_cell_frame(
     power: float = 100.0,
     sensor_size: Tuple[int, int] = (512, 512),
     fov_size_mm: Tuple[float, float] = (0.60, 0.45),
-    is_light_on: bool = False,
+    is_light_on: bool = True,
     num_wells: int = 96,
     **kwargs
 ) -> np.ndarray:
     """
-    Generates synthetic high-resolution camera frames for offline simulator.
-    - If is_light_on is False: Returns dark camera sensor noise frame (black window).
-    - If is_light_on is True: Renders well interior disks, cell colonies, well rim outlines,
-      and 0 intensity (pitch black) outside all well rims.
-    - Z Defocus Blur: Gaussian blur increases smoothly with distance |stage_z - best_z|.
+    Generates synthetic camera frames across multi-well plates.
+    Outside well boundaries, pixel intensity is 0 (pitch black plastic).
+    Inside well boundaries, renders cells and well edge rims in channel pseudocolors.
+    Z-focus defocus blur applies Gaussian blur proportional to |stage_z - best_z|.
+    Magnification scaling: fov_size_mm controls optical zoom.
     """
     w, h = sensor_size
 
-    # 1. Dark Launch / Light OFF State (Black camera feed)
-    if not is_light_on or channel.upper() in ["OFF", "NONE", ""]:
+    # 1. Dark sensor noise when illumination light is OFF
+    if not is_light_on:
         dark_noise = np.random.normal(loc=2.5, scale=1.0, size=(h, w, 3)).astype(np.int16)
         return np.clip(dark_noise, 0, 255).astype(np.uint8)
 
     p_val = led_power if led_power is not None else power
-    p_factor = max(0.05, min(1.5, float(p_val) / 100.0))
+    p_factor = max(0.05, min(1.5, p_val / 100.0))
     exp_factor = max(0.1, min(3.0, (exposure_ms / 20.0) * gain))
     brightness = p_factor * exp_factor
 
@@ -186,8 +192,8 @@ def generate_well_plate_cell_frame(
     fov_bottom = stage_y - fov_h / 2.0
     fov_top = stage_y + fov_h / 2.0
 
-    # Well plate physical layouts (SLAS standard specifications)
-    well_specs = {
+    # Determine well geometry for num_wells
+    well_formats = {
         6: (2, 3, 39.12, 39.12, 34.8, -39.12, 19.56),
         12: (3, 4, 26.0, 26.0, 22.1, -39.0, 26.0),
         24: (4, 6, 19.3, 19.3, 15.6, -48.25, 28.95),
@@ -195,7 +201,7 @@ def generate_well_plate_cell_frame(
         96: (8, 12, 9.0, 9.0, 6.4, -49.5, 31.5),
         384: (16, 24, 4.5, 4.5, 3.8, -51.75, 33.75)
     }
-    rows, cols, pitch_x, pitch_y, well_d, a1_x, a1_y = well_specs.get(num_wells, well_specs[96])
+    rows, cols, pitch_x, pitch_y, well_d, a1_x, a1_y = well_formats.get(num_wells, well_formats[96])
     well_r_mm = well_d / 2.0
 
     wells = []
@@ -207,7 +213,7 @@ def generate_well_plate_cell_frame(
 
     ch_l = channel.lower()
 
-    # Define color LUT for well interior background and cells (BGR format)
+    # Determine Base Colors for Active Channel LUT (BGR format)
     if "blue" in ch_l or "dapi" in ch_l:
         bg_color = np.array([25, 10, 5], dtype=np.float32)
         cell_color = np.array([255, 180, 40], dtype=np.float32)   # Pure Blue BGR
@@ -221,24 +227,60 @@ def generate_well_plate_cell_frame(
         cell_color = np.array([30, 40, 250], dtype=np.float32)    # Pure Red BGR
         rim_color = np.array([30, 30, 120], dtype=np.float32)
     elif "darkfield" in ch_l or "df" in ch_l:
-        bg_color = np.array([15, 15, 20], dtype=np.float32)
+        bg_color = np.array([15, 15, 20], dtype=np.float32)       # Inverted darkfield
         cell_color = np.array([220, 220, 240], dtype=np.float32)
         rim_color = np.array([180, 180, 200], dtype=np.float32)
     elif "phase" in ch_l:
-        bg_color = np.array([175, 175, 180], dtype=np.float32)
-        cell_color = np.array([40, 40, 45], dtype=np.float32)
+        v = 175 * brightness
+        bg_color = np.array([v, v, v], dtype=np.float32)
+        c_v = 40 * brightness
+        cell_color = np.array([c_v, c_v, c_v], dtype=np.float32)
         rim_color = np.array([100, 100, 110], dtype=np.float32)
-    else:  # Brightfield (Monochrome Grayscale)
-        bg_color = np.array([220, 220, 220], dtype=np.float32)
-        cell_color = np.array([70, 70, 80], dtype=np.float32)
+    else:  # Brightfield
+        v = 220 * brightness
+        bg_color = np.array([v, v, v], dtype=np.float32)
+        c_v = 70 * brightness
+        cell_color = np.array([c_v, c_v, c_v], dtype=np.float32)
         rim_color = np.array([110, 110, 120], dtype=np.float32)
 
-    bg_c = tuple(int(x) for x in np.clip(bg_color * brightness, 0, 255))
+    # Outer Plate Skirt & Stage Aperture Background (Dark Brushed Metal)
+    frame = np.full((h, w, 3), 42, dtype=np.float32)
+
+    # Inter-Well Plastic Skirt (Between Wells inside plate boundary)
+    plate_left = -63.88
+    plate_right = 63.88
+    plate_bottom = -42.74
+    plate_top = 42.74
+
+    # Check if FOV overlaps the physical plate footprint
+    if not (fov_right < plate_left or fov_left > plate_right or fov_top < plate_bottom or fov_bottom > plate_top):
+        # Draw dark gray plastic plate body
+        pl_px_x1 = max(0, int(((plate_left - fov_left) / fov_w) * w))
+        pl_px_x2 = min(w, int(((plate_right - fov_left) / fov_w) * w))
+        pl_px_y1 = max(0, int(((fov_top - plate_top) / fov_h) * h))
+        pl_px_y2 = min(h, int(((fov_top - plate_bottom) / fov_h) * h))
+
+        if pl_px_x2 > pl_px_x1 and pl_px_y2 > pl_px_y1:
+            frame[pl_px_y1:pl_px_y2, pl_px_x1:pl_px_x2] = (100 * p_factor, 100 * p_factor, 105 * p_factor)
+
+            # Draw Inter-Well Plastic Grid Rib Lines
+            for r in range(rows + 1):
+                gy = a1_y + pitch_y / 2.0 - r * pitch_y
+                if fov_bottom <= gy <= fov_top:
+                    gy_px = int(((fov_top - gy) / fov_h) * h)
+                    if 0 <= gy_px < h:
+                        cv2.line(frame, (pl_px_x1, gy_px), (pl_px_x2, gy_px), (65 * p_factor, 65 * p_factor, 70 * p_factor), 1)
+
+            for c in range(cols + 1):
+                gx = a1_x - pitch_x / 2.0 + c * pitch_x
+                if fov_left <= gx <= fov_right:
+                    gx_px = int(((gx - fov_left) / fov_w) * w)
+                    if 0 <= gx_px < w:
+                        cv2.line(frame, (gx_px, pl_px_y1), (gx_px, pl_px_y2), (65 * p_factor, 65 * p_factor, 70 * p_factor), 1)
+
+    bg_c = np.clip(bg_color * brightness, 0, 255)
     cell_c = tuple(int(x) for x in np.clip(cell_color * brightness, 0, 255))
     rim_c = tuple(int(x) for x in np.clip(rim_color * brightness, 0, 255))
-
-    # Frame starts as 0 intensity (pitch black outside all wells)
-    frame = np.zeros((h, w, 3), dtype=np.float32)
 
     # Render wells overlapping active FOV
     for wx, wy, r_idx, c_idx in wells:
@@ -249,7 +291,7 @@ def generate_well_plate_cell_frame(
             well_r_px = int((well_r_mm / fov_w) * w)
 
             # Draw filled well interior
-            cv2.circle(frame, (well_px_x, well_px_y), well_r_px, bg_c, -1)
+            cv2.circle(frame, (well_px_x, well_px_y), well_r_px, tuple(int(x) for x in bg_c), -1)
 
             # Draw cell colonies inside well
             cell_list = _CELL_CACHE.get((r_idx % 16, c_idx % 24), [])
@@ -264,11 +306,11 @@ def generate_well_plate_cell_frame(
                         if 0 <= c_px_x < w and 0 <= c_px_y < h:
                             cv2.circle(frame, (c_px_x, c_px_y), c_r_px, cell_c, -1)
 
-            # Draw well edge rim line
+            # Draw double-ring well edge rim line
             rim_w_px = max(2, int((0.15 / fov_w) * w))
             cv2.circle(frame, (well_px_x, well_px_y), well_r_px, rim_c, rim_w_px)
 
-    out_img = np.clip(frame, 0, 255).astype(np.uint8)
+    out_frame = np.clip(frame, 0, 255).astype(np.uint8)
 
     # Z defocus blur simulation
     dist_z = abs(stage_z - best_z)
@@ -278,9 +320,9 @@ def generate_well_plate_cell_frame(
             blur_k += 1
         blur_k = max(1, min(blur_k, 31))
         if blur_k > 1:
-            out_img = cv2.GaussianBlur(out_img, (blur_k, blur_k), 0)
+            out_frame = cv2.GaussianBlur(out_frame, (blur_k, blur_k), 0)
 
-    return out_img
+    return out_frame
 
 
 def generate_simulated_frame(*args, **kwargs) -> np.ndarray:
