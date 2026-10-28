@@ -1,0 +1,5 @@
+[HW_LOG 122765.297s] === Starting LumaViewPro Hardware Initialisation & Handshake ===
+[HW_LOG 122765.297s] X USB Camera Driver offline/unattached: No module named 'pyloncamera'
+[HW_LOG 122765.297s] X Stage Motor Driver offline/unattached: No module named 'motorboard'
+[HW_LOG 122765.297s] X LED Board Driver offline/unattached: No module named 'ledboard'
+[HW_LOG 122765.297s] Hardware State -> Camera: False, Stage/Focus: False, LED: False

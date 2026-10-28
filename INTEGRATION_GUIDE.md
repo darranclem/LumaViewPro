@@ -1,52 +1,31 @@
-# LumaViewPro Integration & Hardware Diagnostics Guide
+# LumaViewPro Architecture & Hardware Setup Guide
 
-## 1. Overview
-LumaViewPro supports both physical microscope hardware operation and an offline desktop simulator.
+## Architecture Overview
 
-- **`lumaviewpro.py`**: Main microscope control controller. Handshakes directly with physical Etaluma drivers (`pyloncamera`, `motorboard`, `ledboard`). On unattached PCs, it renders the `CAMERA DISCONNECTED` warning frame and disables motion, providing a clear offline sense check.
-- **`luma_sim.py`**: Offline desktop hardware simulator injecting mock drivers (`MockCamera`, `MockStage`, `MockLEDBoard`). Enables testing of live feeds, stage jogging, objective magnification scaling, and the 6-point target calibration wizard without physical hardware.
-- **`hw_debug.py`**: Standalone hardware diagnostic script. Inspects installed drivers, tests connection handshakes, captures test camera frames, and writes a detailed report to `hardware_debug.log`.
+LumaViewPro uses a dual-environment design separating real microscope hardware control from offline desktop simulation:
 
----
+1. **`lumaviewpro.py` (Real Microscope Control Application)**:
+   - Connects to physical Etaluma hardware modules (`pyloncamera`, `motorboard`, `ledboard`).
+   - When connected to the microscope, commands drive real stage motors, objective turrets, and LED channels.
+   - When launched on an unattached PC (no microscope connected), displays a clean **"CAMERA DISCONNECTED"** warning frame without simulating fake hardware motion.
 
-## 2. Running Hardware Diagnostics on the Microscope PC
-
-When setting up or troubleshooting the physical microscope, run:
-
-```powershell
-python hw_debug.py
-```
-
-This generates `hardware_debug.log` detailing:
-- Module import status for `pyloncamera`, `motorboard`, and `ledboard`.
-- Return types and values from `connect()` and `is_connected`.
-- Frame grab results from `get_frame()`.
-- Full tracebacks if any driver calls raise exceptions.
+2. **`luma_sim.py` (Offline Desktop Hardware Simulator)**:
+   - Injects mock drivers for `pyloncamera`, `motorboard`, and `ledboard`.
+   - Generates high-resolution synthetic camera frames with cell colonies, well rims, inter-well grid lines, and Z-focus defocus blur.
 
 ---
 
-## 3. Running LumaViewPro Applications
+## 6-Point Target Calibration Wizard Workflow
 
-### Physical Microscope Hardware Mode (Downstairs PC)
-```powershell
-Set-Location H:\Trae\Projects\LumaViewPro-main
-.\venv\Scripts\Activate.ps1
-python lumaviewpro.py
-```
+Located in Tab 1 (`1. Calibration`) of the Studio Panel:
 
-### Offline Desktop Simulator Mode (Upstairs PC)
-```powershell
-Set-Location H:\Trae\Projects\LumaViewPro-main
-.\venv\Scripts\Activate.ps1
-python luma_sim.py
-```
-
----
-
-## 4. Hardware Driver Handshaking Summary
-
-| Hardware Module | Class Name | Connection Method | Return Value Handshake |
-| :--- | :--- | :--- | :--- |
-| **USB Camera** | `pyloncamera.PylonCamera` | `cam.connect()` | `None` / `True` (Checked via `res is not False`) |
-| **Stage & Focus Motors** | `motorboard.MotorBoard` | `stg.connect()` | `None` / `True` (Checked via `res is not False`) |
-| **LED Illumination** | `ledboard.LEDBoard` | `leds.connect()` | `None` / `True` (Checked via `res is not False`) |
+1. Click **`Start Calib`**:
+   - Turns illumination Light **ON** automatically.
+   - Reveals all 6 calibration target points on the microplate canvas map.
+   - Drives the stage directly to Step 1 nominal position (`Well A1 — 12 o'clock / top rim`).
+2. Align reticle using stage jog controls or double-clicking the live camera viewport.
+3. Click **`Mark`**:
+   - Records current stage position for Step 1 and automatically moves to Step 2 (`Well A1 — 3 o'clock / right rim`).
+   - Repeat through Step 6 (`Col 1 End — 12 o'clock`).
+4. Click **`Next >`** or **`< Prev`** to cycle through target points without re-marking.
+5. Click **`Done`**: Computes and applies the 2D Affine Transformation matrix.

@@ -1,5 +1,336 @@
 #:kivy 2.0.0
 
-# plate_navigator.kv - Additional widget definitions if needed
-<PlateNavigatorHelperWidget>:
-    Widget:
+<PlateNavigatorPopup>:
+    title: "LumaViewPro - Plate Navigator & Registration Studio"
+    size_hint: 0.96, 0.96
+    content: popup_root_box
+
+    BoxLayout:
+        id: popup_root_box
+        orientation: 'vertical'
+        spacing: '10dp'
+        padding: '10dp'
+
+        TabbedPanel:
+            id: main_tabbed_panel
+            do_default_tab: False
+            tab_width: '180dp'
+
+            # TAB 1: Calibration & Interactive Template Screen
+            TabbedPanelItem:
+                text: '1. Calibration'
+                BoxLayout:
+                    orientation: 'vertical'
+                    spacing: '8dp'
+                    padding: '8dp'
+
+                    BoxLayout:
+                        orientation: 'horizontal'
+                        spacing: '10dp'
+
+                        # Left Column: Interactive Scaled Microplate Template Canvas (A1 Top-Left)
+                        BoxLayout:
+                            orientation: 'vertical'
+                            size_hint_x: 0.50
+                            spacing: '5dp'
+                            canvas.before:
+                                Color:
+                                    rgba: 0.12, 0.14, 0.18, 1
+                                Rectangle:
+                                    pos: self.pos
+                                    size: self.size
+
+                            Label:
+                                text: "Microplate Registration Map"
+                                bold: True
+                                font_size: '12sp'
+                                size_hint_y: None
+                                height: '22dp'
+                                color: (0.3, 0.8, 1.0, 1)
+
+                            InteractiveScaledPlateCanvas:
+                                id: scaled_canvas_tab1
+
+                            # Template Action Buttons
+                            BoxLayout:
+                                size_hint_y: None
+                                height: '30dp'
+                                spacing: '6dp'
+
+                                Button:
+                                    text: "Select All"
+                                    font_size: '10sp'
+                                    on_release: app.fov_manager.select_all_wells(); scaled_canvas_tab1.redraw_canvas()
+
+                                Button:
+                                    text: "Clear All"
+                                    font_size: '10sp'
+                                    on_release: app.fov_manager.clear_all_wells(); scaled_canvas_tab1.redraw_canvas()
+
+                                Button:
+                                    text: "Sync Channels"
+                                    background_color: (0.2, 0.5, 0.8, 1)
+                                    bold: True
+                                    font_size: '10sp'
+                                    on_release: app.global_sync_active_channels()
+
+                            # Registration Target Instruction & Stage Jog Controls
+                            BoxLayout:
+                                orientation: 'vertical'
+                                size_hint_y: None
+                                height: '135dp'
+                                padding: '6dp'
+                                spacing: '4dp'
+                                canvas.before:
+                                    Color:
+                                        rgba: 0.16, 0.16, 0.22, 1
+                                    Rectangle:
+                                        pos: self.pos
+                                        size: self.size
+
+                                Label:
+                                    id: wizard_instruction_label
+                                    text: "Step 1/6: Jog stage to Well A1 - 12 o'clock position (top rim)"
+                                    size_hint_y: None
+                                    height: '20dp'
+                                    color: (0.9, 0.9, 0.2, 1)
+                                    bold: True
+                                    font_size: '10sp'
+
+                                GridLayout:
+                                    cols: 3
+                                    size_hint_y: None
+                                    height: '55dp'
+                                    spacing: '3dp'
+                                    size_hint_x: 0.6
+                                    pos_hint: {'center_x': 0.5}
+
+                                    Widget:
+                                    Button:
+                                        text: "+Y"
+                                        font_size: '9sp'
+                                        on_release: app.jog_stage(0, 1.0, 0)
+                                    Widget:
+                                    Button:
+                                        text: "-X"
+                                        font_size: '9sp'
+                                        on_release: app.jog_stage(-1.0, 0, 0)
+                                    Button:
+                                        text: "A1"
+                                        font_size: '9sp'
+                                        on_release: app.jog_stage(0, 0, 0)
+                                    Button:
+                                        text: "+X"
+                                        font_size: '9sp'
+                                        on_release: app.jog_stage(1.0, 0, 0)
+                                    Widget:
+                                    Button:
+                                        text: "-Y"
+                                        font_size: '9sp'
+                                        on_release: app.jog_stage(0, -1.0, 0)
+                                    Widget:
+
+                                BoxLayout:
+                                    size_hint_y: None
+                                    height: '28dp'
+                                    spacing: '8dp'
+
+                                    Button:
+                                        text: "Mark Stage Position"
+                                        background_color: (0.2, 0.7, 0.3, 1)
+                                        bold: True
+                                        font_size: '10sp'
+                                        on_release: app.record_calibration_step(); scaled_canvas_tab1.redraw_canvas()
+
+                                    Button:
+                                        text: "Finish Calibration"
+                                        background_color: (0.8, 0.4, 0.2, 1)
+                                        bold: True
+                                        font_size: '10sp'
+                                        on_release: app.finish_plate_calibration(); scaled_canvas_tab1.redraw_canvas()
+
+                        # Right Column: Camera Viewport
+                        BoxLayout:
+                            orientation: 'vertical'
+                            size_hint_x: 0.50
+                            spacing: '6dp'
+
+                            ZoomPanCameraWidget:
+                                id: camera_viewport_tab1
+                                size_hint_y: 0.65
+
+                            BoxLayout:
+                                orientation: 'vertical'
+                                size_hint_y: 0.35
+                                spacing: '4dp'
+                                padding: '6dp'
+                                canvas.before:
+                                    Color:
+                                        rgba: 0.14, 0.12, 0.18, 1
+                                    Rectangle:
+                                        pos: self.pos
+                                        size: self.size
+
+                                Label:
+                                    text: "Master Focus Point & Camera Binning Setup"
+                                    bold: True
+                                    font_size: '11sp'
+                                    size_hint_y: None
+                                    height: '18dp'
+                                    color: (1.0, 0.4, 0.4, 1)
+
+                                Button:
+                                    text: "Set Stage Position as Master Auto Point (Red)"
+                                    size_hint_y: None
+                                    height: '26dp'
+                                    background_color: (0.8, 0.2, 0.2, 1)
+                                    bold: True
+                                    font_size: '10sp'
+                                    on_release: app.set_master_auto_point(); scaled_canvas_tab1.redraw_canvas()
+
+                                Button:
+                                    text: "Test Autofocus Acquisition Sweep"
+                                    size_hint_y: None
+                                    height: '26dp'
+                                    background_color: (0.2, 0.6, 0.8, 1)
+                                    bold: True
+                                    font_size: '10sp'
+                                    on_release: app.test_autofocus_run()
+
+            # TAB 2: Autofocus Scan Dialogue, Nyquist Calculator & Skip Cycle Controls
+            TabbedPanelItem:
+                text: '2. AF Dialogue'
+                BoxLayout:
+                    orientation: 'vertical'
+                    spacing: '10dp'
+                    padding: '10dp'
+
+                    BoxLayout:
+                        orientation: 'horizontal'
+                        spacing: '15dp'
+
+                        # Left Column: Camera Viewport
+                        BoxLayout:
+                            orientation: 'vertical'
+                            size_hint_x: 0.45
+                            spacing: '5dp'
+                            canvas.before:
+                                Color:
+                                    rgba: 0.1, 0.12, 0.16, 1
+                                Rectangle:
+                                    pos: self.pos
+                                    size: self.size
+
+                            ZoomPanCameraWidget:
+                                id: camera_viewport_tab2
+
+                        # Right Column: AF Scan Parameters
+                        BoxLayout:
+                            orientation: 'vertical'
+                            size_hint_x: 0.55
+                            spacing: '8dp'
+
+                            Label:
+                                text: "Autofocus Search Scan & Lens Nyquist Setup"
+                                font_size: '13sp'
+                                bold: True
+                                size_hint_y: None
+                                height: '22dp'
+
+                            GridLayout:
+                                cols: 2
+                                spacing: '6dp'
+                                size_hint_y: None
+                                height: '55dp'
+
+                                Label:
+                                    text: "AF Search Range (+/- um):"
+                                    font_size: '11sp'
+                                TextInput:
+                                    id: af_range_input
+                                    text: "50.0"
+                                    multiline: False
+                                    font_size: '11sp'
+                                    on_text_validate: app.focus_map.af_search_range_um = float(self.text)
+
+                                Label:
+                                    text: "AF Step Size (um):"
+                                    font_size: '11sp'
+                                TextInput:
+                                    id: af_step_input
+                                    text: "2.0"
+                                    multiline: False
+                                    font_size: '11sp'
+                                    on_text_validate: app.focus_map.af_step_size_um = float(self.text)
+
+                            Button:
+                                text: "Calculate & Apply Nyquist Z-Step"
+                                size_hint_y: None
+                                height: '28dp'
+                                background_color: (0.2, 0.6, 0.8, 1)
+                                bold: True
+                                font_size: '10sp'
+                                on_release: app.apply_nyquist_calculation()
+
+            # TAB 3: Hardware Protocol & Tiling
+            TabbedPanelItem:
+                text: '3. Hardware Protocol'
+                BoxLayout:
+                    orientation: 'vertical'
+                    spacing: '10dp'
+                    padding: '10dp'
+
+                    BoxLayout:
+                        orientation: 'horizontal'
+                        spacing: '10dp'
+
+                        ZoomPanCameraWidget:
+                            id: camera_viewport_tab3
+                            size_hint_x: 0.45
+
+                        BoxLayout:
+                            orientation: 'vertical'
+                            size_hint_x: 0.55
+                            spacing: '8dp'
+
+                            Label:
+                                text: "Tile Grid Dimensions (1x1 to 12x12)"
+                                bold: True
+                                font_size: '11sp'
+
+                            BoxLayout:
+                                spacing: '6dp'
+                                size_hint_y: None
+                                height: '28dp'
+
+                                Label:
+                                    text: "Rows:"
+                                    size_hint_x: 0.2
+                                TextInput:
+                                    id: tile_rows_tab3
+                                    text: "1"
+                                    multiline: False
+                                    size_hint_x: 0.25
+                                Label:
+                                    text: "Cols:"
+                                    size_hint_x: 0.2
+                                TextInput:
+                                    id: tile_cols_tab3
+                                    text: "1"
+                                    multiline: False
+                                    size_hint_x: 0.25
+
+                                Button:
+                                    text: "Apply Grid"
+                                    size_hint_x: 0.3
+                                    font_size: '10sp'
+                                    on_release: app.apply_grid_settings(tile_rows_tab3.text, tile_cols_tab3.text, True)
+
+                    Button:
+                        text: "Apply Protocol to Experiment Execution Engine & Save"
+                        size_hint_y: None
+                        height: '42dp'
+                        background_color: (0.2, 0.7, 0.4, 1)
+                        bold: True
+                        font_size: '13sp'
+                        on_release: app.generate_and_apply_protocol(); root.dismiss()
