@@ -1,4 +1,3 @@
-from __future__ import annotations
 """
 luma_sim.py - Offline Hardware Simulator for LumaViewPro.
 

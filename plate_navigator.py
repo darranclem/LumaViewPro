@@ -1,4 +1,3 @@
-from __future__ import annotations
 """
 plate_navigator.py - Modular Plate Navigator & Microplate Registration Studio for LumaViewPro.
 
@@ -10,6 +9,7 @@ Provides:
 - attach_navigator_to_lumaviewpro(): Bridge helper function.
 """
 
+from __future__ import annotations
 
 import os
 import sys
