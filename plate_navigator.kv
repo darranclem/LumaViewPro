@@ -1,9 +1,52 @@
 #:kivy 2.0.0
 
-<PlateNavigatorPopup>:
-    title: "LumaViewPro - Plate Navigator & Registration Studio"
-    size_hint: 0.96, 0.96
+<ZoomPanCameraWidget>:
+    canvas.before:
+        Color:
+            rgba: 0.05, 0.05, 0.05, 1
+        Rectangle:
+            pos: self.pos
+            size: self.size
 
+    BoxLayout:
+        orientation: 'vertical'
+        padding: '4dp'
+
+        Label:
+            text: "[ Live Camera Feed - Interactive Viewport ]"
+            size_hint_y: None
+            height: '20dp'
+            font_size: '11sp'
+            color: (0.6, 0.6, 0.6, 1)
+
+        Widget:
+            id: viewport_box
+            canvas:
+                Color:
+                    rgba: 0.2, 0.2, 0.25, 1
+                Rectangle:
+                    pos: self.pos
+                    size: self.size
+
+        BoxLayout:
+            size_hint_y: None
+            height: '24dp'
+            spacing: '8dp'
+
+            Label:
+                text: "Zoom/Pan: Scroll Wheel = Zoom | Right-Click Drag = Pan"
+                font_size: '10sp'
+                color: (0.7, 0.7, 0.7, 1)
+
+            Button:
+                text: "Reset View"
+                size_hint_x: None
+                width: '75dp'
+                font_size: '10sp'
+                on_release: root.reset_zoom_pan()
+
+
+<PlateNavigatorPopup>:
     BoxLayout:
         orientation: 'vertical'
         spacing: '10dp'
@@ -38,29 +81,18 @@
                                     pos: self.pos
                                     size: self.size
 
-                            BoxLayout:
+                            Label:
+                                text: "Microplate Template (A1 Top-Left | Rows A-H | Cols 1-12)"
+                                bold: True
+                                font_size: '13sp'
                                 size_hint_y: None
-                                height: '28dp'
-                                spacing: '8dp'
-
-                                Label:
-                                    text: "Plate Format:"
-                                    bold: True
-                                    font_size: '11sp'
-                                    size_hint_x: 0.35
-                                    color: (0.3, 0.8, 1.0, 1)
-
-                                Spinner:
-                                    text: "96-Well Plate"
-                                    values: ["6-Well Plate", "12-Well Plate", "24-Well Plate", "48-Well Plate", "96-Well Plate", "384-Well Plate"]
-                                    size_hint_x: 0.65
-                                    font_size: '11sp'
-                                    on_text: app.set_well_plate_format(self.text); scaled_canvas_tab1.redraw_canvas()
+                                height: '22dp'
+                                color: (0.3, 0.8, 1.0, 1)
 
                             InteractiveScaledPlateCanvas:
                                 id: scaled_canvas_tab1
 
-                            # Template Action Buttons
+                            # Template Action & Zoom Controls Toolbar
                             BoxLayout:
                                 size_hint_y: None
                                 height: '32dp'
@@ -68,22 +100,31 @@
 
                                 Button:
                                     text: "Select All"
-                                    font_size: '10sp'
                                     on_release: app.fov_manager.select_all_wells(); scaled_canvas_tab1.redraw_canvas()
 
                                 Button:
                                     text: "Clear All"
-                                    font_size: '10sp'
                                     on_release: app.fov_manager.clear_all_wells(); scaled_canvas_tab1.redraw_canvas()
 
                                 Button:
                                     text: "Sync Channels"
                                     background_color: (0.2, 0.5, 0.8, 1)
                                     bold: True
-                                    font_size: '10sp'
                                     on_release: app.global_sync_active_channels()
 
-                            # Registration Target Instruction & Stage Jog Controls
+                                Button:
+                                    text: "Zoom In (+)"
+                                    on_release: scaled_canvas_tab1.zoom_in()
+
+                                Button:
+                                    text: "Zoom Out (-)"
+                                    on_release: scaled_canvas_tab1.zoom_out()
+
+                                Button:
+                                    text: "Reset Zoom"
+                                    on_release: scaled_canvas_tab1.reset_zoom()
+
+                            # Leica Registration Target Instruction & Stage Jog Controls
                             BoxLayout:
                                 orientation: 'vertical'
                                 size_hint_y: None
@@ -106,14 +147,12 @@
                                         text: "Calib Channel:"
                                         size_hint_x: 0.4
                                         bold: True
-                                        font_size: '10sp'
 
                                     Spinner:
                                         id: calib_channel_spinner
-                                        text: "Brightfield"
+                                        text: "BF"
                                         values: ["Brightfield", "Phase", "Darkfield", "Blue", "Green", "Red"]
                                         size_hint_x: 0.6
-                                        font_size: '10sp'
                                         on_text: app.set_primary_af_channel(self.text)
 
                                 Label:
@@ -123,38 +162,32 @@
                                     height: '22dp'
                                     color: (0.9, 0.9, 0.2, 1)
                                     bold: True
-                                    font_size: '10sp'
+                                    font_size: '11sp'
 
                                 GridLayout:
                                     cols: 3
                                     size_hint_y: None
-                                    height: '55dp'
-                                    spacing: '3dp'
+                                    height: '60dp'
+                                    spacing: '4dp'
                                     size_hint_x: 0.6
                                     pos_hint: {'center_x': 0.5}
 
                                     Widget:
                                     Button:
                                         text: "+Y"
-                                        font_size: '9sp'
                                         on_release: app.jog_stage(0, 1.0, 0)
                                     Widget:
                                     Button:
                                         text: "-X"
-                                        font_size: '9sp'
                                         on_release: app.jog_stage(-1.0, 0, 0)
                                     Button:
                                         text: "CENTER"
-                                        font_size: '9sp'
-                                        on_release: app.jog_stage_to(-49.5, 31.5)
                                     Button:
                                         text: "+X"
-                                        font_size: '9sp'
                                         on_release: app.jog_stage(1.0, 0, 0)
                                     Widget:
                                     Button:
                                         text: "-Y"
-                                        font_size: '9sp'
                                         on_release: app.jog_stage(0, -1.0, 0)
                                     Widget:
 
@@ -167,17 +200,15 @@
                                         text: "Mark Stage Position"
                                         background_color: (0.2, 0.7, 0.3, 1)
                                         bold: True
-                                        font_size: '10sp'
                                         on_release: app.record_calibration_step(); scaled_canvas_tab1.redraw_canvas()
 
                                     Button:
                                         text: "Finish Calibration"
                                         background_color: (0.8, 0.4, 0.2, 1)
                                         bold: True
-                                        font_size: '10sp'
                                         on_release: app.finish_plate_calibration(); scaled_canvas_tab1.redraw_canvas()
 
-                        # Right Column: Interactive Camera Viewport, Master Auto Point & Test AF
+                        # Right Column: Interactive Camera Viewport, Lens & Turret Setup, Master Auto Point & Test AF
                         BoxLayout:
                             orientation: 'vertical'
                             size_hint_x: 0.5
@@ -185,11 +216,11 @@
 
                             ZoomPanCameraWidget:
                                 id: camera_viewport_tab1
-                                size_hint_y: 0.65
+                                size_hint_y: 0.50
 
                             BoxLayout:
                                 orientation: 'vertical'
-                                size_hint_y: 0.35
+                                size_hint_y: 0.50
                                 spacing: '5dp'
                                 padding: '6dp'
                                 canvas.before:
@@ -200,12 +231,125 @@
                                         size: self.size
 
                                 Label:
-                                    text: "Master Focus Point & Camera Binning Setup"
+                                    text: "Lens, Nosepiece & Master Focus Setup"
                                     bold: True
-                                    font_size: '11sp'
+                                    font_size: '12sp'
                                     size_hint_y: None
                                     height: '20dp'
                                     color: (1.0, 0.4, 0.4, 1)
+
+                                # Objective Lens & Hardware Turret Selectors
+                                BoxLayout:
+                                    size_hint_y: None
+                                    height: '26dp'
+                                    spacing: '6dp'
+
+                                    Label:
+                                        text: "Objective:"
+                                        size_hint_x: 0.25
+                                        font_size: '11sp'
+
+                                    Spinner:
+                                        id: objective_spinner_tab1
+                                        text: "20x Air"
+                                        values: ["1.25x", "4x", "5x", "10x", "20x Air", "40x", "60x Oil", "63x", "100x Oil"]
+                                        size_hint_x: 0.28
+                                        font_size: '11sp'
+                                        on_text: app.set_objective_preset(self.text); scaled_canvas_tab1.redraw_canvas()
+
+                                    Label:
+                                        text: "Hardware:"
+                                        size_hint_x: 0.22
+                                        font_size: '11sp'
+
+                                    Spinner:
+                                        id: turret_spinner_tab1
+                                        text: "Manual Nosepiece"
+                                        values: ["Manual Nosepiece", "Motorised Turret"]
+                                        size_hint_x: 0.25
+                                        font_size: '11sp'
+                                        on_text: app.set_turret_hardware_type(self.text)
+
+                                # MOTORISED OBJECTIVE TURRET CONTROLS
+                                # VISIBLE ONLY WHEN "Motorised Turret" IS SELECTED!
+                                BoxLayout:
+                                    id: motorised_turret_panel_tab1
+                                    orientation: 'vertical'
+                                    size_hint_y: None
+                                    height: '100dp' if (turret_spinner_tab1.text == "Motorised Turret") else '0dp'
+                                    opacity: 1.0 if (turret_spinner_tab1.text == "Motorised Turret") else 0.0
+                                    disabled: (turret_spinner_tab1.text != "Motorised Turret")
+                                    spacing: '3dp'
+                                    padding: '4dp'
+                                    canvas.before:
+                                        Color:
+                                            rgba: (0.12, 0.18, 0.24, 1.0) if (turret_spinner_tab1.text == "Motorised Turret") else (0, 0, 0, 0)
+                                        Rectangle:
+                                            pos: self.pos
+                                            size: self.size
+
+                                    Label:
+                                        text: "Motorised Objective Turret Auto-Switching Controls"
+                                        bold: True
+                                        font_size: '11sp'
+                                        size_hint_y: None
+                                        height: '16dp'
+                                        color: (0.3, 0.9, 0.6, 1)
+
+                                    BoxLayout:
+                                        size_hint_y: None
+                                        height: '22dp'
+                                        spacing: '6dp'
+
+                                        CheckBox:
+                                            id: turret_autoswitch_checkbox
+                                            active: True
+                                            size_hint_x: None
+                                            width: '22dp'
+                                            on_active: app.focus_map.turret_auto_switch = self.active
+
+                                        Label:
+                                            text: "Auto-Rotate Turret on Protocol Start"
+                                            font_size: '10sp'
+                                            size_hint_x: 0.9
+
+                                    Label:
+                                        text: "Test Turret Slot Rotation:"
+                                        font_size: '10sp'
+                                        size_hint_y: None
+                                        height: '14dp'
+                                        color: (0.7, 0.7, 0.8, 1)
+
+                                    GridLayout:
+                                        cols: 6
+                                        spacing: '3dp'
+                                        size_hint_y: None
+                                        height: '26dp'
+
+                                        Button:
+                                            text: "1: 4x"
+                                            font_size: '9sp'
+                                            on_release: app.rotate_turret_slot(1); scaled_canvas_tab1.redraw_canvas()
+                                        Button:
+                                            text: "2: 10x"
+                                            font_size: '9sp'
+                                            on_release: app.rotate_turret_slot(2); scaled_canvas_tab1.redraw_canvas()
+                                        Button:
+                                            text: "3: 20x"
+                                            font_size: '9sp'
+                                            on_release: app.rotate_turret_slot(3); scaled_canvas_tab1.redraw_canvas()
+                                        Button:
+                                            text: "4: 40x"
+                                            font_size: '9sp'
+                                            on_release: app.rotate_turret_slot(4); scaled_canvas_tab1.redraw_canvas()
+                                        Button:
+                                            text: "5: 60x"
+                                            font_size: '9sp'
+                                            on_release: app.rotate_turret_slot(5); scaled_canvas_tab1.redraw_canvas()
+                                        Button:
+                                            text: "6: 100x"
+                                            font_size: '9sp'
+                                            on_release: app.rotate_turret_slot(6); scaled_canvas_tab1.redraw_canvas()
 
                                 BoxLayout:
                                     size_hint_y: None
@@ -215,14 +359,14 @@
                                     Label:
                                         text: "AF Camera Binning:"
                                         size_hint_x: 0.45
-                                        font_size: '10sp'
+                                        font_size: '11sp'
 
                                     Spinner:
                                         id: binning_spinner_tab1
                                         text: "2x2"
                                         values: ["1x1", "2x2", "4x4", "8x8"]
                                         size_hint_x: 0.55
-                                        font_size: '10sp'
+                                        font_size: '11sp'
                                         on_text: app.set_af_binning(self.text)
 
                                 BoxLayout:
@@ -233,32 +377,32 @@
                                     Label:
                                         text: "AF Exposure (ms):"
                                         size_hint_x: 0.45
-                                        font_size: '10sp'
+                                        font_size: '11sp'
 
                                     TextInput:
                                         id: af_exp_input_tab1
                                         text: "20.0"
                                         multiline: False
                                         size_hint_x: 0.55
-                                        font_size: '10sp'
+                                        font_size: '11sp'
                                         on_text_validate: app.set_af_exposure(self.text)
 
                                 Button:
                                     text: "Set Stage Position as Master Auto Point (Red)"
                                     size_hint_y: None
-                                    height: '28dp'
+                                    height: '26dp'
                                     background_color: (0.8, 0.2, 0.2, 1)
                                     bold: True
-                                    font_size: '10sp'
+                                    font_size: '11sp'
                                     on_release: app.set_master_auto_point(); scaled_canvas_tab1.redraw_canvas()
 
                                 Button:
                                     text: "Test Autofocus Acquisition"
                                     size_hint_y: None
-                                    height: '28dp'
+                                    height: '26dp'
                                     background_color: (0.2, 0.6, 0.8, 1)
                                     bold: True
-                                    font_size: '10sp'
+                                    font_size: '11sp'
                                     on_release: app.test_autofocus_run()
 
             # TAB 2: Autofocus Scan Dialogue, Nyquist Calculator & Skip Cycle Controls
@@ -290,7 +434,6 @@
                                 bold: True
                                 size_hint_y: None
                                 height: '25dp'
-                                font_size: '11sp'
 
                             ZoomPanCameraWidget:
                                 id: camera_viewport_tab2
@@ -304,7 +447,7 @@
 
                             Label:
                                 text: "Autofocus Search Scan, Skip Cycle & Lens Nyquist Setup"
-                                font_size: '13sp'
+                                font_size: '15sp'
                                 bold: True
                                 size_hint_y: None
                                 height: '25dp'
@@ -317,22 +460,18 @@
 
                                 Label:
                                     text: "AF Search Range (+/- um):"
-                                    font_size: '10sp'
                                 TextInput:
                                     id: af_range_input
                                     text: "50.0"
                                     multiline: False
-                                    font_size: '10sp'
                                     on_text_validate: app.focus_map.af_search_range_um = float(self.text)
 
                                 Label:
                                     text: "AF Step Size (um):"
-                                    font_size: '10sp'
                                 TextInput:
                                     id: af_step_input
                                     text: "2.0"
                                     multiline: False
-                                    font_size: '10sp'
                                     on_text_validate: app.focus_map.af_step_size_um = float(self.text)
 
                             BoxLayout:
@@ -351,7 +490,6 @@
                                 Label:
                                     text: "Autofocus Cycle Skip & Time-Lapse Schedule"
                                     bold: True
-                                    font_size: '11sp'
                                     color: (0.9, 0.7, 1.0, 1)
 
                                 BoxLayout:
@@ -360,14 +498,12 @@
                                     Label:
                                         text: "Autofocus Frequency:"
                                         size_hint_x: 0.45
-                                        font_size: '10sp'
 
                                     Spinner:
                                         id: af_cycle_spinner
                                         text: "Every Cycle (1)"
                                         values: ["Every Cycle (1)", "Every 2nd Cycle (2)", "Every 3rd Cycle (3)", "Every 5th Cycle (5)", "Every 10th Cycle (10)"]
                                         size_hint_x: 0.55
-                                        font_size: '10sp'
                                         on_text: app.set_af_cycle_interval(self.text)
 
                                 BoxLayout:
@@ -383,30 +519,25 @@
                                     Label:
                                         text: "Time-Lapse"
                                         size_hint_x: 0.25
-                                        font_size: '10sp'
 
                                     Label:
                                         text: "Interval (m):"
                                         size_hint_x: 0.2
-                                        font_size: '10sp'
                                     TextInput:
                                         id: tl_interval_input
                                         text: "10.0"
                                         multiline: False
                                         size_hint_x: 0.2
-                                        font_size: '10sp'
                                         on_text_validate: app.set_time_lapse_config(timelapse_enable_checkbox.active, self.text, tl_cycles_input.text)
 
                                     Label:
                                         text: "Cycles:"
                                         size_hint_x: 0.15
-                                        font_size: '10sp'
                                     TextInput:
                                         id: tl_cycles_input
                                         text: "24"
                                         multiline: False
                                         size_hint_x: 0.2
-                                        font_size: '10sp'
                                         on_text_validate: app.set_time_lapse_config(timelapse_enable_checkbox.active, tl_interval_input.text, self.text)
 
                             BoxLayout:
@@ -423,7 +554,6 @@
                                 Label:
                                     text: "Optical Lens Specifications & Nyquist Calculator"
                                     bold: True
-                                    font_size: '11sp'
                                     color: (0.4, 0.8, 1.0, 1)
 
                                 GridLayout:
@@ -432,38 +562,33 @@
 
                                     Label:
                                         text: "NA:"
-                                        font_size: '10sp'
                                     TextInput:
+                                        id: lens_na_input
                                         text: "0.45"
                                         multiline: False
-                                        font_size: '10sp'
                                         on_text_validate: app.focus_map.lens_na = float(self.text)
 
                                     Label:
                                         text: "Mag:"
-                                        font_size: '10sp'
                                     TextInput:
+                                        id: lens_mag_input
                                         text: "20.0"
                                         multiline: False
-                                        font_size: '10sp'
                                         on_text_validate: app.focus_map.lens_mag = float(self.text)
 
                                     Label:
                                         text: "Wavelength (nm):"
-                                        font_size: '10sp'
                                     TextInput:
                                         text: "525.0"
                                         multiline: False
-                                        font_size: '10sp'
                                         on_text_validate: app.focus_map.wavelength_nm = float(self.text)
 
                                     Label:
                                         text: "Immersion n:"
-                                        font_size: '10sp'
                                     TextInput:
+                                        id: lens_n_input
                                         text: "1.0"
                                         multiline: False
-                                        font_size: '10sp'
                                         on_text_validate: app.focus_map.refractive_index = float(self.text)
 
                                 Button:
@@ -472,7 +597,6 @@
                                     height: '30dp'
                                     background_color: (0.2, 0.6, 0.8, 1)
                                     bold: True
-                                    font_size: '10sp'
                                     on_release: app.apply_nyquist_calculation()
 
                             Button:
@@ -481,7 +605,6 @@
                                 height: '35dp'
                                 background_color: (0.2, 0.7, 0.4, 1)
                                 bold: True
-                                font_size: '11sp'
                                 on_release: main_tabbed_panel.switch_to(main_tabbed_panel.tab_list[2])
 
             # TAB 3: Hardware Protocol, 12x12 Tiling & Chromatic Shift Correction
@@ -497,7 +620,7 @@
                         spacing: '10dp'
                         size_hint_y: 0.85
 
-                        # Left Column: Camera Viewport
+                        # Left Column: Camera Viewport for Secondary Chromatic Focus Tuning
                         BoxLayout:
                             orientation: 'vertical'
                             size_hint_x: 0.4
@@ -514,7 +637,6 @@
                                 bold: True
                                 size_hint_y: None
                                 height: '25dp'
-                                font_size: '11sp'
 
                             ZoomPanCameraWidget:
                                 id: camera_viewport_tab3
@@ -527,19 +649,15 @@
 
                                 Button:
                                     text: "-1.0 um"
-                                    font_size: '9sp'
                                     on_release: app.jog_stage(0, 0, -0.001)
                                 Button:
                                     text: "-0.2 um"
-                                    font_size: '9sp'
                                     on_release: app.jog_stage(0, 0, -0.0002)
                                 Button:
                                     text: "+0.2 um"
-                                    font_size: '9sp'
                                     on_release: app.jog_stage(0, 0, 0.0002)
                                 Button:
                                     text: "+1.0 um"
-                                    font_size: '9sp'
                                     on_release: app.jog_stage(0, 0, 0.001)
 
                         # Right Column: Tiling, Channel Accept/Reject & Secondary Chromatic Offsets
@@ -564,7 +682,6 @@
                                 Label:
                                     text: "Tiled Area Grid Dimensions (1x1 up to 12x12)"
                                     bold: True
-                                    font_size: '11sp'
 
                                 BoxLayout:
                                     spacing: '8dp'
@@ -572,29 +689,24 @@
                                     Label:
                                         text: "Rows:"
                                         size_hint_x: 0.2
-                                        font_size: '10sp'
                                     TextInput:
                                         id: tile_rows_tab3
                                         text: "1"
                                         multiline: False
                                         size_hint_x: 0.25
-                                        font_size: '10sp'
 
                                     Label:
                                         text: "Cols:"
                                         size_hint_x: 0.2
-                                        font_size: '10sp'
                                     TextInput:
                                         id: tile_cols_tab3
                                         text: "1"
                                         multiline: False
                                         size_hint_x: 0.25
-                                        font_size: '10sp'
 
                                     Button:
                                         text: "Apply Grid"
                                         size_hint_x: 0.3
-                                        font_size: '10sp'
                                         on_release: app.apply_grid_settings(tile_rows_tab3.text, tile_cols_tab3.text, True)
 
                             BoxLayout:
@@ -611,7 +723,6 @@
                                 Label:
                                     text: "Per-Channel Chromatic Z-Offset Correction"
                                     bold: True
-                                    font_size: '11sp'
                                     color: (0.8, 0.6, 1.0, 1)
 
                                 BoxLayout:
@@ -619,18 +730,56 @@
 
                                     Spinner:
                                         id: chromatic_channel_spinner
-                                        text: "Blue"
+                                        text: "DAPI"
                                         values: ["Brightfield", "Phase", "Darkfield", "Blue", "Green", "Red"]
                                         size_hint_x: 0.5
-                                        font_size: '10sp'
 
                                     Button:
                                         text: "Save Current Z as Channel Offset"
                                         size_hint_x: 0.5
                                         background_color: (0.6, 0.3, 0.8, 1)
                                         bold: True
-                                        font_size: '10sp'
                                         on_release: app.set_chromatic_z_offset(chromatic_channel_spinner.text)
+
+                            # Motorised Turret Per-Channel Slot Mapping
+                            # VISIBLE ONLY WHEN "Motorised Turret" IS SELECTED!
+                            BoxLayout:
+                                id: motorised_turret_panel_tab3
+                                orientation: 'vertical'
+                                size_hint_y: None
+                                height: '70dp' if (turret_spinner_tab1.text == "Motorised Turret") else '0dp'
+                                opacity: 1.0 if (turret_spinner_tab1.text == "Motorised Turret") else 0.0
+                                disabled: (turret_spinner_tab1.text != "Motorised Turret")
+                                spacing: '4dp'
+                                padding: '6dp'
+                                canvas.before:
+                                    Color:
+                                        rgba: (0.12, 0.18, 0.24, 1.0) if (turret_spinner_tab1.text == "Motorised Turret") else (0, 0, 0, 0)
+                                    Rectangle:
+                                        pos: self.pos
+                                        size: self.size
+
+                                Label:
+                                    text: "Motorised Turret Per-Channel Slot Mapping"
+                                    bold: True
+                                    font_size: '11sp'
+                                    color: (0.3, 0.9, 0.6, 1)
+
+                                BoxLayout:
+                                    spacing: '6dp'
+
+                                    Label:
+                                        text: "Channel Assignment:"
+                                        size_hint_x: 0.4
+                                        font_size: '11sp'
+
+                                    Spinner:
+                                        id: turret_ch_assign_spinner
+                                        text: "BF -> Slot 1 (4x)"
+                                        values: ["BF -> Slot 1 (4x)", "Phase -> Slot 2 (10x)", "DAPI -> Slot 3 (20x Air)", "FITC -> Slot 3 (20x Air)", "TxRed -> Slot 4 (40x)", "Cy5 -> Slot 5 (60x Oil)"]
+                                        size_hint_x: 0.6
+                                        font_size: '11sp'
+                                        on_text: app.assign_channel_turret_slot(self.text)
 
                             BoxLayout:
                                 orientation: 'vertical'
@@ -646,7 +795,6 @@
                                 Label:
                                     text: "Accept / Reject Channels for Execution"
                                     bold: True
-                                    font_size: '11sp'
                                     size_hint_y: None
                                     height: '20dp'
 
@@ -657,45 +805,39 @@
                                     BoxLayout:
                                         CheckBox:
                                             active: True
-                                            on_active: app.focus_map.accepted_channels["Brightfield"] = self.active
+                                            on_active: app.focus_map.accepted_channels["BF"] = self.active
                                         Label:
-                                            text: "Brightfield"
-                                            font_size: '10sp'
+                                            text: "BF"
                                     BoxLayout:
                                         CheckBox:
                                             active: True
                                             on_active: app.focus_map.accepted_channels["Phase"] = self.active
                                         Label:
                                             text: "Phase"
-                                            font_size: '10sp'
                                     BoxLayout:
                                         CheckBox:
                                             active: True
-                                            on_active: app.focus_map.accepted_channels["Darkfield"] = self.active
+                                            on_active: app.focus_map.accepted_channels["Pseudo Darkfield"] = self.active
                                         Label:
-                                            text: "Darkfield"
-                                            font_size: '10sp'
+                                            text: "Pseudo DF"
                                     BoxLayout:
                                         CheckBox:
                                             active: True
-                                            on_active: app.focus_map.accepted_channels["Blue"] = self.active
+                                            on_active: app.focus_map.accepted_channels["DAPI"] = self.active
                                         Label:
-                                            text: "Blue (405nm)"
-                                            font_size: '10sp'
+                                            text: "DAPI"
                                     BoxLayout:
                                         CheckBox:
                                             active: True
-                                            on_active: app.focus_map.accepted_channels["Green"] = self.active
+                                            on_active: app.focus_map.accepted_channels["FITC"] = self.active
                                         Label:
-                                            text: "Green (488nm)"
-                                            font_size: '10sp'
+                                            text: "FITC"
                                     BoxLayout:
                                         CheckBox:
                                             active: True
-                                            on_active: app.focus_map.accepted_channels["Red"] = self.active
+                                            on_active: app.focus_map.accepted_channels["TxRed"] = self.active
                                         Label:
-                                            text: "Red (594nm)"
-                                            font_size: '10sp'
+                                            text: "TxRed"
 
                     Button:
                         text: "Apply Protocol to Experiment Execution Engine & Save"
@@ -703,5 +845,5 @@
                         height: '45dp'
                         background_color: (0.2, 0.7, 0.4, 1)
                         bold: True
-                        font_size: '13sp'
+                        font_size: '15sp'
                         on_release: app.generate_and_apply_protocol(); root.dismiss()

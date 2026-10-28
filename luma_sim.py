@@ -1,10 +1,10 @@
 from __future__ import annotations
 """
-luma_sim.py - Offline Hardware Simulator for LumaViewPro 4.0.0-beta
+luma_sim.py - Offline Hardware Simulator for LumaViewPro 4.0.0-beta.
 
 Mocks camera acquisition (pyloncamera) and stage motion (motorboard / ledboard)
-with real-time synthetic cell colony generation across SBS 96-well microplates.
-Enables offline desktop development and testing of LumaViewPro and Plate Navigator without physical hardware.
+with real-time synthetic cell colony generation across multi-well microplates.
+Enables offline desktop development and testing without physical microscope hardware.
 """
 
 import sys
@@ -23,15 +23,17 @@ print("[LumaViewPro Simulator] Initializing offline hardware & camera mocks...")
 class MockCamera:
     def __init__(self):
         self.is_connected = True
-        self.exposure_ms = 100.0
+        self.exposure_ms = 20.0
         self.gain = 1.0
-        self.is_light_on = False  # Starts OFF (black window) by default
-        self.led_power = 100.0
         self.active_channel = "Brightfield"
-        self.stage_x = -49.5  # Well A1 default
+        self.stage_x = -49.5  # Well A1 center
         self.stage_y = 31.5
         self.stage_z = 0.0
-        self.best_z = 0.0
+        self.best_z = 2.5
+        self.led_power = 100.0
+        self.is_light_on = False  # Sensor starts dark on launch!
+        self.num_wells = 96
+        self.fov_size_mm = (0.60, 0.45)
 
     def connect(self) -> bool:
         return True
@@ -50,7 +52,9 @@ class MockCamera:
             led_power=self.led_power,
             exposure_ms=self.exposure_ms,
             gain=self.gain,
-            sensor_size=(512, 512)
+            sensor_size=(512, 512),
+            fov_size_mm=self.fov_size_mm,
+            num_wells=self.num_wells
         )
 
     def set_exposure(self, exp: float):
@@ -58,15 +62,6 @@ class MockCamera:
 
     def set_gain(self, g: float):
         self.gain = g
-
-    def set_light_on(self, on: bool):
-        self.is_light_on = on
-
-    def set_led_power(self, power: float):
-        self.led_power = power
-
-    def set_channel(self, channel: str):
-        self.active_channel = channel
 
 
 mock_pylon = types.ModuleType("pyloncamera")
@@ -83,10 +78,13 @@ class MockStage:
     def connect(self) -> bool:
         return True
 
-    def move_abs(self, x: float, y: float, z: float):
-        self.x, self.y, self.z = x, y, z
+    def move_abs(self, x: float, y: float, z: float = None):
+        self.x = x
+        self.y = y
+        if z is not None:
+            self.z = z
 
-    def move_rel(self, dx: float, dy: float, dz: float):
+    def move_rel(self, dx: float, dy: float, dz: float = 0.0):
         self.x += dx
         self.y += dy
         self.z += dz
@@ -124,4 +122,6 @@ print("[LumaViewPro Simulator] Hardware Mocks Ready. Starting LumaViewPro...")
 import lumaviewpro
 
 if __name__ == "__main__":
-    lumaviewpro.LumaViewProApp().run()
+    app = lumaviewpro.LumaViewProApp()
+    app.is_simulator = True
+    app.run()
