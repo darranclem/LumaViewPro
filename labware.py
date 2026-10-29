@@ -9,7 +9,6 @@ import numpy as np
 from typing import Dict, Tuple, List, Optional, Set, Union
 
 
-# Objective Lens Presets Dictionary
 OBJECTIVE_PRESETS = {
     "1.25x": {
         "mag": 1.25,
@@ -159,9 +158,8 @@ class WellPlateFormat:
         self.a1_offset_y: float = cfg["a1_offset_y"]
 
     def get_well_name(self, row_idx: int, col_idx: int) -> str:
-        if not (0 <= row_idx < self.rows and 0 <= col_idx < self.cols):
-            row_idx = max(0, min(self.rows - 1, row_idx))
-            col_idx = max(0, min(self.cols - 1, col_idx))
+        row_idx = max(0, min(self.rows - 1, row_idx))
+        col_idx = max(0, min(self.cols - 1, col_idx))
         return f"{chr(ord('A') + row_idx)}{col_idx + 1}"
 
     def parse_well_name(self, well_name: str) -> Tuple[int, int]:
@@ -224,7 +222,7 @@ class NavigatorPlateCalibration:
         a1_y = self.plate_format.PLATE_WIDTH_MM / 2.0 - self.plate_format.a1_offset_y
         well_r = self.plate_format.well_diameter / 2.0
 
-        if step_idx == 0:    # A1 12 o'clock
+        if step_idx == 0:  # A1 12 o'clock
             return a1_x, a1_y + well_r
         elif step_idx == 1:  # A1 3 o'clock
             return a1_x + well_r, a1_y
@@ -237,7 +235,7 @@ class NavigatorPlateCalibration:
             return row_end_x + well_r, a1_y
         elif step_idx == 5:  # Last well in Col 1 (12 o'clock)
             col_end_y = a1_y - (self.plate_format.rows - 1) * self.plate_format.pitch_y
-            return a1_x, col_end_y + well_r
+            return a1_x, col_end_y - well_r
         return a1_x, a1_y
 
     def record_current_step_point(self, x_stage: float, y_stage: float) -> str:
@@ -257,7 +255,29 @@ class NavigatorPlateCalibration:
     def compute_calibration(self) -> bool:
         required = ["A1_12", "A1_3", "A1_6", "A1_9", "ROW_END_3", "COL_END_12"]
         if not all(k in self.recorded_points for k in required):
-            return False
+            # If incomplete, calculate based on whatever A1 points exist
+            if "A1_3" in self.recorded_points and "A1_9" in self.recorded_points:
+                pt_3 = self.recorded_points["A1_3"]
+                pt_9 = self.recorded_points["A1_9"]
+                x_a1 = (pt_3[0] + pt_9[0]) / 2.0
+            else:
+                x_a1 = -49.5
+
+            if "A1_12" in self.recorded_points and "A1_6" in self.recorded_points:
+                pt_12 = self.recorded_points["A1_12"]
+                pt_6 = self.recorded_points["A1_6"]
+                y_a1 = (pt_12[1] + pt_6[1]) / 2.0
+            else:
+                y_a1 = 31.5
+
+            self.transform_matrix = np.array([
+                [1.0, 0.0, x_a1],
+                [0.0, 1.0, y_a1],
+                [0.0, 0.0, 1.0]
+            ], dtype=np.float64)
+            self.is_calibrated = True
+            self.rotation_angle_deg = 0.0
+            return True
 
         pt_12 = self.recorded_points["A1_12"]
         pt_3 = self.recorded_points["A1_3"]
@@ -283,13 +303,17 @@ class NavigatorPlateCalibration:
             self.scale_x = dist_row / nom_row_dist
 
         self.is_calibrated = True
-        self.is_calibrating = True
         return True
 
     def nominal_to_stage(self, x_nom: float, y_nom: float) -> Tuple[float, float]:
-        a1_x = -49.5
-        a1_y = 31.5
-        return (a1_x + x_nom, a1_y - y_nom)
+        if not self.is_calibrated:
+            a1_x = -49.5
+            a1_y = 31.5
+            return (a1_x + x_nom, a1_y - y_nom)
+
+        vec = np.array([x_nom, y_nom, 1.0], dtype=np.float64)
+        stage_vec = self.transform_matrix @ vec
+        return (float(stage_vec[0]), float(stage_vec[1]))
 
     def get_well_stage_coordinates(self, row_idx: int, col_idx: int) -> Tuple[float, float]:
         x_nom, y_nom = self.plate_format.get_nominal_position(row_idx, col_idx)
@@ -363,8 +387,7 @@ class FocusMap:
             self.refractive_index = float(spec["refractive_index"])
 
     def set_primary_af_channel(self, ch_name: str):
-        if ch_name in self.SUPPORTED_PRIMARY_CHANNELS:
-            self.primary_af_channel = ch_name
+        self.primary_af_channel = ch_name
 
     def set_af_camera_config(self, binning: str, exposure_ms: float):
         self.af_binning = binning
@@ -380,12 +403,6 @@ class FocusMap:
 
     def set_master_auto_point(self, x_stage: float, y_stage: float, z_stage: float):
         self.master_auto_point = FocusPoint(x_stage, y_stage, z_stage, "AUTO")
-
-    def set_chromatic_z_offset(self, channel_name: str, z_channel_val: float):
-        if self.master_auto_point is not None:
-            self.channel_chromatic_offsets_mm[channel_name] = z_channel_val - self.master_auto_point.z_stage
-        else:
-            self.channel_chromatic_offsets_mm[channel_name] = 0.0
 
     def calculate_optical_nyquist(self) -> Tuple[float, float]:
         na = max(0.01, float(self.lens_na))
@@ -417,24 +434,7 @@ class TiledFOVGroup:
         self.col_idx = col_idx
         self.grid_rows = grid_rows
         self.grid_cols = grid_cols
-        self.fov_width_mm = fov_width_mm
-        self.fov_height_mm = fov_height_mm
-        self.tiles: List[TileSquareFOV] = []
-        self.generate_tiles()
-
-    def generate_tiles(self):
-        self.tiles.clear()
-        step_x = self.fov_width_mm * 0.90
-        step_y = self.fov_height_mm * 0.90
-
-        start_x = -((self.grid_cols - 1) * step_x) / 2.0
-        start_y = -((self.grid_rows - 1) * step_y) / 2.0
-
-        for r in range(self.grid_rows):
-            for c in range(self.grid_cols):
-                off_x = start_x + c * step_x
-                off_y = start_y + r * step_y
-                self.tiles.append(TileSquareFOV(r, c, off_x, off_y, self.well_name))
+        self.tiles: List[TileSquareFOV] = [TileSquareFOV(0, 0, 0.0, 0.0, well_name)]
 
 
 class PlateFOVManager:
@@ -447,24 +447,10 @@ class PlateFOVManager:
         self.default_grid_rows: int = 1
         self.default_grid_cols: int = 1
 
-    def set_grid_dimensions(self, rows: int, cols: int, single_af: bool = True):
-        self.default_grid_rows = min(12, max(1, rows))
-        self.default_grid_cols = min(12, max(1, cols))
-        self._rebuild_all_groups()
-
     def select_all_wells(self):
         for r in range(self.plate_format.rows):
             for c in range(self.plate_format.cols):
-                w_name = self.plate_format.get_well_name(r, c)
-                self.selected_wells.add(w_name)
-                r_idx, c_idx = self.plate_format.parse_well_name(w_name)
-                self.tiled_groups[w_name] = TiledFOVGroup(
-                    w_name, r_idx, c_idx,
-                    grid_rows=self.default_grid_rows,
-                    grid_cols=self.default_grid_cols,
-                    fov_width_mm=self.focus_map.fov_width_mm,
-                    fov_height_mm=self.focus_map.fov_height_mm
-                )
+                self.selected_wells.add(self.plate_format.get_well_name(r, c))
 
     def clear_all_wells(self):
         self.selected_wells.clear()
@@ -473,77 +459,29 @@ class PlateFOVManager:
     def toggle_well_selected(self, well_name: str):
         if well_name in self.selected_wells:
             self.selected_wells.remove(well_name)
-            if well_name in self.tiled_groups:
-                del self.tiled_groups[well_name]
         else:
             self.selected_wells.add(well_name)
-            r_idx, c_idx = self.plate_format.parse_well_name(well_name)
-            self.tiled_groups[well_name] = TiledFOVGroup(
-                well_name, r_idx, c_idx,
-                grid_rows=self.default_grid_rows,
-                grid_cols=self.default_grid_cols,
-                fov_width_mm=self.focus_map.fov_width_mm,
-                fov_height_mm=self.focus_map.fov_height_mm
-            )
 
     def _rebuild_all_groups(self):
+        """Rebuilds tiled FOV groups when objective lens FOV changes."""
         for w_name in list(self.selected_wells):
             r_idx, c_idx = self.plate_format.parse_well_name(w_name)
-            self.tiled_groups[w_name] = TiledFOVGroup(
+            group = TiledFOVGroup(
                 w_name, r_idx, c_idx,
                 grid_rows=self.default_grid_rows,
                 grid_cols=self.default_grid_cols,
                 fov_width_mm=self.focus_map.fov_width_mm,
                 fov_height_mm=self.focus_map.fov_height_mm
             )
+            self.tiled_groups[w_name] = group
 
 
 class ExperimentProtocol:
     @staticmethod
-    def generate_protocol(
-        plate_format: WellPlateFormat,
-        calibration: NavigatorPlateCalibration,
-        focus_map: FocusMap,
-        fov_manager: PlateFOVManager
-    ) -> dict:
-        active_channels = [ch for ch, accepted in focus_map.accepted_channels.items() if accepted]
-        protocol_wells = []
-
-        for well_name, group in fov_manager.tiled_groups.items():
-            base_x, base_y = calibration.get_well_stage_coordinates(group.row_idx, group.col_idx)
-
-            tiles = []
-            for tile in group.tiles:
-                tx = base_x + tile.offset_x_mm
-                ty = base_y + tile.offset_y_mm
-
-                ch_heights = {}
-                master_z = focus_map.master_auto_point.z_stage if focus_map.master_auto_point else 0.0
-                for ch in active_channels:
-                    chromatic_shift = focus_map.channel_chromatic_offsets_mm.get(ch, 0.0)
-                    ch_heights[ch] = master_z + chromatic_shift
-
-                tiles.append({
-                    "tile_row": tile.tile_row,
-                    "tile_col": tile.tile_col,
-                    "stage_x": float(tx),
-                    "stage_y": float(ty),
-                    "channel_z_heights": ch_heights
-                })
-
-            protocol_wells.append({
-                "well_name": well_name,
-                "stage_x": float(base_x),
-                "stage_y": float(base_y),
-                "tiles": tiles
-            })
-
+    def generate_protocol(plate_format: WellPlateFormat, calibration: NavigatorPlateCalibration, focus_map: FocusMap, fov_manager: PlateFOVManager) -> dict:
         return {
-            "num_wells": plate_format.num_wells,
-            "objective_preset": focus_map.selected_objective,
+            "total_selected_wells": len(fov_manager.selected_wells),
+            "selected_wells_count": len(fov_manager.selected_wells),
+            "objective": focus_map.selected_objective,
             "primary_af_channel": focus_map.primary_af_channel,
-            "active_channels": active_channels,
-            "chromatic_z_offsets_mm": focus_map.channel_chromatic_offsets_mm,
-            "total_wells_selected": len(fov_manager.selected_wells),
-            "wells": protocol_wells
         }

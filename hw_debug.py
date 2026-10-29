@@ -1,4 +1,5 @@
 from __future__ import annotations
+# VERSION: 4.2.0-FINAL-INITIALIZATION
 """
 hw_debug.py - Standalone Hardware Diagnostic & Inspection Tool for Etaluma LumaViewPro
 
