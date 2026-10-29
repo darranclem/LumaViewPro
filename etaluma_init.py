@@ -1,6 +1,5 @@
 from __future__ import annotations
-# VERSION: 4.2.0-FINAL-INITIALIZATION
-# VERSION: 4.2.0-FINAL-INITIALIZATION
+# VERSION: 4.4.0-FINAL-INITIALIZATION
 """
 etaluma_init.py - Environment & Hardware Initialization Bootstrapper for LumaViewPro.
 

@@ -1,43 +1,56 @@
 #:kivy 2.0.0
 
-<PlateNavigatorPopup>:
-    title: "LumaViewPro - Plate Navigator & Registration Studio"
-    size_hint: 0.96, 0.96
-    content: popup_root_box
+<ZoomPanCameraWidget>:
+    canvas.before:
+        Color:
+            rgba: 0.05, 0.05, 0.05, 1
+        Rectangle:
+            pos: self.pos
+            size: self.size
 
     BoxLayout:
-        id: popup_root_box
         orientation: 'vertical'
-        spacing: '8dp'
-        padding: '8dp'
+        padding: '4dp'
 
-        # Plate Format Selection Bar inside Navigator Studio Header
-        BoxLayout:
+        Label:
+            text: "[ Live Camera Feed - Interactive Viewport ]"
             size_hint_y: None
-            height: '32dp'
-            spacing: '10dp'
-            padding: ['4dp', '2dp']
-            canvas.before:
+            height: '20dp'
+            font_size: '11sp'
+            color: (0.6, 0.6, 0.6, 1)
+
+        Widget:
+            id: viewport_box
+            canvas:
                 Color:
-                    rgba: 0.14, 0.16, 0.22, 1
+                    rgba: 0.2, 0.2, 0.25, 1
                 Rectangle:
                     pos: self.pos
                     size: self.size
 
-            Label:
-                text: "Labware Plate Format:"
-                bold: True
-                font_size: '11sp'
-                size_hint_x: 0.35
-                color: (0.3, 0.8, 1.0, 1)
+        BoxLayout:
+            size_hint_y: None
+            height: '24dp'
+            spacing: '8dp'
 
-            Spinner:
-                text: "96-Well Plate"
-                values: ["6-Well Plate", "12-Well Plate", "24-Well Plate", "48-Well Plate", "96-Well Plate", "384-Well Plate"]
-                size_hint_x: 0.65
-                font_size: '11sp'
-                bold: True
-                on_text: app.set_well_plate_format(self.text)
+            Label:
+                text: "Zoom/Pan: Scroll Wheel = Zoom | Right-Click Drag = Pan"
+                font_size: '10sp'
+                color: (0.7, 0.7, 0.7, 1)
+
+            Button:
+                text: "Reset View"
+                size_hint_x: None
+                width: '75dp'
+                font_size: '10sp'
+                on_release: root.reset_zoom_pan()
+
+
+<PlateNavigatorPopup>:
+    BoxLayout:
+        orientation: 'vertical'
+        spacing: '10dp'
+        padding: '10dp'
 
         TabbedPanel:
             id: main_tabbed_panel
@@ -56,10 +69,10 @@
                         orientation: 'horizontal'
                         spacing: '10dp'
 
-                        # Left Column: Interactive Scaled Microplate Template Canvas (A1 Top-Left)
+                        # Left Column: Interactive Scaled Microplate Template Canvas
                         BoxLayout:
                             orientation: 'vertical'
-                            size_hint_x: 0.50
+                            size_hint_x: 0.5
                             spacing: '5dp'
                             canvas.before:
                                 Color:
@@ -69,9 +82,9 @@
                                     size: self.size
 
                             Label:
-                                text: "Microplate Registration Map"
+                                text: "Microplate Template (A1 Top-Left | Rows A-H | Cols 1-12)"
                                 bold: True
-                                font_size: '12sp'
+                                font_size: '13sp'
                                 size_hint_y: None
                                 height: '22dp'
                                 color: (0.3, 0.8, 1.0, 1)
@@ -82,31 +95,28 @@
                             # Template Action Buttons
                             BoxLayout:
                                 size_hint_y: None
-                                height: '30dp'
+                                height: '32dp'
                                 spacing: '6dp'
 
                                 Button:
                                     text: "Select All"
-                                    font_size: '10sp'
                                     on_release: app.fov_manager.select_all_wells(); scaled_canvas_tab1.redraw_canvas()
 
                                 Button:
                                     text: "Clear All"
-                                    font_size: '10sp'
                                     on_release: app.fov_manager.clear_all_wells(); scaled_canvas_tab1.redraw_canvas()
 
                                 Button:
                                     text: "Sync Channels"
                                     background_color: (0.2, 0.5, 0.8, 1)
                                     bold: True
-                                    font_size: '10sp'
                                     on_release: app.global_sync_active_channels()
 
                             # Registration Target Instruction & Stage Jog Controls
                             BoxLayout:
                                 orientation: 'vertical'
                                 size_hint_y: None
-                                height: '135dp'
+                                height: '145dp'
                                 padding: '6dp'
                                 spacing: '4dp'
                                 canvas.before:
@@ -116,60 +126,80 @@
                                         pos: self.pos
                                         size: self.size
 
+                                BoxLayout:
+                                    size_hint_y: None
+                                    height: '24dp'
+                                    spacing: '6dp'
+
+                                    Label:
+                                        text: "Calib Channel:"
+                                        size_hint_x: 0.4
+                                        bold: True
+
+                                    Spinner:
+                                        id: calib_channel_spinner
+                                        text: "Brightfield"
+                                        values: ["Brightfield", "Phase", "Darkfield", "Blue", "Green", "Red"]
+                                        size_hint_x: 0.6
+                                        on_text: app.set_primary_af_channel(self.text)
+
                                 Label:
                                     id: wizard_instruction_label
-                                    text: app.root_layout.calibration_wizard_text if app.root_layout else "Click 'Start Calib' to begin"
+                                    text: "Step 1/6: Move stage to Well A1 - 12 o'clock position (top rim)"
                                     size_hint_y: None
-                                    height: '20dp'
+                                    height: '22dp'
                                     color: (0.9, 0.9, 0.2, 1)
                                     bold: True
-                                    font_size: '10sp'
+                                    font_size: '11sp'
+
+                                GridLayout:
+                                    cols: 3
+                                    size_hint_y: None
+                                    height: '60dp'
+                                    spacing: '4dp'
+                                    size_hint_x: 0.6
+                                    pos_hint: {'center_x': 0.5}
+
+                                    Widget:
+                                    Button:
+                                        text: "+Y"
+                                        on_release: app.jog_stage(0, 1.0, 0)
+                                    Widget:
+                                    Button:
+                                        text: "-X"
+                                        on_release: app.jog_stage(-1.0, 0, 0)
+                                    Button:
+                                        text: "CENTER"
+                                    Button:
+                                        text: "+X"
+                                        on_release: app.jog_stage(1.0, 0, 0)
+                                    Widget:
+                                    Button:
+                                        text: "-Y"
+                                        on_release: app.jog_stage(0, -1.0, 0)
+                                    Widget:
 
                                 BoxLayout:
                                     size_hint_y: None
                                     height: '28dp'
-                                    spacing: '4dp'
+                                    spacing: '8dp'
 
                                     Button:
-                                        text: "Start Calib"
-                                        background_color: (0.2, 0.6, 0.8, 1)
-                                        bold: True
-                                        font_size: '9sp'
-                                        on_release: app.start_calibration_wizard()
-
-                                    Button:
-                                        text: "Mark"
+                                        text: "Mark Stage Position"
                                         background_color: (0.2, 0.7, 0.3, 1)
                                         bold: True
-                                        font_size: '9sp'
-                                        on_release: app.mark_calibration_step()
+                                        on_release: app.record_calibration_step(); scaled_canvas_tab1.redraw_canvas()
 
                                     Button:
-                                        text: "< Prev"
-                                        font_size: '9sp'
-                                        on_release: app.previous_calibration_step()
-
-                                    Button:
-                                        text: "Next >"
-                                        font_size: '9sp'
-                                        on_release: app.next_calibration_step()
-
-                                    Button:
-                                        text: "Done"
+                                        text: "Finish Calibration"
                                         background_color: (0.8, 0.4, 0.2, 1)
                                         bold: True
-                                        font_size: '9sp'
-                                        on_release: app.finish_plate_calibration()
+                                        on_release: app.finish_plate_calibration(); scaled_canvas_tab1.redraw_canvas()
 
-                                    Button:
-                                        text: "Reset"
-                                        font_size: '9sp'
-                                        on_release: app.reset_calibration()
-
-                        # Right Column: Camera Viewport
+                        # Right Column: Interactive Camera Viewport, Master Auto Point & Test AF
                         BoxLayout:
                             orientation: 'vertical'
-                            size_hint_x: 0.50
+                            size_hint_x: 0.5
                             spacing: '6dp'
 
                             ZoomPanCameraWidget:
@@ -179,7 +209,7 @@
                             BoxLayout:
                                 orientation: 'vertical'
                                 size_hint_y: 0.35
-                                spacing: '4dp'
+                                spacing: '5dp'
                                 padding: '6dp'
                                 canvas.before:
                                     Color:
@@ -191,27 +221,57 @@
                                 Label:
                                     text: "Master Focus Point & Camera Binning Setup"
                                     bold: True
-                                    font_size: '11sp'
+                                    font_size: '12sp'
                                     size_hint_y: None
-                                    height: '18dp'
+                                    height: '20dp'
                                     color: (1.0, 0.4, 0.4, 1)
+
+                                BoxLayout:
+                                    size_hint_y: None
+                                    height: '26dp'
+                                    spacing: '8dp'
+
+                                    Label:
+                                        text: "AF Camera Binning:"
+                                        size_hint_x: 0.45
+
+                                    Spinner:
+                                        id: binning_spinner_tab1
+                                        text: "2x2"
+                                        values: ["1x1", "2x2", "4x4", "8x8"]
+                                        size_hint_x: 0.55
+                                        on_text: app.set_af_binning(self.text)
+
+                                BoxLayout:
+                                    size_hint_y: None
+                                    height: '26dp'
+                                    spacing: '8dp'
+
+                                    Label:
+                                        text: "AF Exposure (ms):"
+                                        size_hint_x: 0.45
+
+                                    TextInput:
+                                        id: af_exp_input_tab1
+                                        text: "20.0"
+                                        multiline: False
+                                        size_hint_x: 0.55
+                                        on_text_validate: app.set_af_exposure(self.text)
 
                                 Button:
                                     text: "Set Stage Position as Master Auto Point (Red)"
                                     size_hint_y: None
-                                    height: '26dp'
+                                    height: '28dp'
                                     background_color: (0.8, 0.2, 0.2, 1)
                                     bold: True
-                                    font_size: '10sp'
                                     on_release: app.set_master_auto_point(); scaled_canvas_tab1.redraw_canvas()
 
                                 Button:
-                                    text: "Test Autofocus Acquisition Sweep"
+                                    text: "Test Autofocus Acquisition"
                                     size_hint_y: None
-                                    height: '26dp'
+                                    height: '28dp'
                                     background_color: (0.2, 0.6, 0.8, 1)
                                     bold: True
-                                    font_size: '10sp'
                                     on_release: app.test_autofocus_run()
 
             # TAB 2: Autofocus Scan Dialogue, Nyquist Calculator & Skip Cycle Controls
@@ -229,7 +289,7 @@
                         # Left Column: Camera Viewport
                         BoxLayout:
                             orientation: 'vertical'
-                            size_hint_x: 0.45
+                            size_hint_x: 0.4
                             spacing: '5dp'
                             canvas.before:
                                 Color:
@@ -238,58 +298,182 @@
                                     pos: self.pos
                                     size: self.size
 
+                            Label:
+                                text: "Live Camera Stream"
+                                bold: True
+                                size_hint_y: None
+                                height: '25dp'
+
                             ZoomPanCameraWidget:
                                 id: camera_viewport_tab2
 
-                        # Right Column: AF Scan Parameters
+                        # Right Column: AF Scan Range, Skip Cycles & Optical Nyquist Calculator
                         BoxLayout:
                             orientation: 'vertical'
-                            size_hint_x: 0.55
+                            size_hint_x: 0.6
                             spacing: '8dp'
+                            padding: '6dp'
 
                             Label:
-                                text: "Autofocus Search Scan & Lens Nyquist Setup"
-                                font_size: '13sp'
+                                text: "Autofocus Search Scan, Skip Cycle & Lens Nyquist Setup"
+                                font_size: '15sp'
                                 bold: True
                                 size_hint_y: None
-                                height: '22dp'
+                                height: '25dp'
 
                             GridLayout:
                                 cols: 2
                                 spacing: '6dp'
                                 size_hint_y: None
-                                height: '55dp'
+                                height: '60dp'
 
                                 Label:
                                     text: "AF Search Range (+/- um):"
-                                    font_size: '11sp'
                                 TextInput:
                                     id: af_range_input
                                     text: "50.0"
                                     multiline: False
-                                    font_size: '11sp'
                                     on_text_validate: app.focus_map.af_search_range_um = float(self.text)
 
                                 Label:
                                     text: "AF Step Size (um):"
-                                    font_size: '11sp'
                                 TextInput:
                                     id: af_step_input
                                     text: "2.0"
                                     multiline: False
-                                    font_size: '11sp'
                                     on_text_validate: app.focus_map.af_step_size_um = float(self.text)
 
-                            Button:
-                                text: "Calculate & Apply Nyquist Z-Step"
+                            BoxLayout:
+                                orientation: 'vertical'
+                                spacing: '6dp'
+                                padding: '6dp'
                                 size_hint_y: None
-                                height: '28dp'
-                                background_color: (0.2, 0.6, 0.8, 1)
-                                bold: True
-                                font_size: '10sp'
-                                on_release: app.apply_nyquist_calculation()
+                                height: '95dp'
+                                canvas.before:
+                                    Color:
+                                        rgba: 0.16, 0.14, 0.22, 1
+                                    Rectangle:
+                                        pos: self.pos
+                                        size: self.size
 
-            # TAB 3: Hardware Protocol & Tiling
+                                Label:
+                                    text: "Autofocus Cycle Skip & Time-Lapse Schedule"
+                                    bold: True
+                                    color: (0.9, 0.7, 1.0, 1)
+
+                                BoxLayout:
+                                    spacing: '8dp'
+
+                                    Label:
+                                        text: "Autofocus Frequency:"
+                                        size_hint_x: 0.45
+
+                                    Spinner:
+                                        id: af_cycle_spinner
+                                        text: "Every Cycle (1)"
+                                        values: ["Every Cycle (1)", "Every 2nd Cycle (2)", "Every 3rd Cycle (3)", "Every 5th Cycle (5)", "Every 10th Cycle (10)"]
+                                        size_hint_x: 0.55
+                                        on_text: app.set_af_cycle_interval(self.text)
+
+                                BoxLayout:
+                                    spacing: '8dp'
+
+                                    CheckBox:
+                                        id: timelapse_enable_checkbox
+                                        active: False
+                                        size_hint_x: None
+                                        width: '25dp'
+                                        on_active: app.set_time_lapse_config(self.active, tl_interval_input.text, tl_cycles_input.text)
+
+                                    Label:
+                                        text: "Time-Lapse"
+                                        size_hint_x: 0.25
+
+                                    Label:
+                                        text: "Interval (m):"
+                                        size_hint_x: 0.2
+                                    TextInput:
+                                        id: tl_interval_input
+                                        text: "10.0"
+                                        multiline: False
+                                        size_hint_x: 0.2
+                                        on_text_validate: app.set_time_lapse_config(timelapse_enable_checkbox.active, self.text, tl_cycles_input.text)
+
+                                    Label:
+                                        text: "Cycles:"
+                                        size_hint_x: 0.15
+                                    TextInput:
+                                        id: tl_cycles_input
+                                        text: "24"
+                                        multiline: False
+                                        size_hint_x: 0.2
+                                        on_text_validate: app.set_time_lapse_config(timelapse_enable_checkbox.active, tl_interval_input.text, self.text)
+
+                            BoxLayout:
+                                orientation: 'vertical'
+                                spacing: '6dp'
+                                padding: '6dp'
+                                canvas.before:
+                                    Color:
+                                        rgba: 0.12, 0.16, 0.22, 1
+                                    Rectangle:
+                                        pos: self.pos
+                                        size: self.size
+
+                                Label:
+                                    text: "Optical Lens Specifications & Nyquist Calculator"
+                                    bold: True
+                                    color: (0.4, 0.8, 1.0, 1)
+
+                                GridLayout:
+                                    cols: 4
+                                    spacing: '4dp'
+
+                                    Label:
+                                        text: "NA:"
+                                    TextInput:
+                                        text: "0.45"
+                                        multiline: False
+                                        on_text_validate: app.focus_map.lens_na = float(self.text)
+
+                                    Label:
+                                        text: "Mag:"
+                                    TextInput:
+                                        text: "20.0"
+                                        multiline: False
+                                        on_text_validate: app.focus_map.lens_mag = float(self.text)
+
+                                    Label:
+                                        text: "Wavelength (nm):"
+                                    TextInput:
+                                        text: "525.0"
+                                        multiline: False
+                                        on_text_validate: app.focus_map.wavelength_nm = float(self.text)
+
+                                    Label:
+                                        text: "Immersion n:"
+                                    TextInput:
+                                        text: "1.0"
+                                        multiline: False
+                                        on_text_validate: app.focus_map.refractive_index = float(self.text)
+
+                                Button:
+                                    text: "Calculate & Apply Nyquist Z-Step to AF Config"
+                                    size_hint_y: None
+                                    height: '30dp'
+                                    background_color: (0.2, 0.6, 0.8, 1)
+                                    bold: True
+                                    on_release: app.apply_nyquist_calculation()
+
+                            Button:
+                                text: "Return to 1. Calibration to Test Autofocus"
+                                size_hint_y: None
+                                height: '35dp'
+                                background_color: (0.2, 0.7, 0.4, 1)
+                                bold: True
+                                on_release: main_tabbed_panel.switch_to(main_tabbed_panel.tab_list[2])
+
+            # TAB 3: Hardware Protocol, 12x12 Tiling & Chromatic Shift Correction
             TabbedPanelItem:
                 text: '3. Hardware Protocol'
                 BoxLayout:
@@ -300,54 +484,192 @@
                     BoxLayout:
                         orientation: 'horizontal'
                         spacing: '10dp'
+                        size_hint_y: 0.85
 
-                        ZoomPanCameraWidget:
-                            id: camera_viewport_tab3
-                            size_hint_x: 0.45
-
+                        # Left Column: Camera Viewport for Secondary Chromatic Focus Tuning
                         BoxLayout:
                             orientation: 'vertical'
-                            size_hint_x: 0.55
-                            spacing: '8dp'
+                            size_hint_x: 0.4
+                            spacing: '5dp'
+                            canvas.before:
+                                Color:
+                                    rgba: 0.1, 0.12, 0.16, 1
+                                Rectangle:
+                                    pos: self.pos
+                                    size: self.size
 
                             Label:
-                                text: "Tile Grid Dimensions (1x1 to 12x12)"
+                                text: "Live Viewport - Chromatic Focus Check"
                                 bold: True
-                                font_size: '11sp'
-
-                            BoxLayout:
-                                spacing: '6dp'
                                 size_hint_y: None
-                                height: '28dp'
+                                height: '25dp'
 
-                                Label:
-                                    text: "Rows:"
-                                    size_hint_x: 0.2
-                                TextInput:
-                                    id: tile_rows_tab3
-                                    text: "1"
-                                    multiline: False
-                                    size_hint_x: 0.25
-                                Label:
-                                    text: "Cols:"
-                                    size_hint_x: 0.2
-                                TextInput:
-                                    id: tile_cols_tab3
-                                    text: "1"
-                                    multiline: False
-                                    size_hint_x: 0.25
+                            ZoomPanCameraWidget:
+                                id: camera_viewport_tab3
+
+                            GridLayout:
+                                cols: 4
+                                size_hint_y: None
+                                height: '30dp'
+                                spacing: '4dp'
 
                                 Button:
-                                    text: "Apply Grid"
-                                    size_hint_x: 0.3
-                                    font_size: '10sp'
-                                    on_release: app.apply_grid_settings(tile_rows_tab3.text, tile_cols_tab3.text, True)
+                                    text: "-1.0 um"
+                                    on_release: app.jog_stage(0, 0, -0.001)
+                                Button:
+                                    text: "-0.2 um"
+                                    on_release: app.jog_stage(0, 0, -0.0002)
+                                Button:
+                                    text: "+0.2 um"
+                                    on_release: app.jog_stage(0, 0, 0.0002)
+                                Button:
+                                    text: "+1.0 um"
+                                    on_release: app.jog_stage(0, 0, 0.001)
+
+                        # Right Column: Tiling, Channel Accept/Reject & Secondary Chromatic Offsets
+                        BoxLayout:
+                            orientation: 'vertical'
+                            size_hint_x: 0.6
+                            spacing: '10dp'
+
+                            BoxLayout:
+                                orientation: 'vertical'
+                                spacing: '6dp'
+                                padding: '8dp'
+                                size_hint_y: None
+                                height: '75dp'
+                                canvas.before:
+                                    Color:
+                                        rgba: 0.12, 0.15, 0.2, 1
+                                    Rectangle:
+                                        pos: self.pos
+                                        size: self.size
+
+                                Label:
+                                    text: "Tiled Area Grid Dimensions (1x1 up to 12x12)"
+                                    bold: True
+
+                                BoxLayout:
+                                    spacing: '8dp'
+
+                                    Label:
+                                        text: "Rows:"
+                                        size_hint_x: 0.2
+                                    TextInput:
+                                        id: tile_rows_tab3
+                                        text: "1"
+                                        multiline: False
+                                        size_hint_x: 0.25
+
+                                    Label:
+                                        text: "Cols:"
+                                        size_hint_x: 0.2
+                                    TextInput:
+                                        id: tile_cols_tab3
+                                        text: "1"
+                                        multiline: False
+                                        size_hint_x: 0.25
+
+                                    Button:
+                                        text: "Apply Grid"
+                                        size_hint_x: 0.3
+                                        on_release: app.apply_grid_settings(tile_rows_tab3.text, tile_cols_tab3.text, True)
+
+                            BoxLayout:
+                                orientation: 'vertical'
+                                spacing: '6dp'
+                                padding: '8dp'
+                                canvas.before:
+                                    Color:
+                                        rgba: 0.15, 0.12, 0.2, 1
+                                    Rectangle:
+                                        pos: self.pos
+                                        size: self.size
+
+                                Label:
+                                    text: "Per-Channel Chromatic Z-Offset Correction"
+                                    bold: True
+                                    color: (0.8, 0.6, 1.0, 1)
+
+                                BoxLayout:
+                                    spacing: '8dp'
+
+                                    Spinner:
+                                        id: chromatic_channel_spinner
+                                        text: "Blue"
+                                        values: ["Brightfield", "Phase", "Darkfield", "Blue", "Green", "Red"]
+                                        size_hint_x: 0.5
+
+                                    Button:
+                                        text: "Save Current Z as Channel Offset"
+                                        size_hint_x: 0.5
+                                        background_color: (0.6, 0.3, 0.8, 1)
+                                        bold: True
+                                        on_release: app.set_chromatic_z_offset(chromatic_channel_spinner.text)
+
+                            BoxLayout:
+                                orientation: 'vertical'
+                                spacing: '4dp'
+                                padding: '6dp'
+                                canvas.before:
+                                    Color:
+                                        rgba: 0.12, 0.12, 0.14, 1
+                                    Rectangle:
+                                        pos: self.pos
+                                        size: self.size
+
+                                Label:
+                                    text: "Accept / Reject Channels for Execution"
+                                    bold: True
+                                    size_hint_y: None
+                                    height: '20dp'
+
+                                GridLayout:
+                                    cols: 3
+                                    spacing: '6dp'
+
+                                    BoxLayout:
+                                        CheckBox:
+                                            active: True
+                                            on_active: app.focus_map.accepted_channels["Brightfield"] = self.active
+                                        Label:
+                                            text: "Brightfield"
+                                    BoxLayout:
+                                        CheckBox:
+                                            active: True
+                                            on_active: app.focus_map.accepted_channels["Phase"] = self.active
+                                        Label:
+                                            text: "Phase"
+                                    BoxLayout:
+                                        CheckBox:
+                                            active: True
+                                            on_active: app.focus_map.accepted_channels["Darkfield"] = self.active
+                                        Label:
+                                            text: "Darkfield"
+                                    BoxLayout:
+                                        CheckBox:
+                                            active: True
+                                            on_active: app.focus_map.accepted_channels["Blue"] = self.active
+                                        Label:
+                                            text: "Blue (405nm)"
+                                    BoxLayout:
+                                        CheckBox:
+                                            active: True
+                                            on_active: app.focus_map.accepted_channels["Green"] = self.active
+                                        Label:
+                                            text: "Green (488nm)"
+                                    BoxLayout:
+                                        CheckBox:
+                                            active: True
+                                            on_active: app.focus_map.accepted_channels["Red"] = self.active
+                                        Label:
+                                            text: "Red (594nm)"
 
                     Button:
                         text: "Apply Protocol to Experiment Execution Engine & Save"
                         size_hint_y: None
-                        height: '42dp'
+                        height: '45dp'
                         background_color: (0.2, 0.7, 0.4, 1)
                         bold: True
-                        font_size: '13sp'
+                        font_size: '15sp'
                         on_release: app.generate_and_apply_protocol(); root.dismiss()
