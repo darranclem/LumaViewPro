@@ -1,5 +1,5 @@
 from __future__ import annotations
-# VERSION: 4.4.0-FINAL-INITIALIZATION
+# VERSION: 4.5.0-FULL-MICROSCOPE-HANDSHAKE
 """
 etaluma_init.py - Environment & Hardware Initialization Bootstrapper for LumaViewPro.
 
@@ -8,13 +8,12 @@ Replicates the exact startup verification sequence from stock Etaluma LumaViewPr
 2. Sets JAVA_HOME (Zulu OpenJDK 8) and links Apache Maven 3.9.8.
 3. Injects stock hardware driver directories into sys.path so 'import pyloncamera',
    'import motorboard', and 'import ledboard' succeed from any folder.
-4. Checks SciJava, PyImageJ, jgo, and imglyb dependencies.
+4. Probes SciJava, PyImageJ, jgo, and imglyb dependencies.
 """
 
 import os
 import sys
 
-# Standard default paths on Windows microscope installation
 STOCK_INSTALL_DIRS = [
     r"C:\Program Files (x86)\LumaViewPro-stock",
     r"C:\Program Files (x86)\Etaluma\LumaViewPro",
@@ -28,19 +27,23 @@ MAVEN_BIN_DEFAULT = r"C:\Maven\apache-maven-3.9.8\bin"
 
 def run_etaluma_stock_initialization():
     """Initializes environment, driver paths, Java/Maven links, and SciJava bridge."""
-    print("=== LumaViewPro Stock Environment Initialization ===")
+    print("==========================================================")
+    print(" LumaViewPro Hardware & Stock Environment Initialization ")
+    print("==========================================================")
+    print(f"Script Location: {os.path.dirname(os.path.abspath(__file__))}")
+    print(f"Python Executable: {sys.executable}")
 
     # 1. Inject stock driver paths into sys.path
     for d in STOCK_INSTALL_DIRS:
         if os.path.exists(d) and d not in sys.path:
             sys.path.insert(0, d)
-            print(f"--> Added driver path to sys.path: {d}")
+            print(f"--> Injected driver search path into sys.path: {d}")
 
     # 2. Configure JAVA_HOME if not assigned
     if not os.environ.get("JAVA_HOME"):
         if os.path.exists(JAVA_HOME_DEFAULT):
             os.environ["JAVA_HOME"] = JAVA_HOME_DEFAULT
-            print(f"--> Set JAVA_HOME to: {JAVA_HOME_DEFAULT}")
+            print(f"--> Set JAVA_HOME to Zulu OpenJDK 8: {JAVA_HOME_DEFAULT}")
         else:
             print("--> WARNING: JAVA_HOME is not set and default Zulu 8 path was not found.")
     else:
@@ -50,17 +53,17 @@ def run_etaluma_stock_initialization():
     if os.path.exists(MAVEN_BIN_DEFAULT):
         if MAVEN_BIN_DEFAULT not in os.environ.get("PATH", ""):
             os.environ["PATH"] = MAVEN_BIN_DEFAULT + os.pathsep + os.environ.get("PATH", "")
-            print(f"--> Added Maven to PATH: {MAVEN_BIN_DEFAULT}")
+            print(f"--> Added Apache Maven 3.9.8 to PATH: {MAVEN_BIN_DEFAULT}")
 
-    # 4. Check SciJava / PyImageJ / jgo dependencies
+    # 4. Probe SciJava / PyImageJ / jgo dependencies
     for mod_name in ["jgo", "scyjava", "imglyb", "pyimagej"]:
         try:
             __import__(mod_name)
             print(f"--> Dependency '{mod_name}': OK")
         except ImportError:
-            print(f"--> Dependency '{mod_name}': Not loaded (using native Python drivers)")
+            print(f"--> Dependency '{mod_name}': Optional/Not loaded")
 
-    print("=== Initialization Complete. Launching LumaViewPro App... ===")
+    print("=== Stock Environment Handshake Complete. Initializing GUI... ===\n")
 
 
 if __name__ == "__main__":
