@@ -1,17 +1,18 @@
-from __future__ import annotations
-# VERSION: 4.5.0-FULL-MICROSCOPE-HANDSHAKE
 """
-image_utils.py - Fast, cached image processing, flat-field shading correction, focus metrics,
-and optically accurate camera frame processing and sanitization for LumaViewPro.
+image_utils.py - Image processing, flat-field shading correction, focus sharpness metrics,
+and optically accurate synthetic camera frame generation for LumaViewPro.
 """
 
+from __future__ import annotations
 import os
 import cv2
 import numpy as np
 import math
 from typing import Optional, Tuple, Dict, List
 
+# Pre-computed cell colony coordinate cache for 20 FPS live simulation
 _CELL_CACHE: Dict[Tuple[int, int], List[Tuple[float, float, float]]] = {}
+_DARK_NOISE_FRAME: Optional[np.ndarray] = None
 
 
 def _init_cell_cache():
@@ -22,10 +23,10 @@ def _init_cell_cache():
         for c in range(24):
             seed = (r * 24 + c + 1) * 1000
             np.random.seed(seed)
-            num_cells = 45
+            num_cells = 50
             angles = np.random.uniform(0, 2 * np.pi, num_cells)
-            radii = np.random.uniform(0.1, 3.2, num_cells)
-            cell_rs = np.random.uniform(0.015, 0.035, num_cells)
+            radii = np.random.uniform(0.05, 3.2, num_cells)
+            cell_rs = np.random.uniform(0.015, 0.038, num_cells)
 
             cell_list = []
             for i in range(num_cells):
@@ -123,81 +124,26 @@ def compute_focus_score(img: np.ndarray, method: str = "laplacian") -> float:
         return float(np.var(lap))
 
 
-def generate_disconnected_camera_frame(
-    sensor_size: Tuple[int, int] = (512, 512),
-    msg: str = "COULD NOT CONNECT TO MICROSCOPE HARDWARE"
-) -> np.ndarray:
-    """Generates a clear 'COULD NOT CONNECT TO MICROSCOPE HARDWARE' overlay frame."""
+def generate_disconnected_camera_frame(sensor_size: Tuple[int, int] = (512, 512)) -> np.ndarray:
+    """Generates a clear 'CAMERA DISCONNECTED' status frame when run without USB camera attached."""
     w, h = sensor_size
-    frame = np.zeros((h, w, 3), dtype=np.uint8)
-    # Dark slate background with bold warning box
-    cv2.rectangle(frame, (10, 10), (w - 10, h - 10), (25, 25, 35), -1)
-    cv2.rectangle(frame, (10, 10), (w - 10, h - 10), (60, 60, 160), 2)
+    frame = np.full((h, w, 3), (25, 25, 30), dtype=np.uint8)
 
-    cv2.putText(frame, "COULD NOT CONNECT TO MICROSCOPE", (w // 2 - 210, h // 2 - 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (80, 80, 255), 2)
-    cv2.putText(frame, "Check USB Camera, Stage & LED Connections", (w // 2 - 200, h // 2 + 15),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 220), 1)
-    cv2.putText(frame, "(Run luma_sim.py for Offline Desktop Simulation)", (w // 2 - 200, h // 2 + 45),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (120, 160, 200), 1)
+    # Outer border
+    cv2.rectangle(frame, (15, 15), (w - 15, h - 15), (40, 40, 60), -1)
+    cv2.rectangle(frame, (15, 15), (w - 15, h - 15), (70, 70, 180), 2)
+
+    # Disconnected Symbol / Icon
+    cx, cy = w // 2, h // 2 - 20
+    cv2.circle(frame, (cx, cy), 40, (50, 50, 200), -1)
+    cv2.line(frame, (cx - 20, cy - 20), (cx + 20, cy + 20), (240, 240, 240), 4)
+    cv2.line(frame, (cx + 20, cy - 20), (cx - 20, cy + 20), (240, 240, 240), 4)
+
+    # Text Banner
+    cv2.putText(frame, "MICROSCOPE DISCONNECTED", (cx - 180, cy + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (100, 100, 255), 2)
+    cv2.putText(frame, "Connect USB Microscope Hardware", (cx - 150, cy + 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 220), 1)
+
     return frame
-
-
-def sanitize_camera_frame(
-    frame: Optional[np.ndarray],
-    msg: str = "COULD NOT CONNECT TO MICROSCOPE HARDWARE"
-) -> np.ndarray:
-    """
-    Ensures any raw camera frame (Mono8, Mono16 uint16, BGR, RGB, Float) is safely
-    converted to a 3-channel contiguous uint8 RGB numpy array of shape (H, W, 3).
-    If frame is None or invalid, returns a clear DISCONNECTED overlay frame.
-    Prevents Kivy C-extension OpenGL texture memory segfaults.
-    """
-    if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
-        return generate_disconnected_camera_frame(msg=msg)
-
-    try:
-        # Handle 1D array
-        if len(frame.shape) == 1:
-            side = int(math.sqrt(frame.size))
-            if side * side == frame.size:
-                frame = frame.reshape((side, side))
-            else:
-                return generate_disconnected_camera_frame(msg=msg)
-
-        # 1. Convert non-uint8 array (e.g. Mono16 uint16 or float32 from Basler Pylon) to uint8
-        if frame.dtype != np.uint8:
-            if frame.dtype == np.uint16:
-                max_val = frame.max()
-                if max_val > 255:
-                    frame_8u = (frame >> 8).astype(np.uint8)
-                else:
-                    frame_8u = frame.astype(np.uint8)
-            else:
-                frame_8u = cv2.normalize(frame, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-        else:
-            frame_8u = frame
-
-        # 2. Format channels to 3-channel RGB
-        if len(frame_8u.shape) == 2:  # Grayscale (H, W)
-            rgb = cv2.cvtColor(frame_8u, cv2.COLOR_GRAY2RGB)
-        elif len(frame_8u.shape) == 3:
-            channels = frame_8u.shape[2]
-            if channels == 1:
-                rgb = cv2.cvtColor(frame_8u, cv2.COLOR_GRAY2RGB)
-            elif channels == 3:
-                rgb = cv2.cvtColor(frame_8u, cv2.COLOR_BGR2RGB)
-            elif channels == 4:
-                rgb = cv2.cvtColor(frame_8u, cv2.COLOR_BGRA2RGB)
-            else:
-                rgb = frame_8u[:, :, :3]
-        else:
-            return generate_disconnected_camera_frame(msg=msg)
-
-        return np.ascontiguousarray(rgb, dtype=np.uint8)
-    except Exception as e:
-        print(f"[image_utils] sanitize_camera_frame error: {e}")
-        return generate_disconnected_camera_frame(msg=msg)
 
 
 def generate_well_plate_cell_frame(
@@ -216,14 +162,23 @@ def generate_well_plate_cell_frame(
     num_wells: int = 96,
     **kwargs
 ) -> np.ndarray:
+    """
+    Generates synthetic high-resolution camera frames with ultra-fast OpenCV rendering.
+    - If is_light_on is False: Returns dark camera sensor Poisson noise frame.
+    - If is_light_on is True: Renders well interior disks, cell colonies, well rim outlines,
+      inter-well structural grid lines, outer plate skirt borders, and Z defocus blur.
+    """
+    global _DARK_NOISE_FRAME
     w, h = sensor_size
 
-    # Dark sensor state when light is OFF
+    # 1. Dark Launch / Light OFF State (returns dark sensor noise)
     if not is_light_on or channel.upper() in ["OFF", "NONE", ""]:
-        np.random.seed(0)
-        dark_noise = np.random.normal(loc=2.5, scale=1.0, size=(h, w, 3)).astype(np.int16)
-        return np.clip(dark_noise, 0, 255).astype(np.uint8)
+        if _DARK_NOISE_FRAME is None or _DARK_NOISE_FRAME.shape != (h, w, 3):
+            np.random.seed(0)
+            _DARK_NOISE_FRAME = np.random.poisson(lam=2.5, size=(h, w, 3)).clip(0, 255).astype(np.uint8)
+        return _DARK_NOISE_FRAME
 
+    # 2. Light ON State
     p_val = led_power if led_power is not None else power
     p_factor = max(0.05, min(1.5, float(p_val) / 100.0))
     exp_factor = max(0.1, min(3.0, (exposure_ms / 20.0) * gain))
@@ -261,31 +216,33 @@ def generate_well_plate_cell_frame(
 
     ch_l = channel.lower()
 
+    # Determine Base Colors for Active Channel LUT (BGR format)
     if "blue" in ch_l or "dapi" in ch_l:
         bg_color = np.array([25, 10, 5], dtype=np.float32)
-        cell_color = np.array([255, 180, 40], dtype=np.float32)
+        cell_color = np.array([255, 180, 40], dtype=np.float32)   # Pure Blue BGR
         rim_color = np.array([120, 60, 20], dtype=np.float32)
     elif "green" in ch_l or "fitc" in ch_l or "gfp" in ch_l:
         bg_color = np.array([10, 20, 10], dtype=np.float32)
-        cell_color = np.array([40, 240, 60], dtype=np.float32)
+        cell_color = np.array([40, 240, 60], dtype=np.float32)    # Pure Green BGR
         rim_color = np.array([30, 120, 30], dtype=np.float32)
     elif "red" in ch_l or "txred" in ch_l or "mcherry" in ch_l or "cy5" in ch_l:
         bg_color = np.array([20, 10, 10], dtype=np.float32)
-        cell_color = np.array([30, 40, 250], dtype=np.float32)
+        cell_color = np.array([30, 40, 250], dtype=np.float32)    # Pure Red BGR
         rim_color = np.array([30, 30, 120], dtype=np.float32)
     elif "darkfield" in ch_l or "df" in ch_l:
-        bg_color = np.array([15, 15, 20], dtype=np.float32)
+        bg_color = np.array([15, 15, 20], dtype=np.float32)       # Darkfield
         cell_color = np.array([220, 220, 240], dtype=np.float32)
         rim_color = np.array([180, 180, 200], dtype=np.float32)
     elif "phase" in ch_l:
-        bg_color = np.array([175, 175, 180], dtype=np.float32)
+        bg_color = np.array([175, 175, 180], dtype=np.float32)   # Phase Contrast
         cell_color = np.array([40, 40, 45], dtype=np.float32)
         rim_color = np.array([100, 100, 110], dtype=np.float32)
     else:  # Brightfield
-        bg_color = np.array([220, 220, 220], dtype=np.float32)
+        bg_color = np.array([220, 220, 220], dtype=np.float32)   # Brightfield
         cell_color = np.array([70, 70, 80], dtype=np.float32)
         rim_color = np.array([110, 110, 120], dtype=np.float32)
 
+    # Base background: Inter-well plastic body
     plastic_val = int(50 * brightness)
     frame = np.full((h, w, 3), (plastic_val, plastic_val, plastic_val), dtype=np.uint8)
 
@@ -293,11 +250,13 @@ def generate_well_plate_cell_frame(
     cell_c = tuple(int(x) for x in np.clip(cell_color * brightness, 0, 255))
     rim_c = tuple(int(x) for x in np.clip(rim_color * brightness, 0, 255))
 
+    # Outer Plate Skirt Boundary (127.76mm x 85.48mm)
     plate_left = -127.76 / 2.0
     plate_right = 127.76 / 2.0
     plate_bottom = -85.48 / 2.0
     plate_top = 85.48 / 2.0
 
+    # Outside plate skirt boundary -> dark stage metal
     px_left = int(((plate_left - fov_left) / fov_w) * w)
     px_right = int(((plate_right - fov_left) / fov_w) * w)
     px_top = int(((fov_top - plate_top) / fov_h) * h)
@@ -312,6 +271,7 @@ def generate_well_plate_cell_frame(
     if px_bottom < h:
         cv2.rectangle(frame, (0, px_bottom), (w, h), (15, 15, 18), -1)
 
+    # Render wells overlapping active FOV
     for wx, wy, r_idx, c_idx in wells:
         dist_well = math.hypot(wx - stage_x, wy - stage_y)
         if dist_well <= (max(fov_w, fov_h) + well_r_mm + 1.0):
@@ -319,27 +279,31 @@ def generate_well_plate_cell_frame(
             well_px_y = int(((fov_top - wy) / fov_h) * h)
             well_r_px = int((well_r_mm / fov_w) * w)
 
+            # Draw filled well interior
             cv2.circle(frame, (well_px_x, well_px_y), well_r_px, bg_c, -1)
 
+            # Draw cell colonies inside well
             cell_list = _CELL_CACHE.get((r_idx % 16, c_idx % 24), [])
-            for dx, dy, cr_mm in cell_list:
+            for dx, dy, cr_px in cell_list:
                 cx_mm = wx + dx
                 cy_mm = wy + dy
                 if math.hypot(dx, dy) < (well_r_mm - 0.05):
                     if fov_left - 0.1 <= cx_mm <= fov_right + 0.1 and fov_bottom - 0.1 <= cy_mm <= fov_top + 0.1:
                         c_px_x = int(((cx_mm - fov_left) / fov_w) * w)
                         c_px_y = int(((fov_top - cy_mm) / fov_h) * h)
-                        c_r_px = max(2, int((cr_mm / fov_w) * w))
+                        c_r_px = max(2, int((cr_px / 512.0) * (1.2 / fov_w) * w))
                         if 0 <= c_px_x < w and 0 <= c_px_y < h:
                             cv2.circle(frame, (c_px_x, c_px_y), c_r_px, cell_c, -1)
 
+            # Draw well edge rim line
             rim_w_px = max(2, int((0.15 / fov_w) * w))
             cv2.circle(frame, (well_px_x, well_px_y), well_r_px, rim_c, rim_w_px)
 
     out_frame = np.clip(frame, 0, 255).astype(np.uint8)
 
+    # Z defocus blur simulation relative to focal plane best_z
     dist_z = abs(stage_z - best_z)
-    if dist_z > 0.0005:
+    if dist_z > 0.0005:  # more than 0.5 microns off focus
         blur_k = int(dist_z * 250.0)
         if blur_k % 2 == 0:
             blur_k += 1
@@ -352,3 +316,53 @@ def generate_well_plate_cell_frame(
 
 def generate_simulated_frame(*args, **kwargs) -> np.ndarray:
     return generate_well_plate_cell_frame(*args, **kwargs)
+
+
+def sanitize_camera_frame(frame: Optional[np.ndarray]) -> np.ndarray:
+    """
+    Guarantees any frame array from real Basler sensors (Mono16, Mono8, BGR, RGB, Float)
+    is safely normalized and converted into a contiguous uint8 3-channel RGB array (H, W, 3).
+    Prevents Kivy C-extension OpenGL texture memory access violations.
+    """
+    if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+        return generate_disconnected_camera_frame()
+
+    try:
+        if len(frame.shape) == 1:
+            side = int(math.sqrt(frame.size))
+            if side * side == frame.size:
+                frame = frame.reshape((side, side))
+            else:
+                return generate_disconnected_camera_frame()
+
+        if frame.dtype != np.uint8:
+            if frame.dtype == np.uint16:
+                max_val = frame.max()
+                if max_val > 255:
+                    frame_8u = (frame >> 8).astype(np.uint8)
+                else:
+                    frame_8u = frame.astype(np.uint8)
+            else:
+                frame_8u = cv2.normalize(frame, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        else:
+            frame_8u = frame
+
+        if len(frame_8u.shape) == 2:
+            rgb = cv2.cvtColor(frame_8u, cv2.COLOR_GRAY2RGB)
+        elif len(frame_8u.shape) == 3:
+            c_num = frame_8u.shape[2]
+            if c_num == 1:
+                rgb = cv2.cvtColor(frame_8u, cv2.COLOR_GRAY2RGB)
+            elif c_num == 3:
+                rgb = cv2.cvtColor(frame_8u, cv2.COLOR_BGR2RGB)
+            elif c_num == 4:
+                rgb = cv2.cvtColor(frame_8u, cv2.COLOR_BGRA2RGB)
+            else:
+                rgb = frame_8u[:, :, :3]
+        else:
+            return generate_disconnected_camera_frame()
+
+        return np.ascontiguousarray(rgb, dtype=np.uint8)
+    except Exception as e:
+        print(f"[image_utils] sanitize_camera_frame error: {e}")
+        return generate_disconnected_camera_frame()

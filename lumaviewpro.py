@@ -1,44 +1,36 @@
 from __future__ import annotations
-# VERSION: 4.5.0-FULL-MICROSCOPE-HANDSHAKE
 """
 lumaviewpro.py - Main Application Controller for LumaViewPro Microscope Automation.
 
-Unified Single-Window UI Architecture (Zero Popups):
-- Window Maximized to Full Desktop Size on launch.
-- Top Header: Application Title, Active Well Display, Stage Coordinates, Calibration Status.
-- Top-Left (50% Width): Live Camera Viewport (ZoomPanCameraWidget) with center reticle crosshairs & double-click pixel stage centering.
-- Bottom-Left (50% Width): Hardware Motion Deck with Ergonomic 3x3 XY Cross (Y+ ↑, X− ←, Home A1, → X+, ↓ Y−), Step Size Spinner, X/Y Position Readouts, and Z Focus Vertical Bar.
-- Top-Right (50% Width): Microplate Canvas Map (InteractiveScaledPlateCanvas) with Format Selector (6 to 384 wells), Objective Selector (1.25x to 100x Oil), active FOV cyan reticle, and 1:1 double-click stage navigation.
-- Bottom-Right (50% Width): Optical Channels Panel (Single-Channel Mutual Exclusion) + 6-Point Target Calibration Wizard.
+Unified Single-Window UI Architecture (Zero Popups, Zero Redundant Launch Buttons):
+- Top Navigation Bar: Application Title, Active Well Display, Stage Coordinates, Calibration Status.
+- Top-Left (50% Width): Live Camera Viewport (ZoomPanCameraWidget) with reticle crosshairs & double-click pixel centering.
+- Bottom-Left (50% Width): Hardware Motion Stage & Illumination Deck (Exp, Gain, LED %, Light ON/OFF, Grouped XY Cross, Z Column, Snapshot).
+- Top-Right (50% Width): Microplate Canvas Map (InteractiveScaledPlateCanvas) with Format Selector (6 to 384 wells), Objective Selector (1.25x to 100x Oil), active FOV cyan reticle, and double-click well stage navigation.
+- Bottom-Right (50% Width): Optical Channels List (Single-channel mutual exclusion) + 3-Tab Registration, Autofocus & Protocol Studio.
 """
 
 import os
 import sys
+import json
+import math
+import re
+import cv2
+import numpy as np
+from typing import Dict, Optional, List, Tuple
 
-# 1. Force local repository directory to be #1 in Python's module search path
 script_dir = os.path.dirname(os.path.abspath(__file__))
 if script_dir in sys.path:
     sys.path.remove(script_dir)
 sys.path.insert(0, script_dir)
 os.chdir(script_dir)
 
-# 2. MANDATORY TOP-LEVEL EXECUTION OF STOCK ETALUMA JAVA/MAVEN/DRIVER BOOTSTRAPPER
 import etaluma_init
 etaluma_init.run_etaluma_stock_initialization()
-
-import json
-import math
-import re
-import cv2
-import numpy as np
-import threading
-from typing import Dict, Optional, List, Tuple
-
 import image_utils
 import labware
 import plate_navigator
 
-# Kivy framework imports
 import kivy
 kivy.require('2.0.0')
 
@@ -46,7 +38,6 @@ from kivy.app import App
 from kivy.lang import Builder
 from kivy.factory import Factory
 from kivy.clock import Clock
-from kivy.core.window import Window
 from kivy.graphics.texture import Texture
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.gridlayout import GridLayout
@@ -67,37 +58,34 @@ from kivy.properties import (
 )
 
 
+
 def install_crash_handler():
-    """Installs global exception interceptors to record tracebacks in lumaviewpro_crash.log."""
-    def _excepthook(exctype, value, tb):
+    def _global_excepthook(exctype, value, tb):
         import traceback
-        err_msg = "".join(traceback.format_exception(exctype, value, tb))
-        print(f"\n[LUMAVIEWPRO CRASH INTERCEPTED]\n{err_msg}")
+        err_msg = str(traceback.format_exception(exctype, value, tb))
+        print('[CRASH INTERCEPTED]', err_msg)
         try:
-            log_path = os.path.join(script_dir, "lumaviewpro_crash.log")
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"\n=== CRASH LOG ({Clock.get_time():.3f}s) ===\n{err_msg}\n")
+            log_path = os.path.join(script_dir, 'lumaviewpro_crash.log')
+            with open(log_path, 'a', encoding='utf-8') as log_file:
+                log_file.write(err_msg)
         except Exception:
             pass
 
-    sys.excepthook = _excepthook
+    sys.excepthook = _global_excepthook
+    import threading
     if hasattr(threading, 'excepthook'):
-        threading.excepthook = lambda args: _excepthook(args.exc_type, args.exc_value, args.exc_traceback)
-
-
-install_crash_handler()
-
+        threading.excepthook = lambda args: _global_excepthook(args.exc_type, args.exc_value, args.exc_traceback)
 
 class ChannelConfig:
-    """Stores configuration and optical illumination/emission specs for an imaging channel."""
-
+    """Stores configuration and optical specifications for an imaging channel."""
+    
     def __init__(
         self,
         name: str,
         excitation_range_nm: str = "",
         emission_range_nm: str = "",
         color_hex: str = "#FFFFFF",
-        is_transmitted: bool = True,
+        is_transmitted: bool = False,
         btn_color: List[float] = None
     ):
         self.name: str = name
@@ -105,12 +93,13 @@ class ChannelConfig:
         self.emission_range_nm: str = emission_range_nm
         self.color_hex: str = color_hex
         self.is_transmitted: bool = is_transmitted
-        self.btn_color: List[float] = btn_color if btn_color else [0.5, 0.5, 0.5, 1.0]
+        self.btn_color: List[float] = btn_color if btn_color else [0.2, 0.6, 0.8, 1.0]
         self.active: bool = False
         self.exposure_ms: float = 20.0
         self.gain: float = 1.0
+        self.led_power: float = 100.0
         self.ref_image_path: Optional[str] = None
-        self.ref_image_array: Optional[np.ndarray] = None
+        self.ref_image_array: Optional[object] = None
         self.shading_correction_enabled: bool = True
 
     def load_ref_image(self, filepath: str) -> bool:
@@ -126,8 +115,8 @@ class ChannelConfig:
 
 
 class ChannelManager:
-    """Manages optical imaging channels with strict single-channel mutual exclusion."""
-
+    """Manages 6 optical imaging channels with strict single-channel mutual exclusion."""
+    
     ALIASES = {
         "BF": "Brightfield",
         "Pseudo Darkfield": "Darkfield",
@@ -140,30 +129,45 @@ class ChannelManager:
 
     def __init__(self):
         self.channels: Dict[str, ChannelConfig] = {
-            "Brightfield": ChannelConfig("Brightfield", excitation_range_nm="White LED", emission_range_nm="Pass-through", color_hex="#FFFFFF", is_transmitted=True, btn_color=[0.9, 0.9, 0.9, 1.0]),
-            "Phase": ChannelConfig("Phase", excitation_range_nm="White Ring", emission_range_nm="Phase Shift", color_hex="#CCCCCC", is_transmitted=True, btn_color=[0.65, 0.7, 0.75, 1.0]),
-            "Darkfield": ChannelConfig("Darkfield", excitation_range_nm="Oblique LED", emission_range_nm="Pass-through", color_hex="#888888", is_transmitted=True, btn_color=[0.4, 0.4, 0.45, 1.0]),
-            "Blue": ChannelConfig("Blue", excitation_range_nm="370-410 nm", emission_range_nm="429-462 nm", color_hex="#0080FF", is_transmitted=False, btn_color=[0.0, 0.45, 1.0, 1.0]),
-            "Green": ChannelConfig("Green", excitation_range_nm="473-491 nm", emission_range_nm="502-561 nm", color_hex="#00FF40", is_transmitted=False, btn_color=[0.0, 0.85, 0.25, 1.0]),
-            "Red": ChannelConfig("Red", excitation_range_nm="580-598 nm", emission_range_nm="612-680 nm", color_hex="#FF3030", is_transmitted=False, btn_color=[0.95, 0.15, 0.15, 1.0])
+            "Brightfield": ChannelConfig("Brightfield", "White LED", "Pass-through", "#FFFFFF", True, [0.9, 0.9, 0.9, 1.0]),
+            "Phase": ChannelConfig("Phase", "White LED (Phase Ring)", "Pass-through", "#CCCCCC", True, [0.65, 0.7, 0.75, 1.0]),
+            "Darkfield": ChannelConfig("Darkfield", "Oblique LED", "Pass-through", "#888888", True, [0.4, 0.4, 0.45, 1.0]),
+            "Blue": ChannelConfig("Blue", "370-410 nm", "429-462 nm", "#0080FF", False, [0.0, 0.45, 1.0, 1.0]),
+            "Green": ChannelConfig("Green", "473-491 nm", "502-561 nm", "#00FF40", False, [0.0, 0.85, 0.25, 1.0]),
+            "Red": ChannelConfig("Red", "580-598 nm", "612-680 nm", "#FF3030", False, [0.95, 0.15, 0.15, 1.0])
         }
 
     def resolve_channel_name(self, name: str) -> str:
         return self.ALIASES.get(name, name)
 
     def set_channel_active(self, channel_name: str, active: bool):
-        real_name = self.resolve_channel_name(channel_name)
-        if active:
-            for name, ch_cfg in self.channels.items():
-                ch_cfg.active = (name == real_name)
-        else:
-            if real_name in self.channels:
-                self.channels[real_name].active = False
+        canonical = self.resolve_channel_name(channel_name)
+        if canonical in self.channels:
+            if active:
+                for ch in self.channels.values():
+                    ch.active = False
+                self.channels[canonical].active = True
+            else:
+                self.channels[canonical].active = False
 
-    def process_channel_image(self, channel_name: str, raw_frame: np.ndarray) -> np.ndarray:
-        real_name = self.resolve_channel_name(channel_name)
-        ch = self.channels.get(real_name)
-        if ch and ch.shading_correction_enabled and ch.ref_image_array is not None:
+    def global_sync_active_channels(self, active_channel_states: Optional[Dict[str, bool]] = None):
+        if active_channel_states:
+            for name, active_val in active_channel_states.items():
+                canonical = self.resolve_channel_name(name)
+                if canonical in self.channels:
+                    self.channels[canonical].active = active_val
+
+    def get_active_channel_names(self) -> List[str]:
+        return [ch_name for ch_name, ch_cfg in self.channels.items() if ch_cfg.active]
+
+    def get_active_channel_name(self) -> str:
+        names = self.get_active_channel_names()
+        return names[0] if names else "Brightfield"
+
+    def process_channel_image(self, channel_name: str, raw_frame: object) -> object:
+        canonical = self.resolve_channel_name(channel_name)
+        ch = self.channels.get(canonical)
+        if (ch and ch.shading_correction_enabled and ch.ref_image_array is not None):
             return image_utils.apply_shading_correction(raw_frame, ch.ref_image_array)
         return raw_frame
 
@@ -175,28 +179,46 @@ class ChannelControlWidget(BoxLayout):
     is_active = BooleanProperty(False)
     btn_bg_color = ListProperty([0.2, 0.6, 0.8, 1.0])
 
+    def open_ref_chooser(self):
+        App.get_running_app().open_file_chooser_for_channel(self.channel_name)
+
 
 class ZoomPanCameraWidget(Widget):
-    """Interactive Live Camera Viewport Widget with Mouse Zoom, Pan, and Reticle Crosshairs."""
+    zoom_level = NumericProperty(1.0)
+    pan_x = NumericProperty(0.0)
+    pan_y = NumericProperty(0.0)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.is_panning = False
+        self.last_touch_pos = (0, 0)
         self.texture = None
+        self.bind(pos=self.redraw_viewport, size=self.redraw_viewport,
+                  zoom_level=self.redraw_viewport, pan_x=self.redraw_viewport, pan_y=self.redraw_viewport)
+
+    def reset_zoom_pan(self):
         self.zoom_level = 1.0
         self.pan_x = 0.0
         self.pan_y = 0.0
-        self.bind(size=self.redraw_viewport, pos=self.redraw_viewport)
+        self.redraw_viewport()
 
-    def set_frame(self, frame_np: np.ndarray):
-        if frame_np is None:
+    def set_frame(self, frame_array: np.ndarray):
+        if frame_array is None or frame_array.size == 0:
             return
+
+        sanitized = image_utils.sanitize_camera_frame(frame_array)
+        h, w = sanitized.shape[:2]
+        frame_array = sanitized
+        if len(frame_array.shape) == 2:
+            frame_rgb = cv2.cvtColor(frame_array, cv2.COLOR_GRAY2RGB)
+        elif frame_array.shape[2] == 3:
+            frame_rgb = cv2.cvtColor(frame_array, cv2.COLOR_BGR2RGB)
+        else:
+            frame_rgb = frame_array[:, :, :3]
+
+        frame_flipped = np.ascontiguousarray(frame_rgb[::-1, :, :], dtype=np.uint8)
+
         try:
-            sanitized = image_utils.sanitize_camera_frame(frame_np)
-            h, w = sanitized.shape[:2]
-
-            # Flip vertically for OpenGL coordinate system
-            frame_flipped = np.ascontiguousarray(sanitized[::-1, :, :], dtype=np.uint8)
-
             if self.texture is None or self.texture.size != (w, h):
                 self.texture = Texture.create(size=(w, h), colorfmt='rgb')
 
@@ -207,28 +229,89 @@ class ZoomPanCameraWidget(Widget):
 
     def redraw_viewport(self, *args):
         self.canvas.clear()
-        if self.texture is None:
-            with self.canvas:
-                Color(0.1, 0.1, 0.14, 1.0)
-                Rectangle(pos=self.pos, size=self.size)
+        if self.width <= 0 or self.height <= 0:
             return
 
         with self.canvas:
-            Color(1, 1, 1, 1)
-            # Render video texture
-            Rectangle(texture=self.texture, pos=self.pos, size=self.size)
+            Color(0.05, 0.05, 0.08, 1.0)
+            Rectangle(pos=self.pos, size=self.size)
 
-            # Draw Red Reticle Center Crosshairs
+            if self.texture is not None:
+                vw = self.width * self.zoom_level
+                vh = self.height * self.zoom_level
+                vx = self.x + (self.width - vw) / 2.0 + self.pan_x
+                vy = self.y + (self.height - vh) / 2.0 + self.pan_y
+
+                Color(1.0, 1.0, 1.0, 1.0)
+                Rectangle(texture=self.texture, pos=(vx, vy), size=(vw, vh))
+
+            # Reticle Crosshairs
             cx = self.x + self.width / 2.0
             cy = self.y + self.height / 2.0
+
             Color(1.0, 0.2, 0.2, 0.85)
             Line(points=[cx - 20, cy, cx + 20, cy], width=1.5)
             Line(points=[cx, cy - 20, cx, cy + 20], width=1.5)
-            Line(circle=(cx, cy, 10), width=1.2)
+            Line(circle=(cx, cy, 8), width=1.2)
+
+    def on_touch_down(self, touch):
+        if not self.collide_point(*touch.pos):
+            return False
+
+        if touch.is_mouse_scrolling:
+            if touch.button == 'scrolldown':
+                self.zoom_level = max(0.5, self.zoom_level - 0.1)
+            elif touch.button == 'scrollup':
+                self.zoom_level = min(5.0, self.zoom_level + 0.1)
+            return True
+
+        if touch.is_double_tap and touch.button == 'left':
+            app = App.get_running_app()
+            if app and hasattr(app, 'focus_map'):
+                fov_w = app.focus_map.fov_width_mm
+                fov_h = app.focus_map.fov_height_mm
+
+                cx = self.x + self.width / 2.0 + self.pan_x
+                cy = self.y + self.height / 2.0 + self.pan_y
+
+                vw = self.width * self.zoom_level
+                vh = self.height * self.zoom_level
+
+                off_px_x = touch.x - cx
+                off_px_y = touch.y - cy
+
+                dx_mm = (off_px_x / vw) * fov_w
+                dy_mm = (off_px_y / vh) * fov_h
+
+                if hasattr(app, 'jog_stage_to'):
+                    app.jog_stage_to(app.stage_x + dx_mm, app.stage_y + dy_mm)
+            return True
+
+        if touch.button == 'right':
+            self.is_panning = True
+            self.last_touch_pos = touch.pos
+            return True
+
+        return super().on_touch_down(touch)
+
+    def on_touch_move(self, touch):
+        if hasattr(self, 'is_panning') and self.is_panning:
+            dx = touch.x - self.last_touch_pos[0]
+            dy = touch.y - self.last_touch_pos[1]
+            self.pan_x += dx
+            self.pan_y += dy
+            self.last_touch_pos = touch.pos
+            return True
+        return super().on_touch_move(touch)
+
+    def on_touch_up(self, touch):
+        if touch.button == 'right':
+            self.is_panning = False
+            return True
+        return super().on_touch_up(touch)
 
 
 class LumaViewProMainLayout(BoxLayout):
-    """Main Application Root Window Layout."""
     status_msg = StringProperty("LumaViewPro Engine Ready")
     stage_coord_str = StringProperty("Stage: X=-49.50, Y=31.50, Z=0.000 mm")
     calibrated_status = StringProperty("Plate Uncalibrated")
@@ -237,15 +320,12 @@ class LumaViewProMainLayout(BoxLayout):
 
 
 class LumaViewProApp(App):
-    """Main Application Controller."""
-
-    # Class-level Kivy Property Declarations
-    is_light_on = BooleanProperty(False)  # Sensor starts dark on launch
+    is_light_on = BooleanProperty(False)
     active_channel = StringProperty("Brightfield")
     camera_gain = NumericProperty(1.0)
     gain = NumericProperty(1.0)
-    camera_exposure_ms = NumericProperty(20.0)
-    exposure_ms = NumericProperty(20.0)
+    camera_exposure_ms = NumericProperty(100.0)
+    exposure_ms = NumericProperty(100.0)
     led_power = NumericProperty(100.0)
     jog_step_mm = NumericProperty(1.0)
 
@@ -265,7 +345,6 @@ class LumaViewProApp(App):
     well_plate_format = ObjectProperty(None)
     channel_manager = ObjectProperty(None)
 
-    # HARD SOFTWARE MOTOR BOUNDS
     X_MIN_MM = -63.88
     X_MAX_MM = 63.88
     Y_MIN_MM = -42.74
@@ -274,7 +353,6 @@ class LumaViewProApp(App):
     Z_MAX_MM = 10.0
 
     def load_kv(self, filename=None):
-        """Single-instance KV load guard to prevent duplicate UI parsing."""
         if not hasattr(self, '_kv_loaded_flag'):
             self._kv_loaded_flag = True
             kv_path = os.path.join(script_dir, 'lumaviewpro.kv')
@@ -285,7 +363,6 @@ class LumaViewProApp(App):
     def build(self):
         self.title = "LumaViewPro Microscope Automation"
 
-        # MAXIMIZE WINDOW TO FULL DESKTOP SIZE
         try:
             Window.maximize()
         except Exception:
@@ -294,8 +371,6 @@ class LumaViewProApp(App):
         self.camera = None
         self.motor_stage = None
         self.leds = None
-
-        # Execute Hardware Handshake with Basler Camera, Motor Board, and LED Board
         self.init_hardware()
 
         self.channel_manager = ChannelManager()
@@ -309,143 +384,98 @@ class LumaViewProApp(App):
         self.stage_z = 0.0
 
         self._updating_channel_ui = False
+        self.navigator_popup = None
+
         self.root_layout = LumaViewProMainLayout()
 
-        # Connect references to embedded plate canvas in right column
-        if hasattr(self.root_layout, 'ids') and 'main_plate_canvas' in self.root_layout.ids:
-            self.root_layout.ids.main_plate_canvas.set_references(
+        if hasattr(self.root_layout, 'ids') and 'scaled_canvas_tab1' in self.root_layout.ids:
+            self.root_layout.ids.scaled_canvas_tab1.set_references(
                 self.well_plate_format, self.plate_calibration, self.focus_map, self.fov_manager
             )
 
         self.build_channel_controls()
 
-        # Bind Keyboard Event Listener
         Window.bind(on_key_down=self._on_keyboard_down)
-
-        # Schedule live camera feed loop at 20 FPS
         Clock.schedule_interval(self.update_live_feed, 1.0 / 20.0)
 
-        # Report startup hardware connection status on footer bar
-        if self.camera_connected:
-            self.root_layout.status_msg = "✓ Basler USB Camera CONNECTED | LumaViewPro System Ready"
-        else:
-            self.root_layout.status_msg = "X COULD NOT CONNECT TO MICROSCOPE HARDWARE - Check USB & Power Connections"
+        if not self.camera_connected and not self.stage_connected and not self.is_simulator:
+            self.root_layout.status_msg = "LumaViewPro Offline (Disconnected: Camera, Stage/Focus Motor, LED Board)"
 
         return self.root_layout
-
-    def log_hw(self, msg: str):
-        """Logs diagnostic messages to stdout and hardware_debug.log."""
-        try:
-            formatted = f"[HW_LOG {Clock.get_time():.3f}s] {msg}"
-            print(formatted)
-            log_path = os.path.join(script_dir, "hardware_debug.log")
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(formatted + "\n")
-        except Exception:
-            pass
-
-    def init_hardware(self):
-        """Connects to real Etaluma hardware drivers (USB Camera, Motor Board, LED Board)."""
-        self.camera_connected = False
-        self.stage_connected = False
-        self.focus_connected = False
-        self.led_connected = False
-
-        self.log_hw("=== Starting LumaViewPro Hardware Handshake ===")
-
-        # 1. BASLER USB CAMERA (pyloncamera)
-        try:
-            import pyloncamera
-            self.log_hw("Imported pyloncamera. Instantiating PylonCamera()...")
-            cam = pyloncamera.PylonCamera()
-            if hasattr(cam, 'connect'):
-                res = cam.connect()
-                self.log_hw(f"cam.connect() returned: {repr(res)}")
-                if res is not False and getattr(cam, 'is_connected', True) is not False:
-                    self.camera = cam
-                    self.camera_connected = True
-                    self.log_hw("✓ Basler USB Camera CONNECTED successfully.")
-                else:
-                    self.camera = None
-                    self.log_hw("X pyloncamera.connect() returned False.")
-        except Exception as e:
-            self.camera = None
-            self.camera_connected = False
-            self.log_hw(f"X Basler USB Camera Driver error/unattached: {e}")
-
-        # 2. MOTOR BOARD (motorboard)
-        try:
-            import motorboard
-            self.log_hw("Imported motorboard. Instantiating MotorBoard()...")
-            stg = motorboard.MotorBoard()
-            if hasattr(stg, 'connect'):
-                res = stg.connect()
-                self.log_hw(f"stg.connect() returned: {repr(res)}")
-                if res is not False and getattr(stg, 'is_connected', True) is not False:
-                    self.motor_stage = stg
-                    self.stage_connected = True
-                    self.focus_connected = True
-                    self.log_hw("✓ Stage & Focus Motor Board CONNECTED successfully.")
-                else:
-                    self.motor_stage = None
-                    self.stage_connected = False
-                    self.focus_connected = False
-                    self.log_hw("X motorboard.connect() returned False.")
-        except Exception as e:
-            self.motor_stage = None
-            self.stage_connected = False
-            self.focus_connected = False
-            self.log_hw(f"X Motor Board Driver error/unattached: {e}")
-
-        # 3. LED BOARD (ledboard)
-        try:
-            import ledboard
-            self.log_hw("Imported ledboard. Instantiating LEDBoard()...")
-            leds = ledboard.LEDBoard()
-            if hasattr(leds, 'connect'):
-                res = leds.connect()
-                self.log_hw(f"leds.connect() returned: {repr(res)}")
-                if res is not False and getattr(leds, 'is_connected', True) is not False:
-                    self.leds = leds
-                    self.led_connected = True
-                    self.log_hw("✓ LED Illumination Board CONNECTED successfully.")
-                else:
-                    self.leds = None
-                    self.led_connected = False
-                    self.log_hw("X ledboard.connect() returned False.")
-        except Exception as e:
-            self.leds = None
-            self.led_connected = False
-            self.log_hw(f"X LED Board Driver error/unattached: {e}")
-
-        hw_summary = f"Hardware Status -> Camera: {self.camera_connected}, Stage: {self.stage_connected}, LED: {self.led_connected}"
-        self.log_hw(hw_summary)
 
     def _on_keyboard_down(self, window, key, scancode, codepoint, modifiers):
         is_shift = 'shift' in modifiers
         xy_step = 5.0 if is_shift else 0.5
         z_step_um = 10.0 if is_shift else 1.0
 
-        if key == 273:    # Up Arrow (+Y)
+        if key == 273:
             self.jog_stage(0.0, xy_step, 0.0)
             return True
-        elif key == 274:  # Down Arrow (-Y)
+        elif key == 274:
             self.jog_stage(0.0, -xy_step, 0.0)
             return True
-        elif key == 276:  # Left Arrow (-X)
+        elif key == 276:
             self.jog_stage(-xy_step, 0.0, 0.0)
             return True
-        elif key == 275:  # Right Arrow (+X)
+        elif key == 275:
             self.jog_stage(xy_step, 0.0, 0.0)
             return True
-        elif key == 280:  # PageUp (+Z)
+        elif key == 280:
             self.jog_z_stage(z_step_um)
             return True
-        elif key == 281:  # PageDown (-Z)
+        elif key == 281:
             self.jog_z_stage(-z_step_um)
             return True
 
         return False
+
+    def init_hardware(self):
+        try:
+            import pyloncamera
+            cam = pyloncamera.PylonCamera()
+            res = cam.connect()
+            if res is not False:
+                self.camera = cam
+                self.camera_connected = True
+                print("[LumaViewPro] Connected to USB camera hardware.")
+            else:
+                self.camera_connected = False
+        except Exception as e:
+            self.camera = None
+            self.camera_connected = False
+
+        try:
+            import motorboard
+            stg = motorboard.MotorBoard()
+            res = stg.connect()
+            if res is not False:
+                self.motor_stage = stg
+                self.stage_connected = True
+                self.focus_connected = True
+                print("[LumaViewPro] Multi-axis Stage & Z Focus Motor Board connected.")
+            else:
+                self.motor_stage = None
+                self.stage_connected = False
+                self.focus_connected = False
+        except Exception as e:
+            self.motor_stage = None
+            self.stage_connected = False
+            self.focus_connected = False
+
+        try:
+            import ledboard
+            leds = ledboard.LEDBoard()
+            res = leds.connect()
+            if res is not False:
+                self.leds = leds
+                self.led_connected = True
+                print("[LumaViewPro] LED Illumination Board connected.")
+            else:
+                self.leds = None
+                self.led_connected = False
+        except Exception as e:
+            self.leds = None
+            self.led_connected = False
 
     def clamp_stage_position(self, x: Optional[float] = None, y: Optional[float] = None, z: Optional[float] = None) -> Tuple[float, float, float]:
         fov_w = getattr(self.focus_map, 'fov_width_mm', 0.60)
@@ -590,6 +620,11 @@ class LumaViewProApp(App):
 
     def set_jog_step(self, step_str: str):
         self.set_jog_step_size(step_str)
+
+    def zero_stage(self):
+        a1_x = -self.well_plate_format.PLATE_LENGTH_MM / 2.0 + self.well_plate_format.a1_offset_x
+        a1_y = self.well_plate_format.PLATE_WIDTH_MM / 2.0 - self.well_plate_format.a1_offset_y
+        self.jog_stage_to(a1_x, a1_y, 0.0)
 
     def start_calibration_wizard(self):
         self.plate_calibration.is_calibrating = True
@@ -750,17 +785,16 @@ class LumaViewProApp(App):
 
         self.redraw_plate_canvas()
 
-    def zero_stage(self):
-        a1_x = -self.well_plate_format.PLATE_LENGTH_MM / 2.0 + self.well_plate_format.a1_offset_x
-        a1_y = self.well_plate_format.PLATE_WIDTH_MM / 2.0 - self.well_plate_format.a1_offset_y
-        self.jog_stage_to(a1_x, a1_y, 0.0)
-
     def set_objective_preset(self, preset_name: str):
         self.focus_map.set_objective_preset(preset_name)
         if hasattr(self, 'fov_manager'):
             self.fov_manager._rebuild_all_groups()
 
-        self.clamp_stage_position()
+        cx, cy, cz = self.clamp_stage_position(self.stage_x, self.stage_y, self.stage_z)
+        self.stage_x = cx
+        self.stage_y = cy
+        self.stage_z = cz
+
         self.root_layout.status_msg = f"Objective Preset set to {preset_name} (FOV: {self.focus_map.fov_width_mm:.2f} x {self.focus_map.fov_height_mm:.2f} mm)"
         self.redraw_plate_canvas()
 
@@ -773,9 +807,9 @@ class LumaViewProApp(App):
             self.well_plate_format = labware.WellPlateFormat(num_wells=num)
             self.plate_calibration = labware.NavigatorPlateCalibration(self.well_plate_format)
             self.fov_manager = labware.PlateFOVManager(self.well_plate_format, self.plate_calibration, self.focus_map)
-
-            if hasattr(self.root_layout, 'ids') and 'main_plate_canvas' in self.root_layout.ids:
-                self.root_layout.ids.main_plate_canvas.set_references(
+            
+            if hasattr(self.root_layout, 'ids') and 'scaled_canvas_tab1' in self.root_layout.ids:
+                self.root_layout.ids.scaled_canvas_tab1.set_references(
                     self.well_plate_format, self.plate_calibration, self.focus_map, self.fov_manager
                 )
 
@@ -788,6 +822,12 @@ class LumaViewProApp(App):
 
             self.root_layout.status_msg = f"Well Plate Map updated to {num}-Well Format"
 
+    def change_well_plate_format(self, format_str: str):
+        self.set_well_plate_format(format_str)
+
+    def select_well_plate_format(self, format_str: str):
+        self.set_well_plate_format(format_str)
+
     def set_jog_step_size(self, step_str: str):
         try:
             val = float(re.findall(r'[\d\.]+', step_str)[0])
@@ -796,49 +836,35 @@ class LumaViewProApp(App):
         except Exception:
             pass
 
+    def redraw_plate_canvas(self):
+        if hasattr(self.root_layout, 'ids') and 'scaled_canvas_tab1' in self.root_layout.ids:
+            self.root_layout.ids.scaled_canvas_tab1.redraw_canvas()
+
     def update_live_feed(self, dt):
-        if not hasattr(self, 'root_layout') or self.root_layout is None:
-            return
-
-        fov_w = getattr(self.focus_map, 'fov_width_mm', 0.60)
-        fov_h = getattr(self.focus_map, 'fov_height_mm', 0.45)
-
-        raw_frame = None
+        fov_w = self.focus_map.fov_width_mm
+        fov_h = self.focus_map.fov_height_mm
 
         if self.camera_connected and self.camera is not None:
-            try:
-                if hasattr(self.camera, 'stage_x'):
-                    self.camera.stage_x = self.stage_x
-                    self.camera.stage_y = self.stage_y
-                    self.camera.stage_z = self.stage_z
-                    self.camera.active_channel = self.active_channel
-                    self.camera.is_light_on = self.is_light_on
-                    self.camera.exposure_ms = self.exposure_ms
-                    self.camera.gain = self.gain
-                    self.camera.led_power = self.led_power
-                    self.camera.fov_size_mm = (fov_w, fov_h)
-                    self.camera.num_wells = self.well_plate_format.num_wells
+            if hasattr(self.camera, 'stage_x'):
+                self.camera.stage_x = self.stage_x
+                self.camera.stage_y = self.stage_y
+                self.camera.stage_z = self.stage_z
+                self.camera.active_channel = self.active_channel
+                self.camera.is_light_on = self.is_light_on
+                self.camera.exposure_ms = self.exposure_ms
+                self.camera.gain = self.gain
+                self.camera.led_power = self.led_power
+                self.camera.fov_size_mm = (fov_w, fov_h)
+                self.camera.num_wells = self.well_plate_format.num_wells
 
-                raw_frame = self.camera.get_frame()
-            except Exception as e:
-                self.log_hw(f"Camera get_frame exception: {e}")
-                raw_frame = None
-
-            if raw_frame is None:
-                if not self.is_light_on:
-                    # Dark sensor state when light is OFF
-                    raw_frame = image_utils.generate_well_plate_cell_frame(
-                        stage_x=self.stage_x, stage_y=self.stage_y, stage_z=self.stage_z,
-                        best_z=2.5, channel=self.active_channel, is_light_on=False,
-                        led_power=self.led_power, exposure_ms=self.exposure_ms, gain=self.gain
-                    )
-                else:
-                    # Could not capture real frame from connected camera
-                    raw_frame = image_utils.generate_disconnected_camera_frame(
-                        msg="COULD NOT CONNECT TO CAMERA SENSOR"
-                    )
+            raw_frame = self.camera.get_frame()
+            if raw_frame is None or not self.is_light_on:
+                raw_frame = image_utils.generate_well_plate_cell_frame(
+                    stage_x=self.stage_x, stage_y=self.stage_y, stage_z=self.stage_z,
+                    best_z=2.5, channel=self.active_channel, is_light_on=False,
+                    led_power=self.led_power, exposure_ms=self.exposure_ms, gain=self.gain
+                )
         elif self.is_simulator:
-            # Simulator mode (luma_sim.py) renders cell colonies
             raw_frame = image_utils.generate_well_plate_cell_frame(
                 stage_x=self.stage_x, stage_y=self.stage_y, stage_z=self.stage_z,
                 best_z=2.5, channel=self.active_channel, is_light_on=self.is_light_on,
@@ -846,16 +872,11 @@ class LumaViewProApp(App):
                 fov_size_mm=(fov_w, fov_h), num_wells=self.well_plate_format.num_wells
             )
         else:
-            # Application on unattached PC shows COULD NOT CONNECT banner
-            raw_frame = image_utils.generate_disconnected_camera_frame(
-                msg="COULD NOT CONNECT TO MICROSCOPE HARDWARE"
-            )
+            raw_frame = image_utils.generate_disconnected_camera_frame()
 
-        try:
+        if raw_frame is not None:
             proc_frame = self.channel_manager.process_channel_image(self.active_channel, raw_frame)
             self.render_frame_to_viewports(proc_frame)
-        except Exception as e:
-            self.log_hw(f"Process channel image exception: {e}")
 
     def render_frame_to_viewports(self, frame: np.ndarray):
         if frame is None or self.root_layout is None:
@@ -871,12 +892,7 @@ class LumaViewProApp(App):
             val = float(exp_str)
             self.exposure_ms = val
             self.camera_exposure_ms = val
-            if self.camera and hasattr(self.camera, 'set_exposure'):
-                try:
-                    self.camera.set_exposure(val)
-                except Exception:
-                    pass
-            self.root_layout.status_msg = f"Exposure set to {val:.1f} ms"
+            self.root_layout.status_msg = f"Exposure Time set to {val:.1f} ms"
         except ValueError:
             pass
 
@@ -885,27 +901,77 @@ class LumaViewProApp(App):
             val = float(gain_str)
             self.gain = val
             self.camera_gain = val
-            if self.camera and hasattr(self.camera, 'set_gain'):
-                try:
-                    self.camera.set_gain(val)
-                except Exception:
-                    pass
             self.root_layout.status_msg = f"Gain set to {val:.1f}x"
         except ValueError:
             pass
 
+    def set_primary_af_channel(self, channel_name: str):
+        self.focus_map.set_primary_af_channel(channel_name)
+        self.root_layout.status_msg = f"Primary AF Channel set to: {channel_name}"
 
-# Register custom widget classes with Factory BEFORE loading KV files
+    def set_af_binning(self, binning_str: str):
+        self.focus_map.set_af_camera_config(binning_str, self.focus_map.af_exposure_ms)
+        self.root_layout.status_msg = f"AF Camera Binning: {binning_str}"
+
+    def set_master_auto_point(self):
+        sim_frame = image_utils.generate_well_plate_cell_frame(
+            stage_x=self.stage_x, stage_y=self.stage_y, stage_z=self.stage_z,
+            best_z=2.5, channel=self.focus_map.primary_af_channel, is_light_on=True
+        )
+        af_score = image_utils.compute_focus_score(sim_frame, method="laplacian")
+        del sim_frame
+        self.focus_map.set_master_auto_point(self.stage_x, self.stage_y, self.stage_z)
+        self.root_layout.status_msg = f"Master Auto Point set (Red). Primary: {self.focus_map.primary_af_channel}, Score: {af_score:.1f}"
+        self.redraw_plate_canvas()
+
+    def test_autofocus_run(self):
+        af_frame = image_utils.generate_well_plate_cell_frame(
+            stage_x=self.stage_x, stage_y=self.stage_y, stage_z=self.stage_z,
+            best_z=self.stage_z, channel=self.focus_map.primary_af_channel, is_light_on=True
+        )
+        score = image_utils.compute_focus_score(af_frame, method="laplacian")
+        del af_frame
+        self.root_layout.status_msg = f"[Test AF Run] Score: {score:.2f} (Frame Discarded)"
+
+    def generate_and_apply_protocol(self) -> dict:
+        protocol = labware.ExperimentProtocol.generate_protocol(
+            self.well_plate_format, self.plate_calibration, self.focus_map, self.fov_manager
+        )
+        print("[Protocol Generated]\n", json.dumps(protocol, indent=2))
+        self.root_layout.status_msg = f"Hardware Protocol Saved! Selected Wells: {protocol['selected_wells_count']}"
+        return protocol
+
+    def capture_snapshot(self):
+        active_ch = self.channel_manager.get_active_channel_name()
+        frame = image_utils.generate_well_plate_cell_frame(
+            stage_x=self.stage_x, stage_y=self.stage_y, stage_z=self.stage_z,
+            best_z=2.5, channel=active_ch, is_light_on=self.is_light_on, led_power=self.led_power,
+            num_wells=self.well_plate_format.num_wells, fov_size_mm=(self.focus_map.fov_width_mm, self.focus_map.fov_height_mm)
+        )
+        os.makedirs("snapshots", exist_ok=True)
+        filename = os.path.join("snapshots", f"snapshot_{active_ch}_{self.stage_x:.1f}_{self.stage_y:.1f}.png")
+        image_utils.save_image(filename, frame)
+        self.root_layout.status_msg = f"Snapshot saved to {filename}"
+
+    def open_navigator_popup(self):
+        plate_navigator.attach_navigator_to_lumaviewpro(self)
+
+    def open_plate_navigator(self):
+        self.open_navigator_popup()
+
+
+# Safe Factory registration
 if 'ZoomPanCameraWidget' not in Factory.classes:
-    Factory.register('ZoomPanCameraWidget', ZoomPanCameraWidget)
+    Factory.register('ZoomPanCameraWidget', cls=ZoomPanCameraWidget)
 if 'ChannelControlWidget' not in Factory.classes:
-    Factory.register('ChannelControlWidget', ChannelControlWidget)
+    Factory.register('ChannelControlWidget', cls=ChannelControlWidget)
 if 'LumaViewProMainLayout' not in Factory.classes:
-    Factory.register('LumaViewProMainLayout', LumaViewProMainLayout)
+    Factory.register('LumaViewProMainLayout', cls=LumaViewProMainLayout)
+
 if 'InteractiveScaledPlateCanvas' not in Factory.classes:
-    Factory.register('InteractiveScaledPlateCanvas', plate_navigator.InteractiveScaledPlateCanvas)
+    Factory.register('InteractiveScaledPlateCanvas', cls=plate_navigator.InteractiveScaledPlateCanvas)
 if 'PlateNavigatorPopup' not in Factory.classes:
-    Factory.register('PlateNavigatorPopup', plate_navigator.PlateNavigatorPopup)
+    Factory.register('PlateNavigatorPopup', cls=plate_navigator.PlateNavigatorPopup)
 
 _main_kv = os.path.join(script_dir, 'lumaviewpro.kv')
 if os.path.exists(_main_kv) and _main_kv not in Builder.files:
