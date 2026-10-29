@@ -1,18 +1,18 @@
+from __future__ import annotations
 """
 lumaviewpro.py - Main Application Controller for LumaViewPro Microscope Automation.
 
 Unified Single-Window UI Architecture:
-- Embedded Live Camera Viewport (Top-Left) with interactive Zoom and Pan.
-- Hardware Motion Stage & Illumination Controls (Bottom-Left).
+- Embedded Live Camera Viewport (Top-Left) with interactive Zoom, Pan, and Double-Click Pixel Centering.
+- Hardware Motion Stage & Illumination Controls (Bottom-Left) with Grouped XY Jog Cross and Z Focus Column.
 - Interactive Microplate Map Display (Top-Right) with double-click well navigation and format selection (6, 12, 24, 48, 96, 384 wells).
-- Registration & Optical Channel Controls (Bottom-Right).
+- 6-Point Target Registration Wizard, Focus Map & Single-Channel Mutual Exclusion Panel (Bottom-Right).
 """
 
-from __future__ import annotations
+
 import os
 import sys
 
-# Force local repository directory to be #1 in Python's module search path
 script_dir = os.path.dirname(os.path.abspath(__file__))
 if script_dir in sys.path:
     sys.path.remove(script_dir)
@@ -30,32 +30,7 @@ import image_utils
 import labware
 import plate_navigator
 
-import etaluma_init
-etaluma_init.run_etaluma_stock_initialization()
-
 # Kivy framework imports
-
-
-def install_crash_handler():
-    def _global_excepthook(exctype, value, tb):
-        import traceback
-        err_msg = "".join(traceback.format_exception(exctype, value, tb))
-        print("[LUMAVIEWPRO CRASH INTERCEPTED] " + str(err_msg))
-        try:
-            log_path = os.path.join(script_dir, "lumaviewpro_crash.log")
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write("CRASH: " + str(err_msg) + "\n\n")
-# deleted
-# deleted
-        except Exception:
-            pass
-    sys.excepthook = _global_excepthook
-    import threading
-    if hasattr(threading, "excepthook"):
-        threading.excepthook = lambda args: _global_excepthook(args.exc_type, args.exc_value, args.exc_traceback)
-install_crash_handler()
-
-
 import kivy
 kivy.require('2.0.0')
 
@@ -183,139 +158,10 @@ class ChannelControlWidget(BoxLayout):
         App.get_running_app().open_file_chooser_for_channel(self.channel_name)
 
 
-class ZoomPanCameraWidget(Widget):
-    """
-    Interactive Live Camera Viewport Widget with:
-    - Reticle Crosshairs at Center
-    - Double-click Pixel Centering Motion
-    - Mouse Wheel Zooming & Right-Click Panning
-    """
-    zoom_level = NumericProperty(1.0)
-    pan_x = NumericProperty(0.0)
-    pan_y = NumericProperty(0.0)
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.is_panning = False
-        self.last_touch_pos = (0, 0)
-        self.texture = None
-        self.bind(pos=self.redraw_viewport, size=self.redraw_viewport, zoom_level=self.redraw_viewport, pan_x=self.redraw_viewport, pan_y=self.redraw_viewport)
-
-    def set_frame(self, frame_array: np.ndarray):
-        if frame_array is None or frame_array.size == 0:
-            return
-        try:
-            h, w = frame_array.shape[:2]
-            if len(frame_array.shape) == 2:
-                rgb_buf = cv2.cvtColor(frame_array, cv2.COLOR_GRAY2RGB)
-            elif frame_array.shape[2] == 3:
-                rgb_buf = cv2.cvtColor(frame_array, cv2.COLOR_BGR2RGB)
-            else:
-                return
-
-            texture = Texture.create(size=(w, h), colorfmt='rgb')
-            texture.blit_buffer(rgb_buf.tobytes(), colorfmt='rgb', bufferfmt='ubyte')
-            texture.flip_vertical()
-
-            self.current_texture = texture
-            self.redraw_viewport()
-        except Exception as e:
-            print(f"[ZoomPanCameraWidget Error] set_frame: {e}")
-
-    def redraw_viewport(self, *args):
-        self.canvas.clear()
-        if self.width <= 0 or self.height <= 0:
-            return
-
-        with self.canvas:
-            Color(0.05, 0.05, 0.08, 1.0)
-            Rectangle(pos=self.pos, size=self.size)
-
-            if self.current_texture is not None:
-                vw = self.width * self.zoom_level
-                vh = self.height * self.zoom_level
-                vx = self.x + (self.width - vw) / 2.0 + self.pan_x
-                vy = self.y + (self.height - vh) / 2.0 + self.pan_y
-
-                Color(1.0, 1.0, 1.0, 1.0)
-                Rectangle(texture=self.current_texture, pos=(vx, vy), size=(vw, vh))
-            else:
-                Color(0.2, 0.2, 0.25, 1.0)
-                Rectangle(pos=self.pos, size=self.size)
-
-            # Draw Center Reticle Crosshairs Overlay
-            cx = self.x + self.width / 2.0
-            cy = self.y + self.height / 2.0
-            Color(1.0, 0.2, 0.2, 0.8) # Bright Red Crosshairs
-            Line(points=[cx - 20, cy, cx + 20, cy], width=1.5)
-            Line(points=[cx, cy - 20, cx, cy + 20], width=1.5)
-            Line(circle=(cx, cy, 8), width=1.2)
-
-    def reset_zoom_pan(self):
-        self.zoom_level = 1.0
-        self.pan_x = 0.0
-        self.pan_y = 0.0
-        self.redraw_viewport()
-
-    def on_touch_down(self, touch):
-        if not self.collide_point(*touch.pos):
-            return False
-
-        # Double-click pixel centering in live viewport
-        if touch.is_double_tap and touch.button == 'left':
-            center_x = self.x + self.width / 2.0
-            center_y = self.y + self.height / 2.0
-            dx_px = touch.x - center_x
-            dy_px = touch.y - center_y
-
-            app = App.get_running_app()
-            if app and hasattr(app, 'focus_map'):
-                fov_w = getattr(app.focus_map, 'fov_width_mm', 0.6)
-                fov_h = getattr(app.focus_map, 'fov_height_mm', 0.45)
-                scale_x = fov_w / float(self.width)
-                scale_y = fov_h / float(self.height)
-
-                dx_mm = dx_px * scale_x
-                dy_mm = dy_px * scale_y
-
-                if hasattr(app, 'jog_stage'):
-                    app.jog_stage(dx_mm, dy_mm, 0.0)
-                return True
-
-        if touch.is_mouse_scrolling:
-            if touch.button == 'scrolldown':
-                self.zoom_level = max(0.5, self.zoom_level - 0.1)
-            elif touch.button == 'scrollup':
-                self.zoom_level = min(5.0, self.zoom_level + 0.1)
-            return True
-
-        if touch.button == 'right':
-            self.is_panning = True
-            self.last_touch_pos = touch.pos
-            return True
-
-        return super().on_touch_down(touch)
-
-    def on_touch_move(self, touch):
-        if hasattr(self, 'is_panning') and self.is_panning:
-            dx = touch.x - self.last_touch_pos[0]
-            dy = touch.y - self.last_touch_pos[1]
-            self.pan_x += dx
-            self.pan_y += dy
-            self.last_touch_pos = touch.pos
-            return True
-        return super().on_touch_move(touch)
-
-    def on_touch_up(self, touch):
-        if touch.button == 'right':
-            self.is_panning = False
-            return True
-        return super().on_touch_up(touch)
-
-
 class LumaViewProMainLayout(BoxLayout):
     """Main Application Root Window Layout."""
     status_msg = StringProperty("LumaViewPro Microscope Automation Engine Ready")
+    calibration_wizard_text = StringProperty("Click 'Start Calib' to reveal 6 target marks and align plate.")
     stage_coord_str = StringProperty("Stage: X=-49.50, Y=31.50, Z=0.000 mm")
     calibrated_status = StringProperty("Plate Uncalibrated")
     current_well_display = StringProperty("A1")
@@ -331,13 +177,13 @@ class LumaViewProMainLayout(BoxLayout):
 
 
 class LumaViewProApp(App):
-    # Class-level Kivy properties so KV bindings evaluate safely
+    """Main Application Controller."""
     fov_manager = ObjectProperty(None)
     focus_map = ObjectProperty(None)
     plate_calibration = ObjectProperty(None)
     well_plate_format = ObjectProperty(None)
     channel_manager = ObjectProperty(None)
-    """Main Application Controller."""
+
 
     # Explicit class properties bound to KV layout and callbacks
     is_live_imaging = BooleanProperty(True)
@@ -356,23 +202,6 @@ class LumaViewProApp(App):
     def load_kv(self, filename=None):
         return None
 
-    
-    def set_camera_exposure(self, val):
-        self.set_exposure_ms(val)
-
-    def set_camera_gain(self, val):
-        self.set_gain_val(val)
-
-    def toggle_light_master(self, is_down):
-        self.toggle_light_state(is_down)
-
-    def zero_stage(self):
-        if hasattr(self, 'home_a1'):
-            self.home_a1()
-
-    def set_jog_step(self, val):
-        self.set_jog_step_size(val)
-
     def build(self):
         self.title = "LumaViewPro Microscope Automation"
         self.channel_manager = ChannelManager()
@@ -387,6 +216,8 @@ class LumaViewProApp(App):
 
         self._updating_channel_ui = False
         self.camera = None
+        self.motor_stage = None
+        self.leds = None
         self.init_hardware()
 
         self.root_layout = LumaViewProMainLayout()
@@ -403,66 +234,135 @@ class LumaViewProApp(App):
         self.build_channel_controls()
         self.update_active_well_display()
 
-        if not getattr(self, 'stage_connected', False):
-            self.root_layout.stage_coord_str = "Stage: DISCONNECTED"
-
         # Start live camera feed update loop at 20 FPS (0.05s interval)
         Clock.schedule_interval(self.update_live_feed, 0.05)
         return self.root_layout
 
+    
+    def log_hw(self, msg: str):
+        """Logs diagnostic messages to stdout and hardware_debug.log."""
+        try:
+            timestamp = Clock.get_time()
+            formatted = f"[HW_LOG {timestamp:.3f}s] {msg}"
+            print(formatted)
+            log_path = os.path.join(script_dir, "hardware_debug.log")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(formatted + "\n")
+        except Exception:
+            pass
+
     def init_hardware(self):
+        """Initializes connection & handshakes with Basler Camera, Stage Motor Board, and LED Illumination Board."""
         self.camera_connected = False
         self.stage_connected = False
         self.focus_connected = False
         self.led_connected = False
 
+        self.log_hw("=== Starting LumaViewPro Hardware Initialisation & Handshake ===")
+
+        # 1. BASLER USB CAMERA (pyloncamera)
         try:
             import pyloncamera
+            self.log_hw("Found pyloncamera module. Instantiating PylonCamera()...")
             cam = pyloncamera.PylonCamera()
-            if cam.connect():
+            self.log_hw(f"PylonCamera instance created: {cam}")
+
+            if hasattr(cam, 'connect'):
+                self.log_hw("Calling cam.connect()...")
+                res = cam.connect()
+                self.log_hw(f"cam.connect() returned: {repr(res)}")
+
+            # Check if camera is connected (None, True, or is_connected=True)
+            if getattr(cam, 'is_connected', True) is not False:
                 self.camera = cam
                 self.camera_connected = True
+                self.log_hw("✓ PylonCamera CONNECTED successfully.")
             else:
                 self.camera = None
-        except Exception:
+                self.camera_connected = False
+                self.log_hw("X PylonCamera report: is_connected is False.")
+        except Exception as e:
             self.camera = None
+            self.camera_connected = False
+            self.log_hw(f"X USB Camera Driver offline/unattached: {e}")
 
+        # 2. MULTI-AXIS STAGE & Z FOCUS MOTOR BOARD (motorboard)
         try:
             import motorboard
+            self.log_hw("Found motorboard module. Instantiating MotorBoard()...")
             stg = motorboard.MotorBoard()
-            if stg.connect():
+            self.log_hw(f"MotorBoard instance created: {stg}")
+
+            if hasattr(stg, 'connect'):
+                self.log_hw("Calling stg.connect()...")
+                res = stg.connect()
+                self.log_hw(f"stg.connect() returned: {repr(res)}")
+
+            if getattr(stg, 'is_connected', True) is not False:
                 self.motor_stage = stg
                 self.stage_connected = True
                 self.focus_connected = True
+                self.log_hw("✓ MotorBoard (XY Stage & Z Focus Motors) CONNECTED successfully.")
             else:
                 self.motor_stage = None
-        except Exception:
+                self.stage_connected = False
+                self.focus_connected = False
+                self.log_hw("X MotorBoard report: is_connected is False.")
+        except Exception as e:
             self.motor_stage = None
+            self.stage_connected = False
+            self.focus_connected = False
+            self.log_hw(f"X Stage Motor Driver offline/unattached: {e}")
 
+        # 3. LED ILLUMINATION BOARD (ledboard)
         try:
             import ledboard
-            led = ledboard.LEDBoard()
-            self.leds = led
-            self.led_connected = True
-        except Exception:
-            self.leds = None
+            self.log_hw("Found ledboard module. Instantiating LEDBoard()...")
+            leds = ledboard.LEDBoard()
+            self.log_hw(f"LEDBoard instance created: {leds}")
 
-    def clamp_stage_position(self, x: float, y: float, z: float = 0.0) -> Tuple[float, float, float]:
-        """Hard software guardrail: FOV edges never exceed physical well plate boundary."""
+            if hasattr(leds, 'connect'):
+                self.log_hw("Calling leds.connect()...")
+                res = leds.connect()
+                self.log_hw(f"leds.connect() returned: {repr(res)}")
+
+            if getattr(leds, 'is_connected', True) is not False:
+                self.leds = leds
+                self.led_connected = True
+                self.log_hw("✓ LEDBoard CONNECTED successfully.")
+            else:
+                self.leds = None
+                self.led_connected = False
+                self.log_hw("X LEDBoard report: is_connected is False.")
+        except Exception as e:
+            self.leds = None
+            self.led_connected = False
+            self.log_hw(f"X LED Board Driver offline/unattached: {e}")
+
+        summary = f"Hardware State -> Camera: {self.camera_connected}, Stage/Focus: {self.stage_connected}, LED: {self.led_connected}"
+        self.log_hw(summary)
+
+
+    def clamp_stage_position(self, x: float, y: float, z: Optional[float] = None) -> Tuple[float, float, float]:
+        """Physical Guardrails: Clamps stage position so the active FOV never extends beyond the physical plate."""
         fov_w = getattr(self.focus_map, 'fov_width_mm', 0.60)
         fov_h = getattr(self.focus_map, 'fov_height_mm', 0.45)
 
-        plate_w = getattr(self.well_plate_format, 'PLATE_LENGTH_MM', 127.76)
-        plate_h = getattr(self.well_plate_format, 'PLATE_WIDTH_MM', 85.48)
+        plate_w_mm = getattr(self.well_plate_format, 'PLATE_LENGTH_MM', 127.76)
+        plate_h_mm = getattr(self.well_plate_format, 'PLATE_WIDTH_MM', 85.48)
 
-        min_x = -plate_w / 2.0 + fov_w / 2.0
-        max_x =  plate_w / 2.0 - fov_w / 2.0
-        min_y = -plate_h / 2.0 + fov_h / 2.0
-        max_y =  plate_h / 2.0 - fov_h / 2.0
+        max_x = (plate_w_mm / 2.0) - (fov_w / 2.0)
+        min_x = -max_x
+        max_y = (plate_h_mm / 2.0) - (fov_h / 2.0)
+        min_y = -max_y
 
         clamped_x = max(min_x, min(max_x, float(x)))
         clamped_y = max(min_y, min(max_y, float(y)))
-        clamped_z = max(0.0, min(10.0, float(z)))
+
+        if z is not None:
+            clamped_z = max(0.0, min(10.0, float(z)))
+        else:
+            clamped_z = self.stage_z
 
         return clamped_x, clamped_y, clamped_z
 
@@ -516,12 +416,16 @@ class LumaViewProApp(App):
             self.is_light_on = False
             self.root_layout.is_light_on = False
             self.channel_manager.set_channel_active(real_ch, False)
+            if self.leds:
+                self.leds.off()
             self.root_layout.status_msg = f"Turned OFF Channel {real_ch}"
         else:
             self.active_channel = real_ch
             self.is_light_on = True
             self.root_layout.is_light_on = True
             self.channel_manager.set_channel_active(real_ch, True)
+            if self.leds:
+                self.leds.set_led(real_ch, int(self.led_power))
             self.root_layout.status_msg = f"Selected Channel: {real_ch} | Light: ON"
 
         self.build_channel_controls()
@@ -535,9 +439,21 @@ class LumaViewProApp(App):
             self.is_light_on = is_on
         else:
             self.is_light_on = not self.is_light_on
+
         self.root_layout.is_light_on = self.is_light_on
-        status = "ON" if self.is_light_on else "OFF (Dark)"
-        self.root_layout.status_msg = f"Illumination Light toggled {status}"
+        if self.is_light_on:
+            self.channel_manager.set_channel_active(self.active_channel, True)
+            if self.leds:
+                self.leds.set_led(self.active_channel, int(self.led_power))
+            status = f"ON ({self.active_channel})"
+        else:
+            for ch in self.channel_manager.channels.values():
+                ch.active = False
+            if self.leds:
+                self.leds.off()
+            status = "OFF (Dark)"
+
+        self.root_layout.status_msg = f"Illumination Light: {status}"
         self.build_channel_controls()
         self.update_live_feed(0)
 
@@ -572,15 +488,11 @@ class LumaViewProApp(App):
         except Exception as e:
             self.root_layout.status_msg = f"Failed to set plate format: {e}"
 
-    def change_well_plate_format(self, format_str: str):
-        self.set_well_plate_format(format_str)
-
     def set_objective_preset(self, preset_name: str):
         self.focus_map.set_objective_preset(preset_name)
         if hasattr(self, 'fov_manager'):
             self.fov_manager._rebuild_all_groups()
 
-        # Re-clamp stage position with new objective FOV guardrail!
         cx, cy, cz = self.clamp_stage_position(self.stage_x, self.stage_y, self.stage_z)
         self.stage_x, self.stage_y, self.stage_z = cx, cy, cz
 
@@ -589,15 +501,6 @@ class LumaViewProApp(App):
         self.update_live_feed(0)
 
     def jog_stage(self, dx: float, dy: float, dz: float = 0.0):
-        if not getattr(self, 'stage_connected', False) and (dx != 0.0 or dy != 0.0):
-            if hasattr(self, 'root_layout') and self.root_layout:
-                self.root_layout.status_msg = "Stage Motor DISCONNECTED - Motion Disabled"
-            return
-        if not getattr(self, 'focus_connected', False) and dz != 0.0:
-            if hasattr(self, 'root_layout') and self.root_layout:
-                self.root_layout.status_msg = "Z Focus Motor DISCONNECTED - Focus Motion Disabled"
-            return
-
         step = self.jog_step_mm
         tx = self.stage_x + dx * step
         ty = self.stage_y + dy * step
@@ -606,11 +509,8 @@ class LumaViewProApp(App):
         cx, cy, cz = self.clamp_stage_position(tx, ty, tz)
         self.stage_x, self.stage_y, self.stage_z = cx, cy, cz
 
-        if hasattr(self, 'motor_stage') and self.motor_stage and hasattr(self.motor_stage, 'move_rel'):
-            try:
-                self.motor_stage.move_rel(dx * step, dy * step, dz)
-            except Exception as e:
-                print(f"[Hardware Error] move_rel failed: {e}")
+        if self.motor_stage:
+            self.motor_stage.move_abs(self.stage_x, self.stage_y, self.stage_z)
 
         self.update_active_well_display()
         self.root_layout.stage_coord_str = f"Stage: X={self.stage_x:.2f}, Y={self.stage_y:.2f}, Z={self.stage_z:.3f} mm"
@@ -618,25 +518,31 @@ class LumaViewProApp(App):
         self.update_live_feed(0)
 
     def jog_stage_to(self, x_mm: float, y_mm: float, z_mm: Optional[float] = None):
-        if not getattr(self, 'stage_connected', False):
-            if hasattr(self, 'root_layout') and self.root_layout:
-                self.root_layout.status_msg = "Stage Motor DISCONNECTED - Motion Disabled"
-            return
-
         tz = z_mm if z_mm is not None else self.stage_z
         cx, cy, cz = self.clamp_stage_position(x_mm, y_mm, tz)
         self.stage_x, self.stage_y, self.stage_z = cx, cy, cz
 
-        if hasattr(self, 'motor_stage') and self.motor_stage and hasattr(self.motor_stage, 'move_abs'):
-            try:
-                self.motor_stage.move_abs(self.stage_x, self.stage_y, self.stage_z)
-            except Exception as e:
-                print(f"[Hardware Error] move_abs failed: {e}")
+        if self.motor_stage:
+            self.motor_stage.move_abs(self.stage_x, self.stage_y, self.stage_z)
 
         self.update_active_well_display()
         self.root_layout.stage_coord_str = f"Stage: X={self.stage_x:.2f}, Y={self.stage_y:.2f}, Z={self.stage_z:.3f} mm"
         self.redraw_plate_canvas()
         self.update_live_feed(0)
+
+    def move_stage_abs(self, x_mm: float, y_mm: float, z_mm: Optional[float] = None):
+        self.jog_stage_to(x_mm, y_mm, z_mm)
+
+    def move_to_a1(self):
+        a1_x = -self.well_plate_format.PLATE_LENGTH_MM / 2.0 + self.well_plate_format.a1_offset_x
+        a1_y = self.well_plate_format.PLATE_WIDTH_MM / 2.0 - self.well_plate_format.a1_offset_y
+        self.jog_stage_to(a1_x, a1_y)
+
+    def home_a1(self):
+        self.move_to_a1()
+
+    def zero_stage(self):
+        self.move_to_a1()
 
     def jog_z_focus(self, delta_um: float):
         self.jog_stage(0.0, 0.0, delta_um / 1000.0)
@@ -653,6 +559,124 @@ class LumaViewProApp(App):
             self.jog_step_mm = val
         except (IndexError, ValueError):
             self.jog_step_mm = 1.0
+
+    # CALIBRATION WIZARD WORKFLOW CONTROLLER
+    def start_calibration_wizard(self):
+        """
+        1. Turns illumination Light ON (is_light_on = True).
+        2. Shows 6 calibration target points on microplate canvas map.
+        3. Drives stage to Step 1 nominal position (A1_12: Well A1 12 o'clock top rim).
+        4. Updates instruction banner.
+        """
+        self.plate_calibration.is_calibrating = True
+        self.plate_calibration.is_calibrated = False
+        self.plate_calibration.current_step_index = 0
+        self.plate_calibration.recorded_points.clear()
+
+        # Automatically turn illumination Light ON
+        self.is_light_on = True
+        self.root_layout.is_light_on = True
+        if self.leds:
+            self.leds.set_led(self.active_channel, int(self.led_power))
+
+        # Drive stage to Step 1 nominal target position
+        tx, ty = self.plate_calibration.get_step_nominal_stage_coords(0)
+        self.jog_stage_to(tx, ty)
+
+        step_info = self.plate_calibration.get_current_step_info()
+        self.root_layout.calibration_wizard_text = f"Step 1/6: Align reticle to {step_info['desc']}, then click Mark"
+        self.root_layout.status_msg = "Calibration Wizard Started. Light ON. Driven to Step 1 (A1 12 o'clock top rim)."
+        self.redraw_plate_canvas()
+
+    def mark_calibration_step(self):
+        """
+        Records current stage position (self.stage_x, self.stage_y) for active step,
+        then automatically advances to the next step and drives stage there.
+        """
+        if not self.plate_calibration.is_calibrating:
+            self.start_calibration_wizard()
+            return
+
+        cur_idx = self.plate_calibration.current_step_index
+        msg = self.plate_calibration.record_current_step_point(self.stage_x, self.stage_y)
+
+        if self.plate_calibration.current_step_index < len(self.plate_calibration.CALIBRATION_STEPS):
+            next_idx = self.plate_calibration.current_step_index
+            tx, ty = self.plate_calibration.get_step_nominal_stage_coords(next_idx)
+            self.jog_stage_to(tx, ty)
+
+            next_info = self.plate_calibration.get_current_step_info()
+            self.root_layout.calibration_wizard_text = f"Step {next_idx + 1}/6: Align reticle to {next_info['desc']}, then click Mark"
+            self.root_layout.status_msg = f"Marked Step {cur_idx + 1}. Stage moved to Step {next_idx + 1}."
+        else:
+            # All 6 points recorded! Compute matrix
+            success = self.plate_calibration.compute_calibration()
+            if success:
+                self.root_layout.calibrated_status = f"Calibrated ({self.plate_calibration.rotation_angle_deg:.2f}°)"
+                self.root_layout.calibration_wizard_text = f"Calibration Complete! Rotation: {self.plate_calibration.rotation_angle_deg:.2f}°"
+                self.root_layout.status_msg = "All 6 points marked! Plate Calibration Matrix computed & applied."
+            else:
+                self.root_layout.calibration_wizard_text = "Calibration failed. Verify target alignments."
+                self.root_layout.status_msg = "Calibration computation failed."
+
+        self.redraw_plate_canvas()
+
+    def next_calibration_step(self):
+        """Advances to the next step position without marking."""
+        if not self.plate_calibration.is_calibrating:
+            self.start_calibration_wizard()
+            return
+
+        if self.plate_calibration.current_step_index < len(self.plate_calibration.CALIBRATION_STEPS) - 1:
+            self.plate_calibration.current_step_index += 1
+            next_idx = self.plate_calibration.current_step_index
+            tx, ty = self.plate_calibration.get_step_nominal_stage_coords(next_idx)
+            self.jog_stage_to(tx, ty)
+
+            next_info = self.plate_calibration.get_current_step_info()
+            self.root_layout.calibration_wizard_text = f"Step {next_idx + 1}/6: Align reticle to {next_info['desc']}, then click Mark"
+            self.root_layout.status_msg = f"Moved to Step {next_idx + 1}."
+            self.redraw_plate_canvas()
+
+    def previous_calibration_step(self):
+        """Moves back to the previous step position without marking."""
+        if not self.plate_calibration.is_calibrating:
+            return
+
+        if self.plate_calibration.current_step_index > 0:
+            self.plate_calibration.current_step_index -= 1
+            prev_idx = self.plate_calibration.current_step_index
+            tx, ty = self.plate_calibration.get_step_nominal_stage_coords(prev_idx)
+            self.jog_stage_to(tx, ty)
+
+            prev_info = self.plate_calibration.get_current_step_info()
+            self.root_layout.calibration_wizard_text = f"Step {prev_idx + 1}/6: Align reticle to {prev_info['desc']}, then click Mark"
+            self.root_layout.status_msg = f"Moved back to Step {prev_idx + 1}."
+            self.redraw_plate_canvas()
+
+    def record_calibration_step(self):
+        self.mark_calibration_step()
+
+    def finish_plate_calibration(self):
+        """Computes calibration matrix and applies it (Done button)."""
+        success = self.plate_calibration.compute_calibration()
+        if success:
+            self.root_layout.calibrated_status = f"Calibrated ({self.plate_calibration.rotation_angle_deg:.2f}°)"
+            self.root_layout.calibration_wizard_text = f"Calibration Complete! Rotation: {self.plate_calibration.rotation_angle_deg:.2f}°"
+            self.root_layout.status_msg = "Plate Calibration Matrix successfully computed & applied!"
+        else:
+            self.root_layout.calibration_wizard_text = "Calibration complete using nominal plate parameters."
+            self.root_layout.calibrated_status = "Calibrated (Nominal)"
+            self.root_layout.status_msg = "Calibration completed."
+        self.redraw_plate_canvas()
+
+    def reset_calibration(self):
+        """Resets calibration state and hides target marks."""
+        self.plate_calibration.reset_calibration()
+        self.root_layout.calibrated_status = "Plate Uncalibrated"
+        self.root_layout.calibration_wizard_text = "Click 'Start Calib' to begin 6-point target alignment."
+        self.root_layout.status_msg = "Calibration Reset."
+        self.redraw_plate_canvas()
 
     def update_live_feed(self, dt: float):
         if not hasattr(self, 'root_layout') or self.root_layout is None:
@@ -727,6 +751,8 @@ class LumaViewProApp(App):
             val = float(power_str)
             self.led_power = max(0.0, min(100.0, val))
             self.root_layout.led_power_str = f"{self.led_power:.0f}"
+            if self.leds and self.is_light_on:
+                self.leds.set_led(self.active_channel, int(self.led_power))
             self.update_live_feed(0)
         except ValueError:
             pass
@@ -738,61 +764,6 @@ class LumaViewProApp(App):
     def set_af_binning(self, binning_str: str):
         self.focus_map.set_af_camera_config(binning_str, self.focus_map.af_exposure_ms)
         self.root_layout.status_msg = f"AF Camera Binning: {binning_str}"
-
-    def set_af_exposure(self, exposure_str: str):
-        self.set_exposure_ms(exposure_str)
-
-    def set_af_cycle_interval(self, text_or_num):
-        try:
-            digits = re.findall(r'\d+', str(text_or_num))
-            val = int(digits[0]) if digits else 1
-            self.focus_map.set_af_cycle_interval(val)
-            self.root_layout.status_msg = f"Autofocus configured every {val} cycle(s)"
-        except Exception:
-            pass
-
-    def set_time_lapse_config(self, enabled: bool, interval_mins_str: str, cycles_str: str):
-        try:
-            inv_m = float(interval_mins_str) if interval_mins_str else 10.0
-            cyc = int(cycles_str) if cycles_str else 24
-            self.focus_map.set_time_lapse_config(enabled, inv_m, cyc)
-        except ValueError:
-            pass
-
-    def set_chromatic_z_offset(self, channel_name: str):
-        self.focus_map.set_chromatic_z_offset(channel_name, self.stage_z)
-        delta_z = self.focus_map.channel_chromatic_offsets_mm.get(channel_name, 0.0)
-        self.root_layout.status_msg = f"Saved Chromatic Z-Offset for {channel_name}: {delta_z*1000.0:.2f} um"
-
-    def apply_nyquist_calculation(self):
-        dof_um, nyquist_step_um = self.focus_map.calculate_optical_nyquist()
-        self.focus_map.apply_nyquist_to_af_config()
-        self.root_layout.status_msg = f"Applied Nyquist Z-Step: {nyquist_step_um:.3f} um (DoF: {dof_um:.3f} um)"
-
-    def apply_grid_settings(self, rows_str: str, cols_str: str, single_af: bool = True):
-        try:
-            r = int(rows_str)
-            c = int(cols_str)
-            self.fov_manager.set_grid_dimensions(r, c, single_af=single_af)
-            self.root_layout.status_msg = f"Tile Grid set to {r}x{c}"
-            if hasattr(self.root_layout, 'ids') and 'main_plate_canvas' in self.root_layout.ids:
-                self.root_layout.ids.main_plate_canvas.redraw_canvas()
-        except ValueError:
-            pass
-
-    def record_calibration_step(self):
-        msg = self.plate_calibration.record_current_step_point(self.stage_x, self.stage_y)
-        self.root_layout.status_msg = msg
-        self.redraw_plate_canvas()
-
-    def finish_plate_calibration(self):
-        success = self.plate_calibration.compute_calibration()
-        if success:
-            self.root_layout.calibrated_status = f"Calibrated ({self.plate_calibration.rotation_angle_deg:.2f}°)"
-            self.root_layout.status_msg = "Plate Registration Matrix successfully computed!"
-        else:
-            self.root_layout.status_msg = "Calibration failed. Verify edge target points."
-        self.redraw_plate_canvas()
 
     def set_master_auto_point(self):
         sim_frame = image_utils.generate_well_plate_cell_frame(
@@ -841,94 +812,6 @@ class LumaViewProApp(App):
         self.open_navigator_popup()
 
 
-
-    def global_sync_active_channels(self, active_channel_states: Optional[Dict[str, bool]] = None):
-        self.channel_manager.global_sync_active_channels(active_channel_states)
-        active_list = self.channel_manager.get_active_channel_names()
-        self.fov_manager.apply_channels_to_all_selected(active_list)
-        if hasattr(self.root_layout, 'status_msg'):
-            self.root_layout.status_msg = f"Synced active channels ({', '.join(active_list)}) across selected wells"
-
-    def start_calibration_wizard(self):
-        self.plate_calibration.reset_calibration()
-        self.plate_calibration.is_calibrating = True
-        self.is_light_on = True
-        self.root_layout.is_light_on = True
-
-        tx, ty = self.plate_calibration.get_step_nominal_stage_coords(0)
-        self.jog_stage_to(tx, ty)
-
-        step_info = self.plate_calibration.get_current_step_info()
-        self.root_layout.calibration_wizard_text = f"Step 1/6: Align reticle to {step_info['desc']}, then click Mark"
-        self.root_layout.status_msg = "Calibration Wizard Started. Light ON. Stage moved to A1 12 o'clock."
-        self.redraw_plate_canvas()
-
-    def mark_calibration_step(self):
-        if not getattr(self.plate_calibration, 'is_calibrating', False):
-            self.start_calibration_wizard()
-            return
-
-        step_idx = self.plate_calibration.current_step_index
-        msg = self.plate_calibration.record_current_step_point(self.stage_x, self.stage_y)
-
-        if self.plate_calibration.current_step_index < len(self.plate_calibration.CALIBRATION_STEPS):
-            next_idx = self.plate_calibration.current_step_index
-            tx, ty = self.plate_calibration.get_step_nominal_stage_coords(next_idx)
-            self.jog_stage_to(tx, ty)
-
-            step_info = self.plate_calibration.get_current_step_info()
-            self.root_layout.calibration_wizard_text = f"Step {next_idx + 1}/6: Align reticle to {step_info['desc']}, then click Mark"
-            self.root_layout.status_msg = f"Point {step_idx + 1} recorded. Moving to Step {next_idx + 1}..."
-        else:
-            success = self.plate_calibration.compute_calibration()
-            if success:
-                self.root_layout.calibrated_status = f"Calibrated ({self.plate_calibration.rotation_angle_deg:.2f}°)"
-                self.root_layout.calibration_wizard_text = f"Calibration Complete! Rotation: {self.plate_calibration.rotation_angle_deg:.2f}°"
-                self.root_layout.status_msg = "Plate Registration Matrix successfully computed and applied!"
-            else:
-                self.root_layout.calibration_wizard_text = "Calibration failed. Verify edge target points."
-                self.root_layout.status_msg = "Calibration computation failed. Verify edge target alignments."
-
-        self.redraw_plate_canvas()
-
-    def next_calibration_step(self):
-        if not getattr(self.plate_calibration, 'is_calibrating', False):
-            self.start_calibration_wizard()
-            return
-
-        if self.plate_calibration.current_step_index < len(self.plate_calibration.CALIBRATION_STEPS) - 1:
-            self.plate_calibration.current_step_index += 1
-            next_idx = self.plate_calibration.current_step_index
-            tx, ty = self.plate_calibration.get_step_nominal_stage_coords(next_idx)
-            self.jog_stage_to(tx, ty)
-
-            step_info = self.plate_calibration.get_current_step_info()
-            self.root_layout.calibration_wizard_text = f"Step {next_idx + 1}/6: Align reticle to {step_info['desc']}, then click Mark"
-            self.root_layout.status_msg = f"Moved to Step {next_idx + 1}/6."
-            self.redraw_plate_canvas()
-
-    def previous_calibration_step(self):
-        if not getattr(self.plate_calibration, 'is_calibrating', False):
-            return
-
-        if self.plate_calibration.current_step_index > 0:
-            self.plate_calibration.current_step_index -= 1
-            prev_idx = self.plate_calibration.current_step_index
-            tx, ty = self.plate_calibration.get_step_nominal_stage_coords(prev_idx)
-            self.jog_stage_to(tx, ty)
-
-            step_info = self.plate_calibration.get_current_step_info()
-            self.root_layout.calibration_wizard_text = f"Step {prev_idx + 1}/6: Align reticle to {step_info['desc']}, then click Mark"
-            self.root_layout.status_msg = f"Moved back to Step {prev_idx + 1}/6."
-            self.redraw_plate_canvas()
-
-    def reset_calibration(self):
-        self.plate_calibration.reset_calibration()
-        self.root_layout.calibrated_status = "Plate Uncalibrated"
-        self.root_layout.calibration_wizard_text = "Click 'Start Calib' to begin 6-point plate alignment."
-        self.root_layout.status_msg = "Calibration Reset."
-        self.redraw_plate_canvas()
-
 # Register custom widget classes with Factory BEFORE loading KV files
 from kivy.factory import Factory
 
@@ -946,93 +829,6 @@ if 'PlateNavigatorPopup' not in Factory.classes:
 _main_kv = os.path.join(script_dir, 'lumaviewpro.kv')
 if os.path.exists(_main_kv) and _main_kv not in Builder.files:
     Builder.load_file(_main_kv)
-
-
-
-    def start_calibration_wizard(self):
-        self.plate_calibration.reset_calibration()
-        self.plate_calibration.is_calibrating = True
-        self.is_light_on = True
-        self.root_layout.is_light_on = True
-
-        tx, ty = self.plate_calibration.get_step_nominal_stage_coords(0)
-        self.jog_stage_to(tx, ty)
-
-        step_info = self.plate_calibration.get_current_step_info()
-        self.root_layout.calibration_wizard_text = f"Step 1/6: Align reticle to {step_info['desc']}, then click Mark"
-        self.root_layout.status_msg = "Calibration Wizard Started. Light ON. Stage moved to A1 12 o'clock."
-        self.redraw_plate_canvas()
-
-    def mark_calibration_step(self):
-        if not getattr(self.plate_calibration, 'is_calibrating', False):
-            self.start_calibration_wizard()
-            return
-
-        step_idx = self.plate_calibration.current_step_index
-        msg = self.plate_calibration.record_current_step_point(self.stage_x, self.stage_y)
-
-        if self.plate_calibration.current_step_index < len(self.plate_calibration.CALIBRATION_STEPS):
-            next_idx = self.plate_calibration.current_step_index
-            tx, ty = self.plate_calibration.get_step_nominal_stage_coords(next_idx)
-            self.jog_stage_to(tx, ty)
-
-            step_info = self.plate_calibration.get_current_step_info()
-            self.root_layout.calibration_wizard_text = f"Step {next_idx + 1}/6: Align reticle to {step_info['desc']}, then click Mark"
-            self.root_layout.status_msg = f"Point {step_idx + 1} recorded. Moving to Step {next_idx + 1}..."
-        else:
-            success = self.plate_calibration.compute_calibration()
-            if success:
-                self.root_layout.calibrated_status = f"Calibrated ({self.plate_calibration.rotation_angle_deg:.2f}°)"
-                self.root_layout.calibration_wizard_text = f"Calibration Complete! Rotation: {self.plate_calibration.rotation_angle_deg:.2f}°"
-                self.root_layout.status_msg = "Plate Registration Matrix successfully computed and applied!"
-            else:
-                self.root_layout.calibration_wizard_text = "Calibration failed. Verify edge target points."
-                self.root_layout.status_msg = "Calibration computation failed. Verify edge target alignments."
-
-        self.redraw_plate_canvas()
-
-    def next_calibration_step(self):
-        if not getattr(self.plate_calibration, 'is_calibrating', False):
-            self.start_calibration_wizard()
-            return
-
-        if self.plate_calibration.current_step_index < len(self.plate_calibration.CALIBRATION_STEPS) - 1:
-            self.plate_calibration.current_step_index += 1
-            next_idx = self.plate_calibration.current_step_index
-            tx, ty = self.plate_calibration.get_step_nominal_stage_coords(next_idx)
-            self.jog_stage_to(tx, ty)
-
-            step_info = self.plate_calibration.get_current_step_info()
-            self.root_layout.calibration_wizard_text = f"Step {next_idx + 1}/6: Align reticle to {step_info['desc']}, then click Mark"
-            self.root_layout.status_msg = f"Moved to Step {next_idx + 1}/6."
-            self.redraw_plate_canvas()
-
-    def previous_calibration_step(self):
-        if not getattr(self.plate_calibration, 'is_calibrating', False):
-            return
-
-        if self.plate_calibration.current_step_index > 0:
-            self.plate_calibration.current_step_index -= 1
-            prev_idx = self.plate_calibration.current_step_index
-            tx, ty = self.plate_calibration.get_step_nominal_stage_coords(prev_idx)
-            self.jog_stage_to(tx, ty)
-
-            step_info = self.plate_calibration.get_current_step_info()
-            self.root_layout.calibration_wizard_text = f"Step {prev_idx + 1}/6: Align reticle to {step_info['desc']}, then click Mark"
-            self.root_layout.status_msg = f"Moved back to Step {prev_idx + 1}/6."
-            self.redraw_plate_canvas()
-
-    def reset_calibration(self):
-        self.plate_calibration.reset_calibration()
-        self.root_layout.calibrated_status = "Plate Uncalibrated"
-        self.root_layout.calibration_wizard_text = "Click 'Start Calib' to begin 6-point plate alignment."
-        self.root_layout.status_msg = "Calibration Reset."
-        self.redraw_plate_canvas()
-
-    def global_sync_active_channels(self):
-        active_list = self.channel_manager.get_active_channel_names()
-        self.fov_manager.apply_channels_to_all_selected(active_list)
-        self.root_layout.status_msg = f"Synced active channels ({', '.join(active_list)}) across selected wells"
 
 
 if __name__ == '__main__':

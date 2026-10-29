@@ -1,9 +1,9 @@
 """
-luma_sim.py - Offline Hardware Simulator for LumaViewPro 4.0.0-beta.
+luma_sim.py - Offline Hardware Simulator for LumaViewPro 4.0.0-beta
 
-Mocks camera acquisition (pyloncamera), stage motion (motorboard), and illumination (ledboard)
+Mocks camera acquisition (pyloncamera) and stage motion (motorboard / ledboard)
 with real-time synthetic cell colony generation across multi-well microplates.
-Enables offline desktop development and full visual testing without physical microscope hardware.
+Enables offline desktop development and testing without physical microscope hardware.
 """
 
 import sys
@@ -27,9 +27,12 @@ class MockCamera:
         self.stage_x = -49.5
         self.stage_y = 31.5
         self.stage_z = 0.0
+        self.best_z = 0.0
         self.active_channel = "Brightfield"
-        self.is_light_on = False
+        self.is_light_on = False  # DARK LAUNCH STATE
         self.led_power = 100.0
+        self.num_wells = 96
+        self.fov_size_mm = (0.60, 0.45)
 
     def connect(self) -> bool:
         return True
@@ -37,53 +40,50 @@ class MockCamera:
     def disconnect(self):
         pass
 
+    def get_frame(self):
+        from kivy.app import App
+        app = App.get_running_app()
+        if app:
+            stg_x = getattr(app, 'stage_x', self.stage_x)
+            stg_y = getattr(app, 'stage_y', self.stage_y)
+            stg_z = getattr(app, 'stage_z', self.stage_z)
+            ch = getattr(app, 'active_channel', self.active_channel)
+            light_on = getattr(app, 'is_light_on', self.is_light_on)
+            exp = getattr(app, 'exposure_ms', self.exposure_ms)
+            gn = getattr(app, 'gain', self.gain)
+            led_pwr = getattr(app, 'led_power', self.led_power)
+
+            fov_w = app.focus_map.fov_width_mm if hasattr(app, 'focus_map') else 0.60
+            fov_h = app.focus_map.fov_height_mm if hasattr(app, 'focus_map') else 0.45
+            wells = app.well_plate_format.num_wells if hasattr(app, 'well_plate_format') else 96
+        else:
+            stg_x, stg_y, stg_z = self.stage_x, self.stage_y, self.stage_z
+            ch = self.active_channel
+            light_on = self.is_light_on
+            exp, gn, led_pwr = self.exposure_ms, self.gain, self.led_power
+            fov_w, fov_h = self.fov_size_mm
+            wells = self.num_wells
+
+        return image_utils.generate_well_plate_cell_frame(
+            stage_x=stg_x,
+            stage_y=stg_y,
+            stage_z=stg_z,
+            best_z=0.0,
+            channel=ch,
+            exposure_ms=exp,
+            gain=gn,
+            led_power=led_pwr,
+            is_light_on=light_on,
+            fov_size_mm=(fov_w, fov_h),
+            num_wells=wells,
+            sensor_size=(512, 512)
+        )
+
     def set_exposure(self, exp: float):
         self.exposure_ms = float(exp)
 
     def set_gain(self, g: float):
         self.gain = float(g)
-
-    def get_frame(self):
-        try:
-            from kivy.app import App
-            app = App.get_running_app()
-            if app:
-                stg_x = getattr(app, 'stage_x', -49.5)
-                stg_y = getattr(app, 'stage_y', 31.5)
-                stg_z = getattr(app, 'stage_z', 0.0)
-                ch = getattr(app, 'active_channel', 'Brightfield')
-                light_on = getattr(app, 'is_light_on', False)
-                exp = getattr(app, 'exposure_ms', 20.0)
-                gain = getattr(app, 'gain', 1.0)
-                power = getattr(app, 'led_power', 100.0)
-                fov_w = app.focus_map.fov_width_mm if hasattr(app, 'focus_map') else 0.60
-                fov_h = app.focus_map.fov_height_mm if hasattr(app, 'focus_map') else 0.45
-                num_wells = app.well_plate_format.num_wells if hasattr(app, 'well_plate_format') else 96
-            else:
-                stg_x, stg_y, stg_z = self.stage_x, self.stage_y, self.stage_z
-                ch = self.active_channel
-                light_on = getattr(self, 'is_light_on', False)
-                exp, gain, power = self.exposure_ms, self.gain, 100.0
-                fov_w, fov_h = 0.60, 0.45
-                num_wells = 96
-
-            return image_utils.generate_well_plate_cell_frame(
-                stage_x=stg_x,
-                stage_y=stg_y,
-                stage_z=stg_z,
-                best_z=0.0,
-                channel=ch,
-                is_light_on=light_on,
-                exposure_ms=exp,
-                gain=gain,
-                led_power=power,
-                fov_size_mm=(fov_w, fov_h),
-                num_wells=num_wells,
-                sensor_size=(512, 512)
-            )
-        except Exception as e:
-            print(f"[MockCamera get_frame error] {e}")
-            return None
 
 
 mock_pylon = types.ModuleType("pyloncamera")
@@ -93,7 +93,6 @@ sys.modules["pyloncamera"] = mock_pylon
 
 class MockStage:
     def __init__(self):
-        self.is_connected = True
         self.x = -49.5
         self.y = 31.5
         self.z = 0.0
@@ -120,7 +119,6 @@ sys.modules["motorboard"] = mock_motor
 
 class MockLEDBoard:
     def __init__(self):
-        self.is_connected = True
         self.active_channel = "Brightfield"
         self.power = 100
 
