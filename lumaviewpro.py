@@ -1,3 +1,4 @@
+import etaluma_init
 from __future__ import annotations
 """
 lumaviewpro.py - Main Application Controller for LumaViewPro Microscope Automation Software.
@@ -315,6 +316,8 @@ class LumaViewProMainLayout(BoxLayout):
     stage_coord_str = StringProperty("Stage: X=-49.50, Y=31.50, Z=0.000 mm")
     calibrated_status = StringProperty("Plate Uncalibrated")
     current_well_display = StringProperty("A1")
+    is_light_on = BooleanProperty(False)
+    calibration_wizard_text = StringProperty("Click 'Start Calib' to begin 6-point plate alignment.")
 
 
 class LumaViewProApp(App):

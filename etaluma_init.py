@@ -65,3 +65,6 @@ def run_etaluma_stock_initialization():
 
 if __name__ == "__main__":
     run_etaluma_stock_initialization()
+
+# Execute stock environment initialization on import
+run_etaluma_stock_initialization()
