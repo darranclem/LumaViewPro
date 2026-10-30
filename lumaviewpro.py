@@ -63,32 +63,31 @@ from kivy.properties import (
 
 
 class ChannelConfig:
-    """Stores configuration and optical specs for an imaging channel."""
+    """Stores configuration and optical specifications for an imaging channel."""
     
     def __init__(
         self,
         name: str,
-        excitation_range_nm: str = "",
-        emission_range_nm: str = "",
+        excitation_info: str = "White LED",
+        emission_info: str = "Pass-through",
         color_hex: str = "#FFFFFF",
         is_transmitted: bool = True,
         btn_color: List[float] = None
     ):
         self.name: str = name
-        self.excitation_range_nm: str = excitation_range_nm
-        self.emission_range_nm: str = emission_range_nm
+        self.excitation_info: str = excitation_info
+        self.emission_info: str = emission_info
         self.color_hex: str = color_hex
         self.is_transmitted: bool = is_transmitted
-        self.btn_color: List[float] = btn_color if btn_color else [0.2, 0.6, 0.8, 1.0]
+        self.btn_color: List[float] = btn_color if btn_color else [0.5, 0.5, 0.5, 1.0]
         self.active: bool = False
-        self.exposure_ms: float = 100.0
+        self.exposure_ms: float = 20.0
         self.gain: float = 1.0
         self.ref_image_path: Optional[str] = None
         self.ref_image_array: Optional[object] = None
         self.shading_correction_enabled: bool = True
 
     def load_ref_image(self, filepath: str) -> bool:
-        """Loads and assigns a shading correction reference image for this channel."""
         try:
             img = image_utils.load_image(filepath)
             if img is not None:
@@ -99,9 +98,8 @@ class ChannelConfig:
             print(f"[Error] Failed to load reference image for {self.name}: {e}")
         return False
 
-
 class ChannelManager:
-    """Manages optical channels with strict single-channel mutual exclusion."""
+    """Manages 6 optical imaging channels with strict single-channel mutual exclusion."""
     
     ALIASES = {
         "BF": "Brightfield",
@@ -115,44 +113,47 @@ class ChannelManager:
 
     def __init__(self):
         self.channels: Dict[str, ChannelConfig] = {
-            "Brightfield": ChannelConfig("Brightfield", "White LED", "Pass-through", "#FFFFFF", True, [0.8, 0.8, 0.8, 1.0]),
-            "Phase": ChannelConfig("Phase", "White LED (Ring)", "Pass-through", "#CCCCCC", True, [0.6, 0.6, 0.7, 1.0]),
-            "Darkfield": ChannelConfig("Darkfield", "Oblique LED", "Pass-through", "#888888", True, [0.4, 0.4, 0.5, 1.0]),
-            "Blue": ChannelConfig("Blue", "370-410 nm", "429-462 nm (DAPI)", "#0088FF", False, [0.0, 0.4, 1.0, 1.0]),
-            "Green": ChannelConfig("Green", "473-491 nm", "502-561 nm (FITC)", "#00FF00", False, [0.0, 0.8, 0.2, 1.0]),
-            "Red": ChannelConfig("Red", "580-598 nm", "612-680 nm (TxRed)", "#FF0000", False, [0.9, 0.1, 0.1, 1.0]),
+            "Brightfield": ChannelConfig("Brightfield", excitation_info="White LED", emission_info="Pass-through", color_hex="#FFFFFF", is_transmitted=True, btn_color=[0.9, 0.9, 0.9, 1.0]),
+            "Phase": ChannelConfig("Phase", excitation_info="White Ring", emission_info="Phase Shift", color_hex="#CCCCCC", is_transmitted=True, btn_color=[0.65, 0.7, 0.75, 1.0]),
+            "Darkfield": ChannelConfig("Darkfield", excitation_info="Oblique LED", emission_info="Pass-through", color_hex="#888888", is_transmitted=True, btn_color=[0.4, 0.4, 0.45, 1.0]),
+            "Blue": ChannelConfig("Blue", excitation_info="405nm (370-410)", emission_info="429-462nm (DAPI)", color_hex="#0080FF", is_transmitted=False, btn_color=[0.0, 0.45, 1.0, 1.0]),
+            "Green": ChannelConfig("Green", excitation_info="488nm (473-491)", emission_info="502-561nm (FITC)", color_hex="#00FF40", is_transmitted=False, btn_color=[0.0, 0.85, 0.25, 1.0]),
+            "Red": ChannelConfig("Red", excitation_info="594nm (580-598)", emission_info="612-680nm (TxRed)", color_hex="#FF3030", is_transmitted=False, btn_color=[0.95, 0.15, 0.15, 1.0])
         }
-        # Brightfield selected by default but illumination starts OFF
-        self.channels["Brightfield"].active = True
 
     def resolve_channel_name(self, name: str) -> str:
         return self.ALIASES.get(name, name)
 
     def set_channel_active(self, channel_name: str, active: bool):
-        """MUTUAL EXCLUSION: Turns selected channel ON and deactivates all others."""
         real_name = self.resolve_channel_name(channel_name)
-        if active:
-            for ch_key, ch_cfg in self.channels.items():
-                ch_cfg.active = (ch_key == real_name)
-        else:
-            if real_name in self.channels:
+        if real_name in self.channels:
+            if active:
+                for name, ch_cfg in self.channels.items():
+                    ch_cfg.active = (name == real_name)
+            else:
                 self.channels[real_name].active = False
 
-    def get_active_channel_name(self) -> str:
-        for ch_name, ch_cfg in self.channels.items():
-            if ch_cfg.active:
-                return ch_name
-        return "Brightfield"
+    def global_sync_active_channels(self, active_channel_states: Optional[Dict[str, bool]] = None):
+        if active_channel_states:
+            for name, active_val in active_channel_states.items():
+                real_name = self.resolve_channel_name(name)
+                if real_name in self.channels:
+                    self.channels[real_name].active = active_val
 
     def get_active_channel_names(self) -> List[str]:
         return [ch_name for ch_name, ch_cfg in self.channels.items() if ch_cfg.active]
 
+    def get_active_channel_name(self) -> str:
+        names = self.get_active_channel_names()
+        return names[0] if names else "Brightfield"
+
     def process_channel_image(self, channel_name: str, raw_frame: object) -> object:
-        canonical = self.resolve_channel_name(channel_name)
-        ch = self.channels.get(canonical)
-        if (ch and ch.shading_correction_enabled and ch.ref_image_array is not None):
+        real_name = self.resolve_channel_name(channel_name)
+        ch = self.channels.get(real_name)
+        if ch and ch.shading_correction_enabled and ch.ref_image_array is not None:
             return image_utils.apply_shading_correction(raw_frame, ch.ref_image_array)
         return raw_frame
+
 
 
 class ZoomPanCameraWidget(Widget):

@@ -328,3 +328,28 @@ def generate_imaging_error_frame(error_msg: str = "Frame Capture Failed", sensor
     err_str = str(error_msg)[:50]
     cv2.putText(frame, f"Error: {err_str}", (w // 2 - 180, h // 2 + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (100, 150, 255), 1)
     return frame
+
+
+def safe_set_led(led_board_inst, channel_name: str, power_pct: float) -> bool:
+    """Maps optical channel string names to integer IDs required by stock ledboard drivers."""
+    if led_board_inst is None:
+        return False
+
+    channel_map = {
+        "brightfield": 0, "bf": 0, "transmitted": 0, "phase": 0, "darkfield": 0,
+        "blue": 1, "dapi": 1,
+        "green": 2, "fitc": 2, "gfp": 2,
+        "red": 3, "txred": 3, "mcherry": 3, "cy5": 3
+    }
+    ch_id = channel_map.get(str(channel_name).lower(), 0)
+
+    try:
+        if hasattr(led_board_inst, 'set_led'):
+            led_board_inst.set_led(ch_id, int(power_pct))
+            return True
+        elif hasattr(led_board_inst, 'set_power'):
+            led_board_inst.set_power(ch_id, int(power_pct))
+            return True
+    except Exception as e:
+        print(f"[safe_set_led error] {e}")
+    return False
