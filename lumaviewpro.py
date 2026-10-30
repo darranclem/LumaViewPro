@@ -1,5 +1,5 @@
-import etaluma_init
 from __future__ import annotations
+import etaluma_init
 """
 lumaviewpro.py - Main Application Controller for LumaViewPro Microscope Automation Software.
 
@@ -454,6 +454,28 @@ class LumaViewProApp(App):
         Clock.schedule_interval(self.update_live_feed, 1.0 / 20.0)
 
         return self.root_layout
+
+
+    def build_channel_controls(self):
+        if getattr(self, '_updating_channel_ui', False):
+            return
+        self._updating_channel_ui = True
+
+        try:
+            if hasattr(self.root_layout, 'ids') and hasattr(self.root_layout.ids, 'main_channel_container'):
+                container = self.root_layout.ids.main_channel_container
+                container.clear_widgets()
+
+                for ch_name, ch_cfg in self.channel_manager.channels.items():
+                    widget = ChannelControlWidget()
+                    widget.channel_name = ch_name
+                    widget.channel_spec_info = f"Ex: {ch_cfg.excitation_info} | Em: {ch_cfg.emission_info}" if not ch_cfg.is_transmitted else f"{ch_cfg.excitation_info}"
+                    widget.is_active = (ch_name == self.active_channel) and self.is_light_on
+                    widget.btn_bg_color = ch_cfg.btn_color
+                    widget.ref_image_path = os.path.basename(ch_cfg.ref_image_path) if ch_cfg.ref_image_path else "No Ref"
+                    container.add_widget(widget)
+        finally:
+            self._updating_channel_ui = False
 
     def init_hardware(self):
         """Connects to real Etaluma hardware drivers if available on physical microscope PC."""

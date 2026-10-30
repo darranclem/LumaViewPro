@@ -1,24 +1,25 @@
 from __future__ import annotations
-# VERSION: 4.4.0-FINAL-INITIALIZATION
-"""
-etaluma_init.py - Environment & Hardware Initialization Bootstrapper for LumaViewPro.
-
-Replicates the exact startup verification sequence from stock Etaluma LumaViewPro:
-1. Validates Python executable and environment (Python 3.10.11).
-2. Sets JAVA_HOME (Zulu OpenJDK 8) and links Apache Maven 3.9.8.
-3. Injects stock hardware driver directories into sys.path so 'import pyloncamera',
-   'import motorboard', and 'import ledboard' succeed from any folder.
-4. Checks SciJava, PyImageJ, jgo, and imglyb dependencies.
-"""
 
 import os
 import sys
+import enum
+
+# Polyfill StrEnum for Python 3.10 compatibility
+if not hasattr(enum, "StrEnum"):
+    class StrEnum(str, enum.Enum):
+        """Polyfill for Python 3.10 compatibility where enum.StrEnum is missing."""
+        def __str__(self):
+            return str(self.value)
+        def _generate_next_value_(name, start, count, last_values):
+            return name.lower()
+    enum.StrEnum = StrEnum
 
 # Standard default paths on Windows microscope installation
 STOCK_INSTALL_DIRS = [
     r"C:\Program Files (x86)\LumaViewPro-stock",
     r"C:\Program Files (x86)\Etaluma\LumaViewPro",
     r"C:\Program Files\Etaluma\LumaViewPro",
+    r"C:\Program Files (x86)\LumaViewPro-main",
     r"C:\Users\dkc25.BLUE\AppData\Local\Programs\Python\Python310\lib\site-packages"
 ]
 
@@ -63,8 +64,5 @@ def run_etaluma_stock_initialization():
     print("=== Initialization Complete. Launching LumaViewPro App... ===")
 
 
-if __name__ == "__main__":
-    run_etaluma_stock_initialization()
-
-# Execute stock environment initialization on import
+# Run on module import so sys.path and StrEnum polyfill are ready immediately
 run_etaluma_stock_initialization()
