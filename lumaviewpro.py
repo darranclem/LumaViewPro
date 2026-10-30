@@ -275,7 +275,8 @@ class LumaViewProApp(App):
         try:
             import pyloncamera
             cam = pyloncamera.PylonCamera()
-            if hasattr(cam, 'connect') and cam.connect():
+            res = cam.connect() if hasattr(cam, 'connect') else None
+            if res is not False:
                 self.camera = cam
                 self.camera_connected = True
                 print("[LumaViewPro] Connected to physical Basler USB Camera.")
@@ -286,7 +287,8 @@ class LumaViewProApp(App):
         try:
             import motorboard
             stg = motorboard.MotorBoard()
-            if hasattr(stg, 'connect') and stg.connect():
+            res = stg.connect() if hasattr(stg, 'connect') else None
+            if res is not False:
                 self.motor_stage = stg
                 self.stage_connected = True
                 print("[LumaViewPro] Connected to physical Stage Motor Board.")

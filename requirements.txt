@@ -1,14 +1,13 @@
+# LumaViewPro Python 3.10 Dependencies
 kivy==2.3.0
 kivy-deps.angle==0.4.0
 kivy-deps.glew==0.3.2
 kivy-deps.sdl2==0.7.0
-opencv-python>=4.5.0
-numpy>=1.21.0
-Pillow>=9.0.0
-pypylon>=1.8.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+pypylon>=2.1.0
 pyserial>=3.5
-pywin32>=300
-jgo>=1.0.0
-scyjava>=1.8.0
-imglyb>=2.1.0
-pyimagej>=1.4.0
+pywin32>=306
+scyjava>=1.9.0
+pyimagej>=1.4.1
