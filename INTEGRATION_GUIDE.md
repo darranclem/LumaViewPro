@@ -1,48 +1,52 @@
-# LumaViewPro 4.0.0-beta Integration & User Guide
+# LumaViewPro Plate Navigator & Hardware Integration Guide
 
-LumaViewPro is a single-window Python/Kivy application designed to operate and automate fluorescence microscopes, multi-axis stage positioning, and multi-channel experiment protocols.
+## Overview
+
+This guide details the integration architecture for running **LumaViewPro** in both offline simulation mode on a desktop PC and physical hardware mode on the fluorescence microscope system.
 
 ---
 
-## 1. Operating Modes
+## Key Features & Enhancements
 
-### A. Real Microscope Operation (Downstairs PC)
-To run LumaViewPro connected to real physical microscope hardware:
-```powershell
-Set-Location H:\Trae\Projects\LumaViewPro-main
-.\venv\Scripts\Activate.ps1
-python lumaviewpro.py
-```
-* **Hardware Drivers**: Connects directly to Basler USB camera (`pyloncamera.PylonCamera`), stage motor controller (`motorboard.MotorBoard`), and LED illumination board (`ledboard.LEDBoard`).
-* **Disconnected Guard**: If run on an unattached PC, `lumaviewpro.py` displays a `MICROSCOPE DISCONNECTED` warning frame and disables stage motion rather than faking movements.
+1. **Clean Single-Loading KV Architecture**:
+   - Overrides `App.load_kv()` to ensure `lumaviewpro.kv` is loaded exactly once into Kivy's `Builder`, eliminating UI vertical duplication and Kivy `PopupException` layout errors.
 
-### B. Offline Desktop Simulator Mode (Upstairs PC)
-To develop and test the GUI, plate registration canvas, and live feed offline without physical hardware attached:
+2. **Default Launch in Dark State & Illumination Control**:
+   - On application startup, illumination starts **OFF** (`is_light_on = False`), displaying a dark sensor frame.
+   - Turning light ON for a channel (or clicking **`Light: ON / OFF`**) illuminates the live camera stream with exact channel color LUTs:
+     - **Brightfield & Phase**: Monochromatic Grayscale.
+     - **Darkfield**: Inverted Monochromatic Grayscale.
+     - **Blue (DAPI / 405 nm)**: Pure Blue channel LUT.
+     - **Green (FITC / GFP / 488 nm)**: Pure Green channel LUT.
+     - **Red (TxRed / mCherry / 594 nm)**: Pure Red channel LUT.
+
+3. **Strict Single-Channel Mutual Exclusion**:
+   - Selecting a channel turns illumination ON for that channel and automatically turns OFF any previously active channel. Clicking an active channel button again toggles light OFF and returns the view to dark.
+
+4. **Z Focus Controls & AF Search Range**:
+   - Dedicated Z focus jog buttons (`+10 um`, `+1 um`, `-1 um`, `-10 um`) alongside XY stage motion.
+   - Configurable AF Search Range (+/- um) input in both main UI and Plate Navigator.
+
+5. **Plate Navigator Double-Click Well Navigation**:
+   - Double-clicking any well on the microplate canvas automatically moves the stage motor position directly to that well center and updates the active target crosshair.
+
+6. **Well Plate Format Map Selection**:
+   - Dropdown format selector for **6, 12, 24, 48, 96, and 384 well plates**, dynamically reading SLAS pitch and offset dimensions from `labware.py`.
+
+---
+
+## Dual-Mode Execution Commands (`PowerShell`)
+
+### Mode 1: Offline Desktop Simulator (Upstairs PC)
 ```powershell
 Set-Location H:\Trae\Projects\LumaViewPro-main
 .\venv\Scripts\Activate.ps1
 python luma_sim.py
 ```
-* **Synthetic Camera Stream**: Renders dark sensor noise when illumination is OFF, and realistic cellular colonies with Z defocus blur, well rims, outer plastic skirt borders, and inter-well grid lines when illumination is ON.
 
----
-
-## 2. Key Features & Workflows
-
-1. **Single-Window Architecture**: Live camera viewport (Top-Left), microplate map canvas (Top-Right), hardware control deck (Bottom-Left), and optical channel studio (Bottom-Right).
-2. **Double-Click Pixel Centering**: Double-clicking any pixel feature in the camera feed moves that feature directly under the central red reticle.
-3. **Double-Click Microplate Navigation**: Double-clicking any well or location on the microplate canvas map drives the stage directly to those coordinates.
-4. **Magnification-Proportional FOV Scaling**: Selecting objective presets (`1.25x` to `100x Oil`) rescales both the camera view and the cyan FOV reticle box on the map.
-5. **6-Point Target Calibration Wizard**: Step-by-step target wizard (`Start Calib`, `Mark Target`, `< Prev`, `Next >`, `Done`, `Reset`) to compute the 2D Affine Transformation matrix across well plate rim targets.
-6. **Single-Channel Mutual Exclusion**: Selecting an optical channel (`Brightfield`, `Phase`, `Darkfield`, `Blue`, `Green`, `Red`) illuminates that channel exclusively.
-
----
-
-## 3. GitHub Commit & Push Instructions
-
+### Mode 2: Physical Microscope Operation (Downstairs PC)
 ```powershell
 Set-Location H:\Trae\Projects\LumaViewPro-main
-git add .
-git commit -m "Refactor hardware driver integration in lumaviewpro.py and mock hardware layer in luma_sim.py"
-git push -u origin main
+.\venv\Scripts\Activate.ps1
+python lumaviewpro.py
 ```
