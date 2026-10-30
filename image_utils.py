@@ -1,7 +1,7 @@
 from __future__ import annotations
 """
 image_utils.py - Fast, cached image processing, flat-field shading correction, focus metrics,
-C-memory frame sanitization, and hardware LED/Camera control for LumaViewPro.
+and synthetic camera frame generation for LumaViewPro.
 """
 
 import os
@@ -56,89 +56,6 @@ def save_image(filepath: str, img: np.ndarray) -> bool:
     except Exception as e:
         print(f"[Error] Failed to save image {filepath}: {e}")
         return False
-
-
-def sanitize_camera_frame(frame: Optional[np.ndarray]) -> np.ndarray:
-    """
-    Ensures any raw camera frame (Mono8, Mono16, BGR, RGB, Float) from Basler Pylon
-    is safely converted to a 3-channel contiguous uint8 RGB numpy array of shape (H, W, 3).
-    Prevents Kivy C-extension OpenGL texture memory segfaults (0xC0000005).
-    """
-    if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
-        return generate_disconnected_camera_frame()
-
-    try:
-        # Make a deep copy to detach from PyPylon C++ circular ring buffer
-        frame_copy = np.array(frame, copy=True)
-
-        if len(frame_copy.shape) == 1:
-            side = int(math.sqrt(frame_copy.size))
-            if side * side == frame_copy.size:
-                frame_copy = frame_copy.reshape((side, side))
-            else:
-                return generate_disconnected_camera_frame()
-
-        if frame_copy.dtype != np.uint8:
-            if frame_copy.dtype == np.uint16:
-                max_val = frame_copy.max()
-                frame_8u = (frame_copy >> 8).astype(np.uint8) if max_val > 255 else frame_copy.astype(np.uint8)
-            else:
-                frame_8u = cv2.normalize(frame_copy, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-        else:
-            frame_8u = frame_copy
-
-        if len(frame_8u.shape) == 2:
-            rgb = cv2.cvtColor(frame_8u, cv2.COLOR_GRAY2RGB)
-        elif len(frame_8u.shape) == 3:
-            channels = frame_8u.shape[2]
-            if channels == 1:
-                rgb = cv2.cvtColor(frame_8u, cv2.COLOR_GRAY2RGB)
-            elif channels == 3:
-                rgb = cv2.cvtColor(frame_8u, cv2.COLOR_BGR2RGB)
-            elif channels == 4:
-                rgb = cv2.cvtColor(frame_8u, cv2.COLOR_BGRA2RGB)
-            else:
-                rgb = frame_8u[:, :, :3]
-        else:
-            return generate_disconnected_camera_frame()
-
-        return np.ascontiguousarray(rgb, dtype=np.uint8)
-    except Exception as e:
-        print(f"[image_utils] sanitize_camera_frame error: {e}")
-        return generate_disconnected_camera_frame()
-
-
-def safe_set_led(leds_obj: object, channel_name: str, power_percent: float) -> bool:
-    """
-    Safely controls physical Etaluma LED Mainboard.
-    Maps optical channel names ('Brightfield', 'Blue', 'Green', 'Red') to integer IDs (0, 1, 2, 3)
-    and handles multiple driver method signatures without crashing.
-    """
-    if leds_obj is None:
-        return False
-
-    CHANNEL_MAP = {
-        "Brightfield": 0, "BF": 0, "Phase": 0, "Darkfield": 0,
-        "Blue": 1, "DAPI": 1,
-        "Green": 2, "FITC": 2, "GFP": 2,
-        "Red": 3, "TxRed": 3, "Cy5": 3, "mCherry": 3
-    }
-    ch_idx = CHANNEL_MAP.get(channel_name, 0)
-    p_val = max(0, min(100, int(power_percent)))
-
-    for method_name in ["set_led", "set_channel", "set_power"]:
-        if hasattr(leds_obj, method_name):
-            method = getattr(leds_obj, method_name)
-            try:
-                method(ch_idx, p_val)
-                return True
-            except Exception:
-                try:
-                    method(channel_name, p_val)
-                    return True
-                except Exception as e:
-                    print(f"[LEDBoard {method_name} error]: {e}")
-    return False
 
 
 def apply_shading_correction(
@@ -207,25 +124,21 @@ def compute_focus_score(img: np.ndarray, method: str = "laplacian") -> float:
 
 
 def generate_disconnected_camera_frame(sensor_size: Tuple[int, int] = (512, 512)) -> np.ndarray:
-    """Generates a clear 'MICROSCOPE NOT CONNECTED' warning overlay when hardware is absent or unattached."""
+    """Generates a dark frame with 'CAMERA DISCONNECTED' overlay for stock lumaviewpro.py when hardware is absent."""
     w, h = sensor_size
     frame = np.zeros((h, w, 3), dtype=np.uint8)
     
-    # Dark slate blue background with border
-    frame[:] = (25, 20, 15)
-    cv2.rectangle(frame, (15, 15), (w - 15, h - 15), (50, 50, 160), 2)
+    # Subtle dark noise
+    noise = np.random.normal(loc=4.0, scale=1.5, size=(h, w, 3)).astype(np.int16)
+    frame = np.clip(noise, 0, 255).astype(np.uint8)
 
-    # Disconnected Camera Icon / Warning
+    # Disconnected Camera Icon / Text Overlay
     cx, cy = w // 2, h // 2
-    cv2.circle(frame, (cx, cy - 35), 35, (60, 60, 200), 3)
-    cv2.line(frame, (cx - 25, cy - 60), (cx + 25, cy - 10), (60, 60, 200), 4)
+    cv2.circle(frame, (cx, cy - 30), 40, (50, 50, 180), 2)
+    cv2.line(frame, (cx - 30, cy - 60), (cx + 30, cy), (50, 50, 180), 3)
 
-    cv2.putText(frame, "MICROSCOPE NOT CONNECTED", (cx - 175, cy + 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.70, (100, 100, 255), 2)
-    cv2.putText(frame, "Hardware Drivers (pyloncamera, motorboard, ledboard)", (cx - 190, cy + 55),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 210), 1)
-    cv2.putText(frame, "or USB Microscope Hardware Not Detected", (cx - 150, cy + 78),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 210), 1)
+    cv2.putText(frame, "CAMERA DISCONNECTED", (cx - 150, cy + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 80, 220), 2)
+    cv2.putText(frame, "No Microscope Hardware Detected", (cx - 165, cy + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 120, 150), 1)
     return frame
 
 
@@ -245,9 +158,16 @@ def generate_well_plate_cell_frame(
     num_wells: int = 96,
     **kwargs
 ) -> np.ndarray:
-    """Generates synthetic camera frames for offline simulator."""
+    """
+    Generates synthetic high-resolution camera frames for offline simulator.
+    - If is_light_on is False: Returns dark camera sensor noise frame (black window).
+    - If is_light_on is True: Renders well interior disks, cell colonies, well rim outlines,
+      and 0 intensity (pitch black) outside all well rims.
+    - Z Defocus Blur: Gaussian blur increases smoothly with distance |stage_z - best_z|.
+    """
     w, h = sensor_size
 
+    # 1. Dark Launch / Light OFF State (Black camera feed)
     if not is_light_on or channel.upper() in ["OFF", "NONE", ""]:
         dark_noise = np.random.normal(loc=2.5, scale=1.0, size=(h, w, 3)).astype(np.int16)
         return np.clip(dark_noise, 0, 255).astype(np.uint8)
@@ -266,6 +186,7 @@ def generate_well_plate_cell_frame(
     fov_bottom = stage_y - fov_h / 2.0
     fov_top = stage_y + fov_h / 2.0
 
+    # Well plate physical layouts (SLAS standard specifications)
     well_specs = {
         6: (2, 3, 39.12, 39.12, 34.8, -39.12, 19.56),
         12: (3, 4, 26.0, 26.0, 22.1, -39.0, 26.0),
@@ -286,17 +207,18 @@ def generate_well_plate_cell_frame(
 
     ch_l = channel.lower()
 
+    # Define color LUT for well interior background and cells (BGR format)
     if "blue" in ch_l or "dapi" in ch_l:
         bg_color = np.array([25, 10, 5], dtype=np.float32)
-        cell_color = np.array([255, 180, 40], dtype=np.float32)
+        cell_color = np.array([255, 180, 40], dtype=np.float32)   # Pure Blue BGR
         rim_color = np.array([120, 60, 20], dtype=np.float32)
     elif "green" in ch_l or "fitc" in ch_l or "gfp" in ch_l:
         bg_color = np.array([10, 20, 10], dtype=np.float32)
-        cell_color = np.array([40, 240, 60], dtype=np.float32)
+        cell_color = np.array([40, 240, 60], dtype=np.float32)    # Pure Green BGR
         rim_color = np.array([30, 120, 30], dtype=np.float32)
     elif "red" in ch_l or "txred" in ch_l or "mcherry" in ch_l or "cy5" in ch_l:
         bg_color = np.array([20, 10, 10], dtype=np.float32)
-        cell_color = np.array([30, 40, 250], dtype=np.float32)
+        cell_color = np.array([30, 40, 250], dtype=np.float32)    # Pure Red BGR
         rim_color = np.array([30, 30, 120], dtype=np.float32)
     elif "darkfield" in ch_l or "df" in ch_l:
         bg_color = np.array([15, 15, 20], dtype=np.float32)
@@ -306,7 +228,7 @@ def generate_well_plate_cell_frame(
         bg_color = np.array([175, 175, 180], dtype=np.float32)
         cell_color = np.array([40, 40, 45], dtype=np.float32)
         rim_color = np.array([100, 100, 110], dtype=np.float32)
-    else:  # Brightfield
+    else:  # Brightfield (Monochrome Grayscale)
         bg_color = np.array([220, 220, 220], dtype=np.float32)
         cell_color = np.array([70, 70, 80], dtype=np.float32)
         rim_color = np.array([110, 110, 120], dtype=np.float32)
@@ -315,8 +237,10 @@ def generate_well_plate_cell_frame(
     cell_c = tuple(int(x) for x in np.clip(cell_color * brightness, 0, 255))
     rim_c = tuple(int(x) for x in np.clip(rim_color * brightness, 0, 255))
 
+    # Frame starts as 0 intensity (pitch black outside all wells)
     frame = np.zeros((h, w, 3), dtype=np.float32)
 
+    # Render wells overlapping active FOV
     for wx, wy, r_idx, c_idx in wells:
         dist_well = math.hypot(wx - stage_x, wy - stage_y)
         if dist_well <= (max(fov_w, fov_h) + well_r_mm + 1.0):
@@ -324,8 +248,10 @@ def generate_well_plate_cell_frame(
             well_px_y = int(((fov_top - wy) / fov_h) * h)
             well_r_px = int((well_r_mm / fov_w) * w)
 
+            # Draw filled well interior
             cv2.circle(frame, (well_px_x, well_px_y), well_r_px, bg_c, -1)
 
+            # Draw cell colonies inside well
             cell_list = _CELL_CACHE.get((r_idx % 16, c_idx % 24), [])
             for dx, dy, cr_px in cell_list:
                 cx_mm = wx + dx
@@ -338,11 +264,13 @@ def generate_well_plate_cell_frame(
                         if 0 <= c_px_x < w and 0 <= c_px_y < h:
                             cv2.circle(frame, (c_px_x, c_px_y), c_r_px, cell_c, -1)
 
+            # Draw well edge rim line
             rim_w_px = max(2, int((0.15 / fov_w) * w))
             cv2.circle(frame, (well_px_x, well_px_y), well_r_px, rim_c, rim_w_px)
 
     out_img = np.clip(frame, 0, 255).astype(np.uint8)
 
+    # Z defocus blur simulation
     dist_z = abs(stage_z - best_z)
     if dist_z > 0.001:
         blur_k = int(dist_z * 35.0)
@@ -357,3 +285,46 @@ def generate_well_plate_cell_frame(
 
 def generate_simulated_frame(*args, **kwargs) -> np.ndarray:
     return generate_well_plate_cell_frame(*args, **kwargs)
+
+
+def safe_get_camera_frame(camera_obj) -> Tuple[Optional[np.ndarray], str]:
+    if camera_obj is None:
+        return None, "Camera object is None"
+
+    methods_to_try = [
+        "get_image", "grab_image", "get_frame", "grab_frame",
+        "grab", "read", "capture", "snap", "get_array"
+    ]
+
+    found_method = None
+    for m in methods_to_try:
+        if hasattr(camera_obj, m) and callable(getattr(camera_obj, m)):
+            found_method = m
+            break
+
+    if found_method is None:
+        attrs = [a for a in dir(camera_obj) if not a.startswith("_")]
+        return None, f"No grab method found on PylonCamera (methods: {attrs[:5]})"
+
+    try:
+        method_fn = getattr(camera_obj, found_method)
+        frame = method_fn()
+        if frame is not None:
+            frame_copy = np.array(frame, copy=True)
+            return frame_copy, "OK"
+        else:
+            return None, f"{found_method}() returned None"
+    except Exception as e:
+        return None, f"{found_method}() exception: {e}"
+
+
+def generate_imaging_error_frame(error_msg: str = "Frame Capture Failed", sensor_size: Tuple[int, int] = (512, 512)) -> np.ndarray:
+    w, h = sensor_size
+    frame = np.zeros((h, w, 3), dtype=np.uint8)
+    frame[:] = (15, 15, 35)
+    cv2.rectangle(frame, (20, 20), (w - 20, h - 20), (50, 50, 220), 2)
+    cv2.putText(frame, "IMAGING ERROR", (w // 2 - 110, h // 2 - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (50, 50, 255), 2)
+    cv2.putText(frame, "Hardware Connected but Stream Failed", (w // 2 - 165, h // 2 + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (200, 200, 220), 1)
+    err_str = str(error_msg)[:50]
+    cv2.putText(frame, f"Error: {err_str}", (w // 2 - 180, h // 2 + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (100, 150, 255), 1)
+    return frame

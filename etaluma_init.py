@@ -1,4 +1,5 @@
 from __future__ import annotations
+# VERSION: 4.4.0-FINAL-INITIALIZATION
 """
 etaluma_init.py - Environment & Hardware Initialization Bootstrapper for LumaViewPro.
 
@@ -13,12 +14,11 @@ Replicates the exact startup verification sequence from stock Etaluma LumaViewPr
 import os
 import sys
 
+# Standard default paths on Windows microscope installation
 STOCK_INSTALL_DIRS = [
     r"C:\Program Files (x86)\LumaViewPro-stock",
     r"C:\Program Files (x86)\Etaluma\LumaViewPro",
     r"C:\Program Files\Etaluma\LumaViewPro",
-    r"C:\Program Files (x86)\LumaViewPro-main",
-    os.path.dirname(os.path.abspath(__file__)),
     r"C:\Users\dkc25.BLUE\AppData\Local\Programs\Python\Python310\lib\site-packages"
 ]
 
@@ -30,11 +30,13 @@ def run_etaluma_stock_initialization():
     """Initializes environment, driver paths, Java/Maven links, and SciJava bridge."""
     print("=== LumaViewPro Stock Environment Initialization ===")
 
+    # 1. Inject stock driver paths into sys.path
     for d in STOCK_INSTALL_DIRS:
         if os.path.exists(d) and d not in sys.path:
             sys.path.insert(0, d)
             print(f"--> Added driver path to sys.path: {d}")
 
+    # 2. Configure JAVA_HOME if not assigned
     if not os.environ.get("JAVA_HOME"):
         if os.path.exists(JAVA_HOME_DEFAULT):
             os.environ["JAVA_HOME"] = JAVA_HOME_DEFAULT
@@ -44,11 +46,13 @@ def run_etaluma_stock_initialization():
     else:
         print(f"--> JAVA_HOME = {os.environ.get('JAVA_HOME')}")
 
+    # 3. Add Maven bin to System Path if present
     if os.path.exists(MAVEN_BIN_DEFAULT):
         if MAVEN_BIN_DEFAULT not in os.environ.get("PATH", ""):
             os.environ["PATH"] = MAVEN_BIN_DEFAULT + os.pathsep + os.environ.get("PATH", "")
             print(f"--> Added Maven to PATH: {MAVEN_BIN_DEFAULT}")
 
+    # 4. Check SciJava / PyImageJ / jgo dependencies
     for mod_name in ["jgo", "scyjava", "imglyb", "pyimagej"]:
         try:
             __import__(mod_name)
