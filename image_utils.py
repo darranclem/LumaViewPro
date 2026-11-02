@@ -1,330 +1,90 @@
 from __future__ import annotations
-"""
-image_utils.py - Fast, cached image processing, flat-field shading correction, focus metrics,
-and synthetic camera frame generation for LumaViewPro.
-"""
-
-import os
 import cv2
 import numpy as np
-import math
-from typing import Optional, Tuple, Union, Dict, List
 
-# Pre-computed cell colony coordinate cache
-_CELL_CACHE: Dict[Tuple[int, int], List[Tuple[float, float, float]]] = {}
-
-
-def _init_cell_cache():
-    global _CELL_CACHE
-    if _CELL_CACHE:
-        return
-    for r in range(16):
-        for c in range(24):
-            seed = (r * 24 + c + 1) * 1000
-            np.random.seed(seed)
-            num_cells = 45
-            angles = np.random.uniform(0, 2 * np.pi, num_cells)
-            radii = np.random.uniform(0.1, 3.2, num_cells)
-            cell_rs = np.random.uniform(0.015, 0.035, num_cells)
-            
-            cell_list = []
-            for i in range(num_cells):
-                dx = radii[i] * np.cos(angles[i])
-                dy = radii[i] * np.sin(angles[i])
-                cell_list.append((dx, dy, cell_rs[i]))
-            _CELL_CACHE[(r, c)] = cell_list
-
-
-_init_cell_cache()
-
-
-def load_image(filepath: str) -> Optional[np.ndarray]:
-    if not os.path.exists(filepath):
-        return None
-    try:
-        img = cv2.imread(filepath, cv2.IMREAD_UNCHANGED)
-        return img
-    except Exception as e:
-        print(f"[Error] Failed to load image {filepath}: {e}")
-        return None
-
-
-def save_image(filepath: str, img: np.ndarray) -> bool:
-    try:
-        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
-        return cv2.imwrite(filepath, img)
-    except Exception as e:
-        print(f"[Error] Failed to save image {filepath}: {e}")
-        return False
-
-
-def apply_shading_correction(
-    raw_img: np.ndarray,
-    ref_img: np.ndarray,
-    dark_img: Optional[np.ndarray] = None,
-    clip_output: bool = True
-) -> np.ndarray:
-    if raw_img is None or ref_img is None:
-        return raw_img
-
-    if raw_img.shape != ref_img.shape:
-        return raw_img
-
-    orig_dtype = raw_img.dtype
-    raw_f = raw_img.astype(np.float32)
-    ref_f = ref_img.astype(np.float32)
-
-    if dark_img is not None and dark_img.shape == raw_img.shape:
-        dark_f = dark_img.astype(np.float32)
-        raw_f = np.maximum(0.0, raw_f - dark_f)
-        ref_f = np.maximum(1.0e-5, ref_f - dark_f)
-    else:
-        ref_f = np.maximum(1.0e-5, ref_f)
-
-    ref_mean = float(np.mean(ref_f))
-    if ref_mean < 1.0e-5:
-        ref_mean = 1.0
-
-    corrected = (raw_f / ref_f) * ref_mean
-
-    if not clip_output:
-        return corrected
-
-    if orig_dtype == np.uint8:
-        return np.clip(corrected, 0, 255).astype(np.uint8)
-    elif orig_dtype == np.uint16:
-        return np.clip(corrected, 0, 65535).astype(np.uint16)
-    return corrected.astype(orig_dtype)
-
-
-def compute_focus_score(img: np.ndarray, method: str = "laplacian") -> float:
-    if img is None or img.size == 0:
-        return 0.0
-
-    if len(img.shape) == 3:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = img
-
-    gray_f = gray.astype(np.float32)
-
-    if method.lower() == "laplacian":
-        lap = cv2.Laplacian(gray_f, cv2.CV_32F)
-        return float(np.var(lap))
-    elif method.lower() == "tenengrad":
-        sobel_x = cv2.Sobel(gray_f, cv2.CV_32F, 1, 0, ksize=3)
-        sobel_y = cv2.Sobel(gray_f, cv2.CV_32F, 0, 1, ksize=3)
-        return float(np.mean(sobel_x**2 + sobel_y**2))
-    elif method.lower() == "brenner":
-        diff_x = gray_f[:, 2:] - gray_f[:, :-2]
-        return float(np.mean(diff_x**2))
-    else:
-        lap = cv2.Laplacian(gray_f, cv2.CV_32F)
-        return float(np.var(lap))
-
-
-def generate_disconnected_camera_frame(sensor_size: Tuple[int, int] = (512, 512)) -> np.ndarray:
-    """Generates a dark frame with 'CAMERA DISCONNECTED' overlay for stock lumaviewpro.py when hardware is absent."""
-    w, h = sensor_size
-    frame = np.zeros((h, w, 3), dtype=np.uint8)
-    
-    # Subtle dark noise
-    noise = np.random.normal(loc=4.0, scale=1.5, size=(h, w, 3)).astype(np.int16)
-    frame = np.clip(noise, 0, 255).astype(np.uint8)
-
-    # Disconnected Camera Icon / Text Overlay
-    cx, cy = w // 2, h // 2
-    cv2.circle(frame, (cx, cy - 30), 40, (50, 50, 180), 2)
-    cv2.line(frame, (cx - 30, cy - 60), (cx + 30, cy), (50, 50, 180), 3)
-
-    cv2.putText(frame, "CAMERA DISCONNECTED", (cx - 150, cy + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 80, 220), 2)
-    cv2.putText(frame, "No Microscope Hardware Detected", (cx - 165, cy + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 120, 150), 1)
-    return frame
-
-
-def generate_well_plate_cell_frame(
-    stage_x: float = -49.5,
-    stage_y: float = 31.5,
-    stage_z: float = 0.0,
-    best_z: float = 0.0,
-    channel: str = "Brightfield",
-    exposure_ms: float = 20.0,
-    gain: float = 1.0,
-    led_power: float = 100.0,
-    power: float = 100.0,
-    sensor_size: Tuple[int, int] = (512, 512),
-    fov_size_mm: Tuple[float, float] = (0.60, 0.45),
-    is_light_on: bool = False,
-    num_wells: int = 96,
-    **kwargs
-) -> np.ndarray:
-    """
-    Generates synthetic high-resolution camera frames for offline simulator.
-    - If is_light_on is False: Returns dark camera sensor noise frame (black window).
-    - If is_light_on is True: Renders well interior disks, cell colonies, well rim outlines,
-      and 0 intensity (pitch black) outside all well rims.
-    - Z Defocus Blur: Gaussian blur increases smoothly with distance |stage_z - best_z|.
-    """
-    w, h = sensor_size
-
-    # 1. Dark Launch / Light OFF State (Black camera feed)
-    if not is_light_on or channel.upper() in ["OFF", "NONE", ""]:
-        dark_noise = np.random.normal(loc=2.5, scale=1.0, size=(h, w, 3)).astype(np.int16)
-        return np.clip(dark_noise, 0, 255).astype(np.uint8)
-
-    p_val = led_power if led_power is not None else power
-    p_factor = max(0.05, min(1.5, float(p_val) / 100.0))
-    exp_factor = max(0.1, min(3.0, (exposure_ms / 20.0) * gain))
-    brightness = p_factor * exp_factor
-
-    fov_w, fov_h = fov_size_mm
-    fov_w = max(0.05, float(fov_w))
-    fov_h = max(0.05, float(fov_h))
-
-    fov_left = stage_x - fov_w / 2.0
-    fov_right = stage_x + fov_w / 2.0
-    fov_bottom = stage_y - fov_h / 2.0
-    fov_top = stage_y + fov_h / 2.0
-
-    # Well plate physical layouts (SLAS standard specifications)
-    well_specs = {
-        6: (2, 3, 39.12, 39.12, 34.8, -39.12, 19.56),
-        12: (3, 4, 26.0, 26.0, 22.1, -39.0, 26.0),
-        24: (4, 6, 19.3, 19.3, 15.6, -48.25, 28.95),
-        48: (6, 8, 13.0, 13.0, 11.0, -45.5, 32.5),
-        96: (8, 12, 9.0, 9.0, 6.4, -49.5, 31.5),
-        384: (16, 24, 4.5, 4.5, 3.8, -51.75, 33.75)
-    }
-    rows, cols, pitch_x, pitch_y, well_d, a1_x, a1_y = well_specs.get(num_wells, well_specs[96])
-    well_r_mm = well_d / 2.0
-
-    wells = []
-    for r in range(rows):
-        wy = a1_y - r * pitch_y
-        for c in range(cols):
-            wx = a1_x + c * pitch_x
-            wells.append((wx, wy, r, c))
-
-    ch_l = channel.lower()
-
-    # Define color LUT for well interior background and cells (BGR format)
-    if "blue" in ch_l or "dapi" in ch_l:
-        bg_color = np.array([25, 10, 5], dtype=np.float32)
-        cell_color = np.array([255, 180, 40], dtype=np.float32)   # Pure Blue BGR
-        rim_color = np.array([120, 60, 20], dtype=np.float32)
-    elif "green" in ch_l or "fitc" in ch_l or "gfp" in ch_l:
-        bg_color = np.array([10, 20, 10], dtype=np.float32)
-        cell_color = np.array([40, 240, 60], dtype=np.float32)    # Pure Green BGR
-        rim_color = np.array([30, 120, 30], dtype=np.float32)
-    elif "red" in ch_l or "txred" in ch_l or "mcherry" in ch_l or "cy5" in ch_l:
-        bg_color = np.array([20, 10, 10], dtype=np.float32)
-        cell_color = np.array([30, 40, 250], dtype=np.float32)    # Pure Red BGR
-        rim_color = np.array([30, 30, 120], dtype=np.float32)
-    elif "darkfield" in ch_l or "df" in ch_l:
-        bg_color = np.array([15, 15, 20], dtype=np.float32)
-        cell_color = np.array([220, 220, 240], dtype=np.float32)
-        rim_color = np.array([180, 180, 200], dtype=np.float32)
-    elif "phase" in ch_l:
-        bg_color = np.array([175, 175, 180], dtype=np.float32)
-        cell_color = np.array([40, 40, 45], dtype=np.float32)
-        rim_color = np.array([100, 100, 110], dtype=np.float32)
-    else:  # Brightfield (Monochrome Grayscale)
-        bg_color = np.array([220, 220, 220], dtype=np.float32)
-        cell_color = np.array([70, 70, 80], dtype=np.float32)
-        rim_color = np.array([110, 110, 120], dtype=np.float32)
-
-    bg_c = tuple(int(x) for x in np.clip(bg_color * brightness, 0, 255))
-    cell_c = tuple(int(x) for x in np.clip(cell_color * brightness, 0, 255))
-    rim_c = tuple(int(x) for x in np.clip(rim_color * brightness, 0, 255))
-
-    # Frame starts as 0 intensity (pitch black outside all wells)
-    frame = np.zeros((h, w, 3), dtype=np.float32)
-
-    # Render wells overlapping active FOV
-    for wx, wy, r_idx, c_idx in wells:
-        dist_well = math.hypot(wx - stage_x, wy - stage_y)
-        if dist_well <= (max(fov_w, fov_h) + well_r_mm + 1.0):
-            well_px_x = int(((wx - fov_left) / fov_w) * w)
-            well_px_y = int(((fov_top - wy) / fov_h) * h)
-            well_r_px = int((well_r_mm / fov_w) * w)
-
-            # Draw filled well interior
-            cv2.circle(frame, (well_px_x, well_px_y), well_r_px, bg_c, -1)
-
-            # Draw cell colonies inside well
-            cell_list = _CELL_CACHE.get((r_idx % 16, c_idx % 24), [])
-            for dx, dy, cr_px in cell_list:
-                cx_mm = wx + dx
-                cy_mm = wy + dy
-                if math.hypot(dx, dy) < (well_r_mm - 0.05):
-                    if fov_left - 0.1 <= cx_mm <= fov_right + 0.1 and fov_bottom - 0.1 <= cy_mm <= fov_top + 0.1:
-                        c_px_x = int(((cx_mm - fov_left) / fov_w) * w)
-                        c_px_y = int(((fov_top - cy_mm) / fov_h) * h)
-                        c_r_px = max(2, int((cr_px / 512.0) * (1.2 / fov_w) * w))
-                        if 0 <= c_px_x < w and 0 <= c_px_y < h:
-                            cv2.circle(frame, (c_px_x, c_px_y), c_r_px, cell_c, -1)
-
-            # Draw well edge rim line
-            rim_w_px = max(2, int((0.15 / fov_w) * w))
-            cv2.circle(frame, (well_px_x, well_px_y), well_r_px, rim_c, rim_w_px)
-
-    out_img = np.clip(frame, 0, 255).astype(np.uint8)
-
-    # Z defocus blur simulation
-    dist_z = abs(stage_z - best_z)
-    if dist_z > 0.001:
-        blur_k = int(dist_z * 35.0)
-        if blur_k % 2 == 0:
-            blur_k += 1
-        blur_k = max(1, min(blur_k, 31))
-        if blur_k > 1:
-            out_img = cv2.GaussianBlur(out_img, (blur_k, blur_k), 0)
-
-    return out_img
-
-
-def generate_simulated_frame(*args, **kwargs) -> np.ndarray:
-    return generate_well_plate_cell_frame(*args, **kwargs)
-
-
-def safe_get_camera_frame(camera_obj) -> Tuple[Optional[np.ndarray], str]:
-    if camera_obj is None:
-        return None, "Camera object is None"
-
-    methods_to_try = [
-        "get_image", "grab_image", "get_frame", "grab_frame",
-        "grab", "read", "capture", "snap", "get_array"
-    ]
-
-    found_method = None
-    for m in methods_to_try:
-        if hasattr(camera_obj, m) and callable(getattr(camera_obj, m)):
-            found_method = m
-            break
-
-    if found_method is None:
-        attrs = [a for a in dir(camera_obj) if not a.startswith("_")]
-        return None, f"No grab method found on PylonCamera (methods: {attrs[:5]})"
+def safe_get_camera_frame(cam) -> tuple[np.ndarray | None, bool]:
+    """Retrieves live frame array from Basler PylonCamera object using stock grab()."""
+    if cam is None:
+        return None, False
 
     try:
-        method_fn = getattr(camera_obj, found_method)
-        frame = method_fn()
-        if frame is not None:
-            frame_copy = np.array(frame, copy=True)
-            return frame_copy, "OK"
+        # PylonCamera stock method is grab()
+        if hasattr(cam, 'grab'):
+            raw = cam.grab()
+        elif hasattr(cam, 'get_image'):
+            raw = cam.get_image()
+        elif hasattr(cam, 'get_frame'):
+            raw = cam.get_frame()
         else:
-            return None, f"{found_method}() returned None"
+            return None, False
+
+        if raw is None:
+            return None, False
+
+        frame = np.array(raw, copy=True)
+        if frame.size == 0:
+            return None, False
+
+        return frame, True
     except Exception as e:
-        return None, f"{found_method}() exception: {e}"
+        print(f"[image_utils] Error getting camera frame: {e}")
+        return None, False
 
+def safe_set_led(leds, channel_name: str, state: bool, power_ma: int = 100):
+    """Controls stock LEDBoard channels ('BF', 'PC', 'DF', 'Red', 'Blue', 'Green')."""
+    if leds is None:
+        return
 
-def generate_imaging_error_frame(error_msg: str = "Frame Capture Failed", sensor_size: Tuple[int, int] = (512, 512)) -> np.ndarray:
-    w, h = sensor_size
-    frame = np.zeros((h, w, 3), dtype=np.uint8)
-    frame[:] = (15, 15, 35)
-    cv2.rectangle(frame, (20, 20), (w - 20, h - 20), (50, 50, 220), 2)
-    cv2.putText(frame, "IMAGING ERROR", (w // 2 - 110, h // 2 - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (50, 50, 255), 2)
-    cv2.putText(frame, "Hardware Connected but Stream Failed", (w // 2 - 165, h // 2 + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (200, 200, 220), 1)
-    err_str = str(error_msg)[:50]
-    cv2.putText(frame, f"Error: {err_str}", (w // 2 - 180, h // 2 + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (100, 150, 255), 1)
-    return frame
+    channel_map = {
+        "Brightfield": "BF",
+        "Phase": "PC",
+        "Darkfield": "DF",
+        "Red": "Red",
+        "Blue": "Blue",
+        "Green": "Green"
+    }
+    ch_code = channel_map.get(channel_name, "BF")
+
+    try:
+        if not state:
+            if hasattr(leds, 'led_off'):
+                leds.led_off(ch_code)
+            elif hasattr(leds, 'leds_off'):
+                leds.leds_off()
+        else:
+            if hasattr(leds, 'led_on'):
+                leds.led_on(ch_code, power_ma)
+            elif hasattr(leds, 'leds_enable'):
+                leds.leds_enable()
+    except Exception as e:
+        print(f"[image_utils] Error setting LED channel {channel_name}: {e}")
+
+def generate_disconnected_camera_frame(width: int = 640, height: int = 480) -> np.ndarray:
+    """Generates a dark placeholder frame with MICROSCOPE NOT CONNECTED overlay."""
+    img = np.zeros((height, width, 3), dtype=np.uint8)
+    cv2.putText(
+        img,
+        "MICROSCOPE NOT CONNECTED",
+        (width // 6, height // 2),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 0, 255),
+        2,
+        cv2.LINE_AA
+    )
+    return img
+
+def generate_imaging_error_frame(width: int = 640, height: int = 480) -> np.ndarray:
+    """Generates an error placeholder frame with IMAGING ERROR overlay."""
+    img = np.zeros((height, width, 3), dtype=np.uint8)
+    cv2.putText(
+        img,
+        "IMAGING ERROR",
+        (width // 4, height // 2),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (0, 165, 255),
+        2,
+        cv2.LINE_AA
+    )
+    return img

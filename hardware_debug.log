@@ -1,5 +1,9 @@
-[HW_LOG 122765.297s] === Starting LumaViewPro Hardware Initialisation & Handshake ===
-[HW_LOG 122765.297s] X USB Camera Driver offline/unattached: No module named 'pyloncamera'
-[HW_LOG 122765.297s] X Stage Motor Driver offline/unattached: No module named 'motorboard'
-[HW_LOG 122765.297s] X LED Board Driver offline/unattached: No module named 'ledboard'
-[HW_LOG 122765.297s] Hardware State -> Camera: False, Stage/Focus: False, LED: False
+[2026-10-30 19:00:19.506] ==================================================
+[2026-10-30 19:00:19.506]    LUMAVIEWPRO HARDWARE DIAGNOSTIC SUITE          
+[2026-10-30 19:00:19.506] ==================================================
+[2026-10-30 19:00:19.506] Python Executable: C:\Users\dkc25.BLUE\AppData\Local\Programs\Python\Python310\python.exe
+[2026-10-30 19:00:19.506] Python Version: 3.10.11 (tags/v3.10.11:7d4cc5a, Apr  5 2023, 00:38:17) [MSC v.1929 64 bit (AMD64)]
+[2026-10-30 19:00:19.506] Working Directory: C:\Program Files (x86)\LumaViewPro-main
+[2026-10-30 19:00:19.506] System Path: ['C:\\Program Files (x86)\\LumaViewPro-stock', 'C:\\Program Files (x86)\\LumaViewPro-main', 'C:\\Users\\dkc25.BLUE\\AppData\\Local\\Programs\\Python\\Python310\\python310.zip']
+[2026-10-30 19:00:19.506] 
+[2026-10-30 19:00:19.506] --- [1/3] INSPECTING PYLONCAMERA (BASLER USB CAMERA) ---

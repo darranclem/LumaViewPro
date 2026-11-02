@@ -1,4 +1,5 @@
 from __future__ import annotations
+import etaluma_init
 """
 hw_debug.py - Standalone Hardware Diagnostic & Inspection Tool for Etaluma LumaViewPro
 

@@ -1,0 +1,36 @@
+PS C:\Program Files (x86)\LumaViewPro-main> python lumaviewpro.py
+[INFO   ] [Logger      ] Record log in C:\Users\dkc25.BLUE\.kivy\logs\kivy_26-10-29_6.txt
+[INFO   ] [deps        ] Successfully imported "kivy_deps.angle" 0.4.0
+[INFO   ] [deps        ] Successfully imported "kivy_deps.glew" 0.3.2
+[INFO   ] [deps        ] Successfully imported "kivy_deps.sdl2" 0.7.0
+[INFO   ] [Kivy        ] v2.3.0
+[INFO   ] [Kivy        ] Installed at "C:\Users\dkc25.BLUE\AppData\Local\Programs\Python\Python310\lib\site-packages\kivy\__init__.py"
+[INFO   ] [Python      ] v3.10.11 (tags/v3.10.11:7d4cc5a, Apr  5 2023, 00:38:17) [MSC v.1929 64 bit (AMD64)]
+[INFO   ] [Python      ] Interpreter at "C:\Users\dkc25.BLUE\AppData\Local\Programs\Python\Python310\python.exe"
+[INFO   ] [Logger      ] Purge log fired. Processing...
+[INFO   ] [Logger      ] Purge finished!
+[INFO   ] [Factory     ] 195 symbols loaded
+[INFO   ] [Image       ] Providers: img_tex, img_dds, img_sdl2, img_pil (img_ffpyplayer ignored)
+[INFO   ] [Text        ] Provider: sdl2
+[INFO   ] [Window      ] Provider: sdl2
+[INFO   ] [GL          ] Using the "OpenGL" graphics system
+[INFO   ] [GL          ] GLEW initialization succeeded
+[INFO   ] [GL          ] Backend used <glew>
+[INFO   ] [GL          ] OpenGL version <b'3.3.11672 Compatibility Profile Context FireGL'>
+[INFO   ] [GL          ] OpenGL vendor <b'ATI Technologies Inc.'>
+[INFO   ] [GL          ] OpenGL renderer <b'ATI FirePro V3700 (FireGL)'>
+[INFO   ] [GL          ] OpenGL parsed version: 3, 3
+[INFO   ] [GL          ] Shading version <b'3.30'>
+[INFO   ] [GL          ] Texture max size <8192>
+[INFO   ] [GL          ] Texture max units <16>
+[INFO   ] [Window      ] auto add sdl2 input provider
+[INFO   ] [Window      ] virtual keyboard not allowed, single mode, not docked
+[HW_LOG 32134.775s] === Starting LumaViewPro Hardware Initialisation & Handshake ===
+[HW_LOG 32134.775s] X USB Camera Driver offline/unattached: No module named 'pyloncamera'
+[HW_LOG 32134.775s] X Stage Motor Driver offline/unattached: No module named 'motorboard'
+[HW_LOG 32134.775s] X LED Board Driver offline/unattached: No module named 'ledboard'
+[HW_LOG 32134.775s] Hardware State -> Camera: False, Stage/Focus: False, LED: False
+[WARNING] Deprecated property "<NumericProperty name=padding_x>" of object "<kivy.uix.label.Label object at 0x000001F918CD04A0>" was accessed, it will be removed in a future version
+[INFO   ] [GL          ] NPOT texture support is available
+[INFO   ] [Base        ] Start application main loop
+[INFO   ] [GL          ] BGRA texture support is available

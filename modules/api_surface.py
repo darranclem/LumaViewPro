@@ -63,7 +63,7 @@ IN_PROCESS = 'in_process'
 
 # A ``type`` statement, not an assignment: an assignment's alias evaluates to
 # its union and loses the name a wire client and the guard read.
-type FilePath = str | os.PathLike[str]
+# Patched for Python 3.10 compatibility
 # How a long call tells its caller how far it has got: the percentage done,
 # 0 to 100, and a status line when it has one to say. A callable rather than
 # a surface to write to, so whoever asked -- a widget, a script, a remote

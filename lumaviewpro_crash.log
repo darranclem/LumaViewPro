@@ -1,0 +1,13 @@
+
+=== CRASH LOG (23941.543s) ===
+Traceback (most recent call last):
+  File "C:\Program Files (x86)\LumaViewPro-main\lumaviewpro.py", line 916, in <module>
+    LumaViewProApp().run()
+  File "C:\Users\dkc25.BLUE\AppData\Local\Programs\Python\Python310\lib\site-packages\kivy\app.py", line 955, in run
+    self._run_prepare()
+  File "C:\Users\dkc25.BLUE\AppData\Local\Programs\Python\Python310\lib\site-packages\kivy\app.py", line 925, in _run_prepare
+    root = self.build()
+  File "C:\Program Files (x86)\LumaViewPro-main\lumaviewpro.py", line 302, in build
+    self.well_plate_format = labware.WellPlateFormat(num_wells=96)
+AttributeError: module 'labware' has no attribute 'WellPlateFormat'
+
