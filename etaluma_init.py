@@ -1,10 +1,14 @@
-import os, sys
+import os
+import sys
 
-def init_etaluma_environment():
-    stock_path = r"C:\Program Files (x86)\LumaViewPro-stock"
-    if os.path.exists(stock_path) and stock_path not in sys.path:
-        sys.path.insert(0, stock_path)
-    os.environ['JAVA_HOME'] = r"C:\Program Files\Zulu\zulu-8"
+driver_paths = [
+    r"C:\Program Files (x86)\LumaViewPro-stock",
+    r"C:\Program Files (x86)\Etaluma\LumaViewPro",
+    r"C:\Program Files (x86)\LumaViewPro-main",
+    os.path.dirname(os.path.abspath(__file__))
+]
+for p in driver_paths:
+    if os.path.exists(p) and p not in sys.path:
+        sys.path.insert(0, p)
 
-if __name__ == '__main__':
-    init_etaluma_environment()
+os.environ['JAVA_HOME'] = r"C:\Program Files\Zulu\zulu-8"
