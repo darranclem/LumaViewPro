@@ -109,8 +109,9 @@ class ZoomPanCameraWidget(Image):
             if frame_np.dtype == np.uint16:
                 f_min = float(frame_np.min())
                 f_max = float(frame_np.max())
-                if f_max - f_min > 20.0:
-                    frame_8u = np.clip((frame_np.astype(np.float32) - f_min) / (f_max - f_min) * 255.0, 0, 255).astype(np.uint8)
+                if f_max > f_min + 20:
+                    frame_norm = ((frame_np.astype(np.float32) - f_min) / (f_max - f_min)) * 255.0
+                    frame_8u = np.clip(frame_norm, 0, 255).astype(np.uint8)
                 else:
                     frame_8u = np.clip(frame_np >> 4, 0, 255).astype(np.uint8)
             else:
