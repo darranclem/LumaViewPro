@@ -84,8 +84,6 @@ except ImportError:
 class ZoomPanCameraWidget(Image):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.allow_stretch = True
-        self.keep_ratio = True
         self.bind(pos=self.redraw_overlay, size=self.redraw_overlay)
         self.set_standby_texture()
 
@@ -117,20 +115,11 @@ class ZoomPanCameraWidget(Image):
             else:
                 frame_8u = np.clip(frame_np, 0, 255).astype(np.uint8)
 
-            if len(frame_8u.shape) == 2:
-                frame_rgb = np.stack([frame_8u] * 3, axis=-1)
-            elif len(frame_8u.shape) == 3 and frame_8u.shape[2] == 1:
-                frame_rgb = np.repeat(frame_8u, 3, axis=-1)
-            elif len(frame_8u.shape) == 3 and frame_8u.shape[2] == 4:
-                frame_rgb = frame_8u[:, :, :3]
-            else:
-                frame_rgb = frame_8u
+            h, w = frame_8u.shape[:2]
+            buf = frame_8u.tobytes()
 
-            h, w, c = frame_rgb.shape
-            buf = frame_rgb.tobytes()
-
-            tex = Texture.create(size=(w, h), colorfmt='rgb')
-            tex.blit_buffer(buf, colorfmt='rgb', bufferfmt='ubyte')
+            tex = Texture.create(size=(w, h), colorfmt='luminance')
+            tex.blit_buffer(buf, colorfmt='luminance', bufferfmt='ubyte')
             tex.flip_vertical()
             self.texture = tex
             self.canvas.ask_update()

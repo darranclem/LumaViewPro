@@ -28,17 +28,7 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
 from kivy.uix.button import Button
 from kivy.uix.popup import Popup
-
-try:
-    import plate_navigator
-except ImportError:
-    try:
-        import plate_navigator_v6 as plate_navigator
-    except ImportError:
-        try:
-            import plate_navigator_v5 as plate_navigator
-        except ImportError:
-            import plate_navigator_v4 as plate_navigator
+import plate_navigator
 
 
 class LumaViewProMainLayout(BoxLayout):
@@ -69,13 +59,10 @@ class LumaViewProApp(App):
         }
         self.latest_frame = None
         self.last_cam_err = 'None'
+        self.frame_count = 0
+        self.last_log_time = time.time()
 
     def load_kv(self, filename=None):
-        if filename is None:
-            for kw in ['lumaviewpro.kv', 'lumaviewpro_v6.kv', 'lumaviewpro_v5.kv', 'lumaviewpro_v4.kv']:
-                if os.path.exists(kw):
-                    filename = kw
-                    break
         return super().load_kv(filename)
 
     def build(self):
@@ -103,7 +90,7 @@ class LumaViewProApp(App):
         threading.Thread(target=self.init_hardware_synchronized, daemon=True).start()
 
     def init_hardware_synchronized(self):
-        self.status_msg = 'Initializing Camera...'
+        Clock.schedule_once(lambda dt: setattr(self, 'status_msg', 'Initializing Camera...'), 0)
         try:
             import pyloncamera
             cam = pyloncamera.PylonCamera()
@@ -126,18 +113,34 @@ class LumaViewProApp(App):
                     pass
 
             cam.connect()
+
+            # Explicitly activate camera USB grab engine on PylonCamera driver
+            if hasattr(cam, 'start_grabbing'):
+                try:
+                    cam.start_grabbing()
+                    print('[LumaViewPro] Called PylonCamera.start_grabbing().', flush=True)
+                except Exception as e:
+                    print(f'[LumaViewPro] PylonCamera start_grabbing info: {e}', flush=True)
+
+            if hasattr(cam, 'active'):
+                try:
+                    cam.active = True
+                except Exception:
+                    pass
+
             self.camera = cam
             self.camera_connected = True
             print('[LumaViewPro] Connected to Basler USB Camera.', flush=True)
 
             self._introspect_camera(cam)
+            threading.Thread(target=self._camera_grab_loop, daemon=True).start()
             self.set_camera_exposure(self.camera_exposure_ms)
         except Exception as e:
             print(f'[LumaViewPro] Camera connection error: {e}', flush=True)
             self.last_cam_err = str(e)
 
         time.sleep(0.3)
-        self.status_msg = 'Initializing Stage...'
+        Clock.schedule_once(lambda dt: setattr(self, 'status_msg', 'Initializing Stage...'), 0)
 
         try:
             import motorboard
@@ -151,7 +154,7 @@ class LumaViewProApp(App):
             print(f'[LumaViewPro] Stage connection error: {e}', flush=True)
 
         time.sleep(0.3)
-        self.status_msg = 'Initializing LEDs...'
+        Clock.schedule_once(lambda dt: setattr(self, 'status_msg', 'Initializing LEDs...'), 0)
 
         try:
             import ledboard
@@ -164,77 +167,89 @@ class LumaViewProApp(App):
         except Exception as e:
             print(f'[LumaViewPro] LED connection error: {e}', flush=True)
 
-        self.status_msg = 'System Ready'
+        Clock.schedule_once(lambda dt: setattr(self, 'status_msg', 'System Ready'), 0)
 
     def _introspect_camera(self, cam):
-        try:
-            methods = [m for m in dir(cam) if not m.startswith('_')]
-            print(f"=== PYLONCAMERA HARDWARE INTROSPECTION PROBE ===", flush=True)
-            print(f"Camera Object Class: {type(cam).__module__}.{type(cam).__name__}", flush=True)
-            print(f"Public Attributes/Methods ({len(methods)}): {methods[:15]}", flush=True)
+        print('=== PYLONCAMERA HARDWARE INTROSPECTION PROBE ===', flush=True)
+        print(f'Camera Object Class: {type(cam).__module__}.{type(cam).__name__}', flush=True)
+        pub_attrs = [a for a in dir(cam) if not a.startswith('_')]
+        print(f'Public Attributes/Methods ({len(pub_attrs)}): {pub_attrs}', flush=True)
 
-            for target_attr in ['array', 'img', 'frame', 'image', 'raw_array', 'grab_new_capture', 'grab', 'get_image', 'read']:
-                if hasattr(cam, target_attr):
-                    val = getattr(cam, target_attr)
-                    is_callable = callable(val)
-                    val_type = type(val).__name__
-                    shape_info = getattr(val, 'shape', None)
-                    print(f"  [ATTR PROBE] '{target_attr}': present (callable={is_callable}, type={val_type}, shape={shape_info})", flush=True)
+        for check_attr in ['active', 'array', 'img', 'frame', 'image', 'raw_array', 'start_grabbing', 'grab_new_capture', 'grab', 'get_image', 'read']:
+            if hasattr(cam, check_attr):
+                val = getattr(cam, check_attr)
+                is_callable = callable(val)
+                val_type = type(val).__name__
+                val_shape = getattr(val, 'shape', None)
+                print(f"  [ATTR PROBE] '{check_attr}': present (callable={is_callable}, type={val_type}, shape={val_shape})", flush=True)
+            else:
+                print(f"  [ATTR PROBE] '{check_attr}': NOT present", flush=True)
+        print('================================================', flush=True)
+
+    def _camera_grab_loop(self):
+        print('[CAM LOOP] Background camera monitor thread active...', flush=True)
+        while self.camera_connected and self.camera:
+            try:
+                cam = self.camera
+                arr = getattr(cam, 'array', None)
+
+                if arr is None or (isinstance(arr, np.ndarray) and arr.size == 0):
+                    if hasattr(cam, 'start_grabbing'):
+                        try:
+                            cam.start_grabbing()
+                        except Exception:
+                            pass
+                    if hasattr(cam, 'grab_new_capture'):
+                        try:
+                            res = cam.grab_new_capture(100)
+                            if isinstance(res, np.ndarray) and res.size > 0:
+                                cam.array = res
+                        except Exception as e:
+                            self.last_cam_err = f'grab_new_capture: {e}'
                 else:
-                    print(f"  [ATTR PROBE] '{target_attr}': NOT present", flush=True)
-            print("================================================", flush=True)
-        except Exception as ex:
-            print(f"[INTROSPECTION PROBE ERROR] {ex}", flush=True)
+                    self.frame_count += 1
+                    now = time.time()
+                    if now - self.last_log_time >= 3.0:
+                        self.last_log_time = now
+                        f_min, f_max = arr.min(), arr.max()
+                        f_mean = float(arr.mean())
+                        print(f'[CAM STREAM SUCCESS] Frame #{self.frame_count}: shape={arr.shape}, dtype={arr.dtype}, min={f_min}, max={f_max}, mean={f_mean:.1f}', flush=True)
+            except Exception as e:
+                self.last_cam_err = f'Grab loop exc: {e}'
+                print(f'[CAM LOOP ERROR] {e}', flush=True)
+                time.sleep(0.1)
 
-    def _extract_numpy_array(self, obj):
-        if obj is None:
-            return None
-        if isinstance(obj, np.ndarray):
-            return obj
-        for attr in ['Array', 'GetArray', 'array', 'buffer', 'image']:
-            if hasattr(obj, attr):
-                try:
-                    val = getattr(obj, attr)
-                    if callable(val):
-                        val = val()
-                    if isinstance(val, np.ndarray):
-                        return val
-                except Exception:
-                    pass
-        return None
+            time.sleep(0.03)
 
     def run_hardware_stream_diagnostic(self):
         diag_lines = []
         if self.camera_connected and self.camera:
-            diag_lines.append("Camera Driver Status: CONNECTED")
-            diag_lines.append(f"  Camera Object: {type(self.camera).__name__}")
-            methods = [m for m in dir(self.camera) if not m.startswith('_')]
-            diag_lines.append(f"  Methods: {', '.join(methods[:10])}")
+            diag_lines.append('Camera Driver Status: CONNECTED')
+            diag_lines.append(f'  Camera Class: {type(self.camera).__name__}')
+            diag_lines.append(f'  Last Camera Error: {self.last_cam_err}')
+            diag_lines.append(f'  Total Frames Monitored: {self.frame_count}')
 
             frame = getattr(self.camera, 'array', None)
-            frame_arr = self._extract_numpy_array(frame)
-
-            if frame_arr is not None and frame_arr.size > 0:
-                diag_lines.append("Live Frame Buffer Stream: ACTIVE")
-                diag_lines.append(f"  Resolution: {frame_arr.shape[1]} x {frame_arr.shape[0]}")
-                diag_lines.append(f"  Data Type: {frame_arr.dtype}")
-                diag_lines.append(f"  Pixel Range: min={frame_arr.min()}, max={frame_arr.max()}, mean={frame_arr.mean():.1f}")
-                non_zero = float((frame_arr > 0).sum()) / frame_arr.size * 100.0
-                diag_lines.append(f"  Active Light Coverage: {non_zero:.1f}%")
+            if frame is not None and isinstance(frame, np.ndarray) and frame.size > 0:
+                diag_lines.append('Live Frame Buffer Stream: ACTIVE')
+                diag_lines.append(f'  Resolution: {frame.shape[1]} x {frame.shape[0]}')
+                diag_lines.append(f'  Data Type: {frame.dtype}')
+                diag_lines.append(f'  Pixel Range: min={frame.min()}, max={frame.max()}, mean={frame.mean():.1f}')
+                non_zero = float((frame > 0).sum()) / frame.size * 100.0
+                diag_lines.append(f'  Active Light Coverage: {non_zero:.1f}%')
             else:
-                diag_lines.append("Live Frame Buffer Stream: INACTIVE (No frame array received yet)")
-                diag_lines.append(f"  Last Recorded Exception: {self.last_cam_err}")
+                diag_lines.append('Live Frame Buffer Stream: INACTIVE (Waiting for first USB frame)')
         else:
-            diag_lines.append("Hardware Diagnosis: Camera hardware object not initialized or failed connection.")
+            diag_lines.append('Hardware Diagnosis: Camera hardware object not initialized or failed connection.')
 
         content = BoxLayout(orientation='vertical', padding=10, spacing=8)
-        content.add_widget(Label(text="Hardware Stream Diagnostic Report", font_size='16sp', bold=True))
+        content.add_widget(Label(text='Hardware Stream Diagnostic Report', font_size='16sp', bold=True))
         report_text = chr(10).join(diag_lines)
         content.add_widget(Label(text=report_text, font_size='13sp', halign='left', valign='top'))
-        close_btn = Button(text="Close Report", size_hint_y=None, height='36dp')
+        close_btn = Button(text='Close Report', size_hint_y=None, height='36dp')
         content.add_widget(close_btn)
 
-        popup = Popup(title="Hardware Stream Diagnostic Report", content=content, size_hint=(0.8, 0.6))
+        popup = Popup(title='Hardware Stream Diagnostic Report', content=content, size_hint=(0.8, 0.6))
         close_btn.bind(on_press=popup.dismiss)
         popup.open()
 
@@ -267,7 +282,7 @@ class LumaViewProApp(App):
                     'VIOLET': 3, 'BLUE_FLUOR': 3,
                     'BLUE': 0, 'GREEN_FLUOR': 0,
                     'GREEN': 1, 'RED_FLUOR': 1,
-                    'RED': 2, 'FAR_RED': 2
+                    'RED': 2, 'FAR_RED_FLUOR': 2
                 }
                 ch_num = ch_map.get(self.active_channel_name.upper(), 4)
                 self.led_board.exchange_command('LEDS_ENT')
@@ -315,7 +330,7 @@ class LumaViewProApp(App):
                     'VIOLET': 3, 'BLUE_FLUOR': 3,
                     'BLUE': 0, 'GREEN_FLUOR': 0,
                     'GREEN': 1, 'RED_FLUOR': 1,
-                    'RED': 2, 'FAR_RED': 2
+                    'RED': 2, 'FAR_RED_FLUOR': 2
                 }
                 ch_num = ch_map.get(self.active_channel_name, 4)
 
@@ -346,7 +361,7 @@ class LumaViewProApp(App):
                 print(f'[LumaViewPro] Auto exposure error: {e}', flush=True)
 
     def run_autofocus(self):
-        self.status_msg = 'Running Autofocus...'
+        Clock.schedule_once(lambda dt: setattr(self, 'status_msg', 'Running Autofocus...'), 0)
         def _exec():
             try:
                 if self.motor_stage and hasattr(self.motor_stage, 'autofocus'):
@@ -354,10 +369,10 @@ class LumaViewProApp(App):
                 elif self.camera and hasattr(self.camera, 'autofocus'):
                     self.camera.autofocus()
                 print('[LumaViewPro] Autofocus completed.', flush=True)
-                self.status_msg = 'Ready'
+                Clock.schedule_once(lambda dt: setattr(self, 'status_msg', 'Ready'), 0)
             except Exception as e:
                 print(f'[LumaViewPro] Autofocus error: {e}', flush=True)
-                self.status_msg = 'Autofocus Error'
+                Clock.schedule_once(lambda dt: setattr(self, 'status_msg', 'Autofocus Error'), 0)
         threading.Thread(target=_exec, daemon=True).start()
 
     def add_current_focus_map_point(self):
@@ -444,15 +459,15 @@ class LumaViewProApp(App):
         if not self.camera_connected or not self.camera:
             return
 
-        raw_frame = getattr(self.camera, 'array', None)
-        frame = self._extract_numpy_array(raw_frame)
+        frame_arr = getattr(self.camera, 'array', None)
 
-        if frame is not None and isinstance(frame, np.ndarray) and frame.size > 0:
+        if frame_arr is not None and isinstance(frame_arr, np.ndarray) and frame_arr.size > 0:
+            self.latest_frame = frame_arr
             if hasattr(self, 'root_widget') and self.root_widget:
                 try:
                     viewport = self.root_widget.ids.get('main_camera_viewport')
                     if viewport:
-                        viewport.update_frame_texture(frame)
+                        viewport.update_frame_texture(frame_arr)
                 except Exception as e:
                     print(f'[LumaViewPro] Viewport update error: {e}', flush=True)
 
