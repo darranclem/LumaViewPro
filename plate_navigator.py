@@ -3,6 +3,7 @@ import math
 import sys
 import numpy as np
 from kivy.app import App
+from kivy.factory import Factory
 from kivy.graphics import Color, Line, Rectangle, Ellipse
 from kivy.graphics.texture import Texture
 from kivy.uix.image import Image
@@ -84,19 +85,20 @@ except ImportError:
 class ZoomPanCameraWidget(Image):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.allow_stretch = True
+        self.keep_ratio = True
         self.bind(pos=self.redraw_overlay, size=self.redraw_overlay)
-        self.texture_buffer = None
         self.set_standby_texture()
 
     def set_standby_texture(self):
         h, w = 480, 640
-        img = np.zeros((h, w), dtype=np.uint8)
-        img[:, :] = 18
-        img[h // 2 - 1:h // 2 + 2, :] = 60
-        img[:, w // 2 - 1:w // 2 + 2] = 60
+        img = np.zeros((h, w, 3), dtype=np.uint8)
+        img[:, :] = [15, 18, 24]
+        img[h // 2 - 1:h // 2 + 2, :] = [50, 70, 90]
+        img[:, w // 2 - 1:w // 2 + 2] = [50, 70, 90]
 
-        tex = Texture.create(size=(w, h), colorfmt='luminance')
-        tex.blit_buffer(img.tobytes(), colorfmt='luminance', bufferfmt='ubyte')
+        tex = Texture.create(size=(w, h), colorfmt='rgb')
+        tex.blit_buffer(img.tobytes(), colorfmt='rgb', bufferfmt='ubyte')
         tex.flip_vertical()
         self.texture = tex
 
@@ -105,32 +107,33 @@ class ZoomPanCameraWidget(Image):
             return
 
         try:
-            if frame_np.dtype == np.uint16:
-                f_min = float(frame_np.min())
-                f_max = float(frame_np.max())
-                if f_max > f_min + 20:
-                    frame_norm = ((frame_np.astype(np.float32) - f_min) / (f_max - f_min)) * 255.0
-                    frame_8u = np.clip(frame_norm, 0, 255).astype(np.uint8)
-                else:
-                    frame_8u = np.clip(frame_np >> 4, 0, 255).astype(np.uint8)
+            f_min = float(frame_np.min())
+            f_max = float(frame_np.max())
+            if f_max > f_min + 1.0:
+                frame_norm = ((frame_np.astype(np.float32) - f_min) / (f_max - f_min)) * 255.0
+                frame_8u = np.clip(frame_norm, 0, 255).astype(np.uint8)
             else:
                 frame_8u = np.clip(frame_np, 0, 255).astype(np.uint8)
 
-            if len(frame_8u.shape) == 3 and frame_8u.shape[2] == 1:
-                frame_8u = frame_8u[:, :, 0]
-            elif len(frame_8u.shape) == 3 and frame_8u.shape[2] >= 3:
-                frame_8u = frame_8u[:, :, 0]
+            if len(frame_8u.shape) == 2:
+                frame_rgb = np.stack([frame_8u] * 3, axis=-1)
+            elif len(frame_8u.shape) == 3 and frame_8u.shape[2] == 1:
+                frame_rgb = np.repeat(frame_8u, 3, axis=-1)
+            elif len(frame_8u.shape) == 3 and frame_8u.shape[2] == 4:
+                frame_rgb = frame_8u[:, :, :3]
+            else:
+                frame_rgb = frame_8u
 
-            h, w = frame_8u.shape
-            buf = np.ascontiguousarray(frame_8u[::-1, :]).tobytes()
+            frame_rgb = np.ascontiguousarray(frame_rgb[::-1, :])
+            h, w, c = frame_rgb.shape
+            buf = frame_rgb.tobytes()
 
-            if self.texture is None or self.texture.width != w or self.texture.height != h or self.texture.colorfmt != 'luminance':
-                self.texture = Texture.create(size=(w, h), colorfmt='luminance')
-
-            self.texture.blit_buffer(buf, colorfmt='luminance', bufferfmt='ubyte')
+            tex = Texture.create(size=(w, h), colorfmt='rgb')
+            tex.blit_buffer(buf, colorfmt='rgb', bufferfmt='ubyte')
+            self.texture = tex
             self.canvas.ask_update()
         except Exception as e:
-            print(f'[ZoomPanCameraWidget] Error updating texture: {e}', flush=True)
+            print(f'[ZoomPanCameraWidget] Error blitting frame: {e}', flush=True)
 
     def redraw_overlay(self, *args):
         self.canvas.after.clear()
@@ -155,7 +158,7 @@ class InteractiveScaledPlateCanvas(Widget):
         if self.width <= 0 or self.height <= 0:
             return
 
-        margin = 15.0
+        margin = 20.0
         avail_w = self.width - 2 * margin
         avail_h = self.height - 2 * margin
 
@@ -170,13 +173,13 @@ class InteractiveScaledPlateCanvas(Widget):
         draw_h = plate_h_mm * scale
 
         offset_x = self.x + (self.width - draw_w) / 2.0
-        offset_y = self.y + (self.height - draw_h) / 2.0
+        offset_y = self.y + (self.height + draw_h) / 2.0
 
         with self.canvas:
             Color(0.20, 0.22, 0.26, 1.0)
-            Rectangle(pos=(offset_x, offset_y), size=(draw_w, draw_h))
+            Rectangle(pos=(offset_x, offset_y - draw_h), size=(draw_w, draw_h))
             Color(0.50, 0.55, 0.65, 1.0)
-            Line(rectangle=(offset_x, offset_y, draw_w, draw_h), width=1.5)
+            Line(rectangle=(offset_x, offset_y - draw_h, draw_w, draw_h), width=1.5)
 
             well_r_px = (self.plate_format.well_diameter / 2.0) * scale
 
@@ -186,7 +189,7 @@ class InteractiveScaledPlateCanvas(Widget):
                     x_nom, y_nom = self.plate_format.get_nominal_position(r, c)
 
                     wx_px = offset_x + (self.plate_format.a1_offset_x + x_nom) * scale
-                    wy_px = offset_y + draw_h - (self.plate_format.a1_offset_y + y_nom) * scale
+                    wy_px = offset_y - (self.plate_format.a1_offset_y + y_nom) * scale
 
                     if w_name in self.focus_map.points:
                         Color(0.2, 0.8, 0.2, 0.9)
@@ -208,7 +211,7 @@ class InteractiveScaledPlateCanvas(Widget):
                 norm_y = ((plate_h_mm / 2.0) - stg_y) / plate_h_mm
 
                 cur_px_x = offset_x + norm_x * draw_w
-                cur_px_y = offset_y + norm_y * draw_h
+                cur_px_y = offset_y - norm_y * draw_h
 
                 box_w_px = max(6.0, (0.60 / plate_w_mm) * draw_w)
                 box_h_px = max(4.0, (0.45 / plate_h_mm) * draw_h)
@@ -238,3 +241,7 @@ def attach_navigator_to_lumaviewpro(app_instance):
     app_instance.plate_calibration = calib
     app_instance.focus_map = focus_m
     app_instance.fov_manager = fov_m
+
+
+Factory.register('InteractiveScaledPlateCanvas', cls=InteractiveScaledPlateCanvas)
+Factory.register('ZoomPanCameraWidget', cls=ZoomPanCameraWidget)

@@ -2,15 +2,13 @@
 
 <LumaViewProMainLayout>:
     orientation: 'vertical'
-    padding: ('6dp', '4dp')
-    spacing: '4dp'
+    padding: ('8dp', 0)
+    spacing: '6dp'
 
-    # Top Status & Stage Bar
     BoxLayout:
         size_hint_y: None
-        height: '38dp'
-        spacing: '8dp'
-        padding: ('8dp', '2dp')
+        height: '42dp'
+        spacing: '10dp'
         canvas.before:
             Color:
                 rgba: 0.12, 0.14, 0.18, 1.0
@@ -20,10 +18,10 @@
 
         Label:
             text: "LumaViewPro Microscope Control System"
-            font_size: '16sp'
+            font_size: '18sp'
             bold: True
             color: 0.2, 0.8, 1.0, 1.0
-            size_hint_x: 0.35
+            size_hint_x: 0.40
             halign: 'left'
             valign: 'middle'
             text_size: self.size
@@ -38,19 +36,17 @@
 
         Label:
             text: app.stage_coord_str
-            font_size: '13sp'
+            font_size: '14sp'
             color: 0.9, 0.9, 0.9, 1.0
-            size_hint_x: 0.40
+            size_hint_x: 0.35
             halign: 'right'
             valign: 'middle'
             text_size: self.size
 
-    # Main Center View Area
     BoxLayout:
         orientation: 'horizontal'
-        spacing: '6dp'
+        spacing: '8dp'
 
-        # Camera Viewport & Vertical Z Slider
         BoxLayout:
             orientation: 'horizontal'
             size_hint_x: 0.62
@@ -58,102 +54,13 @@
 
             ZoomPanCameraWidget:
                 id: main_camera_viewport
-                size_hint_x: 0.88
+                size_hint_x: 0.82
 
-            # Vertical Z Focus Slider Panel
             BoxLayout:
                 orientation: 'vertical'
-                size_hint_x: 0.12
-                spacing: '2dp'
-                padding: ('2dp', '4dp')
-                canvas.before:
-                    Color:
-                        rgba: 0.14, 0.16, 0.20, 1.0
-                    Rectangle:
-                        pos: self.pos
-                        size: self.size
-
-                Label:
-                    text: "Lens Z"
-                    font_size: '11sp'
-                    bold: True
-                    size_hint_y: None
-                    height: '16dp'
-                    color: 0.2, 0.8, 1.0, 1.0
-
-                Button:
-                    text: 'Z++'
-                    font_size: '10sp'
-                    size_hint_y: None
-                    height: '24dp'
-                    on_press: app.jog_z(0.10)
-
-                Button:
-                    text: 'Z+'
-                    font_size: '10sp'
-                    size_hint_y: None
-                    height: '24dp'
-                    on_press: app.jog_z(0.01)
-
-                Button:
-                    text: 'z+'
-                    font_size: '10sp'
-                    size_hint_y: None
-                    height: '22dp'
-                    on_press: app.jog_z(0.001)
-
-                Slider:
-                    orientation: 'vertical'
-                    min: -10.0
-                    max: 10.0
-                    value: app.stage_z
-                    on_value: app.set_z_focus_absolute(self.value)
-
-                Button:
-                    text: 'z-'
-                    font_size: '10sp'
-                    size_hint_y: None
-                    height: '22dp'
-                    on_press: app.jog_z(-0.001)
-
-                Button:
-                    text: 'Z-'
-                    font_size: '10sp'
-                    size_hint_y: None
-                    height: '24dp'
-                    on_press: app.jog_z(-0.01)
-
-                Button:
-                    text: 'Z--'
-                    font_size: '10sp'
-                    size_hint_y: None
-                    height: '24dp'
-                    on_press: app.jog_z(-0.10)
-
-                Button:
-                    text: 'Zero'
-                    font_size: '10sp'
-                    size_hint_y: None
-                    height: '22dp'
-                    on_press: app.zero_z_baseline()
-
-        # Right Control Column (Plate Canvas + Control Panels)
-        BoxLayout:
-            orientation: 'vertical'
-            size_hint_x: 0.38
-            spacing: '4dp'
-
-            # Plate Navigator Canvas
-            InteractiveScaledPlateCanvas:
-                id: main_plate_canvas
-                size_hint_y: 0.40
-
-            # Illumination & Hardware Control Panel
-            BoxLayout:
-                orientation: 'vertical'
-                size_hint_y: 0.60
-                spacing: '3dp'
+                size_hint_x: 0.18
                 padding: '4dp'
+                spacing: '3dp'
                 canvas.before:
                     Color:
                         rgba: 0.15, 0.17, 0.22, 1.0
@@ -162,21 +69,107 @@
                         size: self.size
 
                 Label:
-                    text: "Illumination & Camera Settings"
-                    font_size: '13sp'
+                    text: "Z Focus"
+                    font_size: '12sp'
                     bold: True
                     size_hint_y: None
                     height: '18dp'
+                    color: 0.2, 0.8, 1.0, 1.0
+
+                Button:
+                    text: 'Z ++'
+                    size_hint_y: None
+                    height: '24dp'
+                    font_size: '11sp'
+                    on_press: app.jog_z(100)
+
+                Button:
+                    text: 'Z +'
+                    size_hint_y: None
+                    height: '22dp'
+                    font_size: '11sp'
+                    on_press: app.jog_z(10)
+
+                Button:
+                    text: 'z +'
+                    size_hint_y: None
+                    height: '20dp'
+                    font_size: '10sp'
+                    on_press: app.jog_z(1)
+
+                Slider:
+                    id: z_focus_slider
+                    orientation: 'vertical'
+                    min: -10.0
+                    max: 10.0
+                    value: app.stage_z
+                    on_value: app.set_z_focus_absolute(self.value)
+
+                Button:
+                    text: 'z -'
+                    size_hint_y: None
+                    height: '20dp'
+                    font_size: '10sp'
+                    on_press: app.jog_z(-1)
+
+                Button:
+                    text: 'Z -'
+                    size_hint_y: None
+                    height: '22dp'
+                    font_size: '11sp'
+                    on_press: app.jog_z(-10)
+
+                Button:
+                    text: 'Z --'
+                    size_hint_y: None
+                    height: '24dp'
+                    font_size: '11sp'
+                    on_press: app.jog_z(-100)
+
+                Button:
+                    text: 'Zero'
+                    size_hint_y: None
+                    height: '22dp'
+                    font_size: '11sp'
+                    on_press: app.zero_z_baseline()
+
+        BoxLayout:
+            orientation: 'vertical'
+            size_hint_x: 0.38
+            spacing: '6dp'
+
+            InteractiveScaledPlateCanvas:
+                id: main_plate_canvas
+                size_hint_y: 0.42
+
+            BoxLayout:
+                orientation: 'vertical'
+                size_hint_y: 0.58
+                spacing: '4dp'
+                padding: '6dp'
+                canvas.before:
+                    Color:
+                        rgba: 0.15, 0.17, 0.22, 1.0
+                    Rectangle:
+                        pos: self.pos
+                        size: self.size
+
+                Label:
+                    text: "Camera Stream & Illumination Controls"
+                    font_size: '14sp'
+                    bold: True
+                    size_hint_y: None
+                    height: '20dp'
                     color: 0.3, 0.8, 1.0, 1.0
 
                 BoxLayout:
                     size_hint_y: None
-                    height: '26dp'
-                    spacing: '4dp'
+                    height: '28dp'
+                    spacing: '6dp'
                     Label:
-                        text: "Exposure: " + str(round(app.camera_exposure_ms, 1)) + " ms"
+                        text: "Exposure (ms): " + str(round(app.camera_exposure_ms, 1))
                         size_hint_x: 0.40
-                        font_size: '11sp'
+                        font_size: '12sp'
                     Slider:
                         min: 0.1
                         max: 200.0
@@ -186,12 +179,12 @@
 
                 BoxLayout:
                     size_hint_y: None
-                    height: '26dp'
-                    spacing: '4dp'
+                    height: '28dp'
+                    spacing: '6dp'
                     Label:
-                        text: "LED Power: " + str(int(app.led_power_pct)) + "%"
+                        text: "LED Power (%): " + str(int(app.led_power_pct))
                         size_hint_x: 0.40
-                        font_size: '11sp'
+                        font_size: '12sp'
                     Slider:
                         min: 0
                         max: 100
@@ -199,108 +192,104 @@
                         on_value: app.set_led_power(self.value)
                         size_hint_x: 0.60
 
+                GridLayout:
+                    cols: 3
+                    spacing: '4dp'
+                    size_hint_y: None
+                    height: '30dp'
+                    Button:
+                        text: 'Auto Gain: ON' if app.auto_gain_active else 'Auto Gain: OFF'
+                        on_press: app.toggle_auto_gain()
+                    Button:
+                        text: 'Auto Exp: ON' if app.auto_exp_active else 'Auto Exp: OFF'
+                        on_press: app.toggle_auto_exposure()
+                    Button:
+                        text: 'Stream Test'
+                        on_press: app.run_hardware_stream_diagnostic()
+
                 Label:
                     text: "Optical Illumination Channels"
-                    font_size: '13sp'
+                    font_size: '14sp'
                     bold: True
                     size_hint_y: None
-                    height: '18dp'
+                    height: '20dp'
                     color: 0.3, 0.8, 1.0, 1.0
 
                 GridLayout:
                     cols: 4
-                    spacing: '2dp'
+                    spacing: '3dp'
                     size_hint_y: None
-                    height: '52dp'
+                    height: '56dp'
                     Button:
                         text: 'Brightfield'
-                        font_size: '10sp'
                         on_press: app.set_active_channel('BF')
                     Button:
                         text: 'Phase (PC)'
-                        font_size: '10sp'
                         on_press: app.set_active_channel('PC')
                     Button:
                         text: 'Darkfield (DF)'
-                        font_size: '10sp'
                         on_press: app.set_active_channel('DF')
                     Button:
-                        text: 'Violet (405)'
-                        font_size: '10sp'
-                        on_press: app.set_active_channel('VIOLET')
-                    Button:
                         text: 'Blue (470)'
-                        font_size: '10sp'
                         on_press: app.set_active_channel('BLUE')
                     Button:
                         text: 'Green (530)'
-                        font_size: '10sp'
                         on_press: app.set_active_channel('GREEN')
                     Button:
                         text: 'Red (625)'
-                        font_size: '10sp'
                         on_press: app.set_active_channel('RED')
                     Button:
-                        text: 'ALL LEDs OFF'
-                        font_size: '10sp'
+                        text: 'Violet (405)'
+                        on_press: app.set_active_channel('VIOLET')
+                    Button:
+                        text: 'LEDs Off'
                         background_color: (0.8, 0.2, 0.2, 1.0)
                         on_press: app.turn_off_all_leds()
 
                 Label:
-                    text: "Focus Map & Stage Motion"
-                    font_size: '13sp'
+                    text: "Focus Map & Protocol Steps"
+                    font_size: '14sp'
                     bold: True
                     size_hint_y: None
-                    height: '18dp'
+                    height: '20dp'
                     color: 0.3, 0.8, 1.0, 1.0
 
                 GridLayout:
-                    cols: 3
-                    spacing: '3dp'
+                    cols: 2
+                    spacing: '4dp'
                     size_hint_y: None
-                    height: '26dp'
+                    height: '32dp'
                     Button:
-                        text: '+ Focus Pt'
-                        font_size: '10sp'
+                        text: '+ Add Focus Map Point'
                         on_press: app.add_current_focus_map_point()
                     Button:
-                        text: '+ AF Pt'
-                        font_size: '10sp'
+                        text: '+ Add AF Step Point'
                         on_press: app.add_current_autofocus_point()
-                    Button:
-                        text: 'Autofocus'
-                        font_size: '10sp'
-                        on_press: app.run_autofocus()
 
                 GridLayout:
                     cols: 3
-                    spacing: '3dp'
+                    spacing: '4dp'
                     size_hint_y: None
-                    height: '60dp'
+                    height: '70dp'
 
                     Widget:
                     Button:
                         text: 'Y+ (Up)'
-                        font_size: '10sp'
                         on_press: app.jog_stage(0, 1)
                     Widget:
 
                     Button:
                         text: 'X- (Left)'
-                        font_size: '10sp'
                         on_press: app.jog_stage(-1, 0)
                     Button:
                         text: 'Home Stage'
-                        font_size: '10sp'
                         on_press: app.home_stage_and_synchronize()
                     Button:
                         text: 'X+ (Right)'
-                        font_size: '10sp'
                         on_press: app.jog_stage(1, 0)
 
                     Widget:
                     Button:
                         text: 'Y- (Down)'
-                        font_size: '10sp'
                         on_press: app.jog_stage(0, -1)
                     Widget:
