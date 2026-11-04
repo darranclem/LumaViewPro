@@ -628,7 +628,8 @@ def run_tile_scan(hw: ScopeHW,
                   cancel: threading.Event,
                   status_cb=None,
                   settle_s: float = 0.2,
-                  stitch: bool = True) -> dict[str, str]:
+                  stitch: bool = True,
+                  use_channel_z_offsets: bool = True) -> dict[str, str]:
     """Acquire every enabled channel at each tile position, then stitch.
 
     Per tile: move XY, look up the focus surface Z (if defined), then for
@@ -661,7 +662,8 @@ def run_tile_scan(hw: ScopeHW,
                 break
             cs = channel_settings[ch]
             if base_z is not None:
-                hw.move_z(base_z + cs.z_offset_um)
+                z_off = cs.z_offset_um if use_channel_z_offsets else 0.0
+                hw.move_z(base_z + z_off)
             hw.set_channel(ch, cs)
             frame = hw.grab_settled(settle_s=settle_s)
             if frame is None:
@@ -696,7 +698,8 @@ def run_z_stack(hw: ScopeHW,
                 out_dir: str,
                 cancel: threading.Event,
                 status_cb=None,
-                settle_s: float = 0.1) -> None:
+                settle_s: float = 0.1,
+                use_channel_z_offsets: bool = True) -> None:
     """Acquire a z-stack for each channel using its own z-stack config.
 
     The stack is centered on ``center_z_um`` plus the channel's chromatic
@@ -715,7 +718,7 @@ def run_z_stack(hw: ScopeHW,
         zc = cs.zstack
         half = abs(zc.range_um) / 2.0
         step = max(abs(zc.step_um), 0.1)
-        z0 = center_z_um + cs.z_offset_um
+        z0 = center_z_um + (cs.z_offset_um if use_channel_z_offsets else 0.0)
         zs = np.arange(z0 - half, z0 + half + 1e-6, step)
         hw.set_channel(ch, cs)
         _status(f'Z-stack {ch}: {len(zs)} slices '
@@ -738,6 +741,224 @@ def run_z_stack(hw: ScopeHW,
 
 def channel_settings_to_dict(cs: dict[str, ChannelSettings]) -> dict:
     return {k: asdict(v) for k, v in cs.items()}
+
+
+# ----------------------------------------------------- plate calibration
+
+@dataclass
+class CalTarget:
+    """One guided calibration position (LAS X style)."""
+    label: str                 # e.g. "A1 12 o'clock"
+    plate_mm: tuple[float, float]   # nominal position, plate top-left origin
+    marked_stage_um: tuple[float, float] | None = None
+
+
+class PlateCalibration:
+    """LAS X-style plate calibration.
+
+    Guided targets: the 12, 3, 6 and 9 o'clock well-edge positions of A1,
+    the 9 o'clock position of the last well of the first row, and the
+    12 o'clock position of the last well of the first column. The user
+    centers the FOV on each physical position and marks it.
+
+    From the six marks we solve:
+    - the A1 well center (stage um) and the measured well diameter,
+    - a full 2x2 affine mapping plate-mm -> stage-um, which captures the
+      well spacing/distances, any plate rotation, and axis directions.
+    """
+
+    def __init__(self, labware):
+        self.labware = labware
+        self.targets = self._build_targets(labware)
+        self.index = 0
+        # Results
+        self.a1_center_stage_um: tuple[float, float] | None = None
+        self.matrix: list[list[float]] | None = None   # 2x2, mm -> um
+        self.measured_well_diameter_mm: float | None = None
+        self.rotation_deg: float | None = None
+        self.measured_spacing_x_mm: float | None = None
+        self.measured_spacing_y_mm: float | None = None
+
+    @staticmethod
+    def _build_targets(lw) -> list[CalTarget]:
+        rx = lw.well_size_x_mm / 2.0
+        ry = lw.well_size_y_mm / 2.0
+        a1x, a1y = lw.a1_offset_x_mm, lw.a1_offset_y_mm
+        last_col = lw.cols - 1
+        last_row = lw.rows - 1
+        row_end_x = a1x + last_col * lw.spacing_x_mm
+        col_end_y = a1y + last_row * lw.spacing_y_mm
+        first_row_name = lw.get_well_name(0, last_col)
+        first_col_name = lw.get_well_name(last_row, 0)
+        return [
+            CalTarget("A1 12 o'clock", (a1x, a1y - ry)),
+            CalTarget("A1 3 o'clock", (a1x + rx, a1y)),
+            CalTarget("A1 6 o'clock", (a1x, a1y + ry)),
+            CalTarget("A1 9 o'clock", (a1x - rx, a1y)),
+            CalTarget(f"{first_row_name} 9 o'clock",
+                      (row_end_x - rx, a1y)),
+            CalTarget(f"{first_col_name} 12 o'clock",
+                      (a1x, col_end_y - ry)),
+        ]
+
+    @property
+    def current(self) -> CalTarget:
+        return self.targets[self.index]
+
+    @property
+    def complete(self) -> bool:
+        return all(t.marked_stage_um is not None for t in self.targets)
+
+    def mark_current(self, stage_x_um: float, stage_y_um: float) -> None:
+        self.targets[self.index].marked_stage_um = (float(stage_x_um),
+                                                    float(stage_y_um))
+
+    def next(self) -> bool:
+        if self.index < len(self.targets) - 1:
+            self.index += 1
+            return True
+        return False
+
+    def prev(self) -> bool:
+        if self.index > 0:
+            self.index -= 1
+            return True
+        return False
+
+    def provisional_solve(self) -> bool:
+        """Axis-aligned estimate from the four A1 edge marks, used to
+        auto-drive the stage near the remaining targets."""
+        if any(t.marked_stage_um is None for t in self.targets[:4]):
+            return False
+        lw = self.labware
+        m12, m3, m6, m9 = [np.asarray(t.marked_stage_um, dtype=np.float64)
+                           for t in self.targets[:4]]
+        c_a1 = (m12 + m3 + m6 + m9) / 4.0
+        self.a1_center_stage_um = (float(c_a1[0]), float(c_a1[1]))
+        rx = lw.well_size_x_mm / 2.0
+        ry = lw.well_size_y_mm / 2.0
+        ex = (m3 - m9) / (2 * rx)
+        ey = (m6 - m12) / (2 * ry)
+        self.matrix = [[float(ex[0]), float(ey[0])],
+                       [float(ex[1]), float(ey[1])]]
+        return True
+
+    def estimate_stage_for(self, target: CalTarget,
+                           fallback_transform) -> tuple[float, float] | None:
+        """Best-known stage position for a target: its own mark, else the
+        current (possibly partial) solve, else the caller's transform."""
+        if target.marked_stage_um is not None:
+            return target.marked_stage_um
+        if self.matrix is not None and self.a1_center_stage_um is not None:
+            return self.plate_mm_to_stage_um(*target.plate_mm)
+        if fallback_transform is not None:
+            lw = self.labware
+            rel = (target.plate_mm[0] - lw.a1_offset_x_mm,
+                   target.plate_mm[1] - lw.a1_offset_y_mm)
+            return fallback_transform(rel[0], rel[1])
+        return None
+
+    def solve(self) -> bool:
+        """Compute A1 center, well size, spacing, rotation and the affine
+        plate->stage transform from the six marks."""
+        if not self.complete:
+            return False
+        lw = self.labware
+        m12, m3, m6, m9, m_row, m_col = [np.asarray(t.marked_stage_um,
+                                                    dtype=np.float64)
+                                         for t in self.targets]
+        # A1 center: midpoints of the opposing edge marks.
+        c_a1 = (m12 + m3 + m6 + m9) / 4.0
+        self.a1_center_stage_um = (float(c_a1[0]), float(c_a1[1]))
+
+        # Plate-frame nominal vectors from the A1 center (mm):
+        rx = lw.well_size_x_mm / 2.0
+        ry = lw.well_size_y_mm / 2.0
+        last_col = lw.cols - 1
+        last_row = lw.rows - 1
+        n_row = np.array([last_col * lw.spacing_x_mm - rx, 0.0])
+        n_col = np.array([0.0, last_row * lw.spacing_y_mm - ry])
+        v_row = m_row - c_a1
+        v_col = m_col - c_a1
+        if last_col == 0 or last_row == 0 or abs(n_row[0]) < 1e-9 or abs(n_col[1]) < 1e-9:
+            # Degenerate (single-row/column labware): axis-aligned fallback
+            # from the A1 edge marks only.
+            ex = (m3 - m9)
+            ey = (m6 - m12)
+            M = np.column_stack([ex / (2 * rx), ey / (2 * ry)])
+        else:
+            N = np.column_stack([n_row, n_col])    # plate-frame
+            V = np.column_stack([v_row, v_col])    # stage-frame
+            try:
+                M = V @ np.linalg.inv(N)
+            except np.linalg.LinAlgError:
+                return False
+        self.matrix = [[float(M[0, 0]), float(M[0, 1])],
+                       [float(M[1, 0]), float(M[1, 1])]]
+
+        # Measured quantities for display / labware refinement.
+        scale_x = float(np.linalg.norm(M[:, 0]))   # um per plate-mm along x
+        scale_y = float(np.linalg.norm(M[:, 1]))
+        d_x = float(np.linalg.norm(m3 - m9)) / scale_x if scale_x > 0 else 0.0
+        d_y = float(np.linalg.norm(m6 - m12)) / scale_y if scale_y > 0 else 0.0
+        self.measured_well_diameter_mm = (d_x + d_y) / 2.0
+        self.rotation_deg = float(np.degrees(np.arctan2(M[1, 0], M[0, 0])))
+        if last_col > 0 and scale_x > 0:
+            row_len_mm = float(np.linalg.norm(v_row)) / scale_x
+            self.measured_spacing_x_mm = (row_len_mm + d_x / 2.0) / last_col
+        if last_row > 0 and scale_y > 0:
+            col_len_mm = float(np.linalg.norm(v_col)) / scale_y
+            self.measured_spacing_y_mm = (col_len_mm + d_y / 2.0) / last_row
+        return True
+
+    # ------------------------------------------------------- transforms
+
+    def plate_mm_to_stage_um(self, plate_x_mm: float,
+                             plate_y_mm: float) -> tuple[float, float]:
+        """Plate coords (top-left origin, mm) -> stage um via the solve."""
+        lw = self.labware
+        rel = np.array([plate_x_mm - lw.a1_offset_x_mm,
+                        plate_y_mm - lw.a1_offset_y_mm])
+        M = np.asarray(self.matrix)
+        c = np.asarray(self.a1_center_stage_um)
+        out = c + M @ rel
+        return float(out[0]), float(out[1])
+
+    def stage_um_to_plate_mm(self, x_um: float,
+                             y_um: float) -> tuple[float, float] | None:
+        try:
+            M = np.asarray(self.matrix)
+            c = np.asarray(self.a1_center_stage_um)
+            rel = np.linalg.solve(M, np.array([x_um, y_um]) - c)
+        except Exception:
+            return None
+        lw = self.labware
+        return (float(rel[0]) + lw.a1_offset_x_mm,
+                float(rel[1]) + lw.a1_offset_y_mm)
+
+    def to_dict(self) -> dict:
+        return {
+            'labware_name': getattr(self.labware, 'name', ''),
+            'a1_center_stage_um': self.a1_center_stage_um,
+            'matrix': self.matrix,
+            'measured_well_diameter_mm': self.measured_well_diameter_mm,
+            'rotation_deg': self.rotation_deg,
+            'measured_spacing_x_mm': self.measured_spacing_x_mm,
+            'measured_spacing_y_mm': self.measured_spacing_y_mm,
+            'marks': [t.marked_stage_um for t in self.targets],
+        }
+
+    def from_dict(self, d: dict) -> None:
+        a1 = d.get('a1_center_stage_um')
+        self.a1_center_stage_um = tuple(a1) if a1 else None
+        self.matrix = d.get('matrix')
+        self.measured_well_diameter_mm = d.get('measured_well_diameter_mm')
+        self.rotation_deg = d.get('rotation_deg')
+        self.measured_spacing_x_mm = d.get('measured_spacing_x_mm')
+        self.measured_spacing_y_mm = d.get('measured_spacing_y_mm')
+        marks = d.get('marks') or []
+        for t, m in zip(self.targets, marks):
+            t.marked_stage_um = tuple(m) if m else None
 
 
 def channel_settings_from_dict(d: dict) -> dict[str, ChannelSettings]:

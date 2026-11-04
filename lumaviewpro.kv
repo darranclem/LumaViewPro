@@ -178,6 +178,9 @@ LumaViewProMainLayout:
 
                 HeaderLabel:
                     text: 'LIVE CHANNEL'
+                FlatButton:
+                    text: 'Next channel  >>'
+                    on_press: app.cycle_channel()
                 GridLayout:
                     cols: 4
                     spacing: '3dp'
@@ -234,6 +237,15 @@ LumaViewProMainLayout:
                     SmallInput:
                         id: exposure_input
                         text: '20'
+                Slider:
+                    id: exposure_slider
+                    min: 1
+                    max: 1000
+                    value: 20
+                    size_hint_y: None
+                    height: '24dp'
+                    cursor_size: '14dp', '14dp'
+                    on_value: app.slider_changed('exposure', self.value)
                 FieldRow:
                     PanelLabel:
                         text: 'Gain (dB)'
@@ -241,6 +253,15 @@ LumaViewProMainLayout:
                     SmallInput:
                         id: gain_input
                         text: '0'
+                Slider:
+                    id: gain_slider
+                    min: 0
+                    max: 48
+                    value: 0
+                    size_hint_y: None
+                    height: '24dp'
+                    cursor_size: '14dp', '14dp'
+                    on_value: app.slider_changed('gain', self.value)
                 FieldRow:
                     PanelLabel:
                         text: 'LED power (mA)'
@@ -248,6 +269,15 @@ LumaViewProMainLayout:
                     SmallInput:
                         id: led_input
                         text: '50'
+                Slider:
+                    id: led_slider
+                    min: 0
+                    max: 600
+                    value: 50
+                    size_hint_y: None
+                    height: '24dp'
+                    cursor_size: '14dp', '14dp'
+                    on_value: app.slider_changed('led', self.value)
                 FieldRow:
                     PanelLabel:
                         text: 'Colour Z offset (um)'
@@ -257,7 +287,7 @@ LumaViewProMainLayout:
                         text: '0'
                 FieldRow:
                     PanelLabel:
-                        text: 'Use in acquisition'
+                        text: 'Use in protocol'
                         size_hint_x: 0.75
                     CheckBox:
                         id: channel_enabled_chk
@@ -266,6 +296,21 @@ LumaViewProMainLayout:
                 AccentButton:
                     text: 'Apply channel settings'
                     on_press: app.apply_channel_fields()
+
+                HeaderLabel:
+                    text: 'CORRECTIONS (all optional)'
+                FlatButton:
+                    text: 'Focus surface: ' + ('ON' if app.use_surface_on else 'off')
+                    background_color: ACCENT if app.use_surface_on else PANEL2
+                    on_press: app.use_surface_on = not app.use_surface_on
+                FlatButton:
+                    text: 'Colour Z offsets: ' + ('ON' if app.use_z_offsets_on else 'off')
+                    background_color: ACCENT if app.use_z_offsets_on else PANEL2
+                    on_press: app.use_z_offsets_on = not app.use_z_offsets_on
+                FlatButton:
+                    text: 'Shading: ' + ('ON' if app.shading_on else 'off')
+                    background_color: ACCENT if app.shading_on else PANEL2
+                    on_press: app.toggle_shading(not app.shading_on)
 
                 HeaderLabel:
                     text: 'Z-STACK (per channel)'
@@ -424,117 +469,193 @@ LumaViewProMainLayout:
                 font_size: '10sp'
 
         # --------------- RIGHT: plate navigator + stage ---------------
-        BoxLayout:
-            orientation: 'vertical'
+        ScrollView:
             size_hint_x: None
             width: '300dp'
-            spacing: '4dp'
-            padding: '6dp'
-            canvas.before:
-                Color:
-                    rgba: PANEL
-                Rectangle:
-                    pos: self.pos
-                    size: self.size
-
-            HeaderLabel:
-                text: 'PLATE NAVIGATOR'
-            WellPlateMapWidget:
-                id: plate_map
+            do_scroll_x: False
+            bar_width: '4dp'
+            BoxLayout:
+                orientation: 'vertical'
                 size_hint_y: None
-                height: '200dp'
-            FieldRow:
+                height: self.minimum_height
+                spacing: '4dp'
+                padding: '6dp'
+                canvas.before:
+                    Color:
+                        rgba: PANEL
+                    Rectangle:
+                        pos: self.pos
+                        size: self.size
+
+                HeaderLabel:
+                    text: 'LABWARE'
+                DarkSpinner:
+                    id: labware_spinner
+                    text: app.labware_name
+                    values: app.labware_options
+                    on_text: app.select_labware(self.text)
+                FieldRow:
+                    FlatButton:
+                        text: 'Duplicate'
+                        on_press: app.duplicate_labware()
+                    FlatButton:
+                        text: 'Edit / New'
+                        on_press: app.open_labware_editor()
+                    FlatButton:
+                        text: 'Delete'
+                        on_press: app.delete_labware()
+
+                HeaderLabel:
+                    text: 'PLATE NAVIGATOR'
+                WellPlateMapWidget:
+                    id: plate_map
+                    size_hint_y: None
+                    height: '200dp'
+                FieldRow:
+                    PanelLabel:
+                        text: 'Selected well: ' + app.selected_well_str
+                        size_hint_x: 0.6
+                    FlatButton:
+                        text: 'Set A1 = here'
+                        on_press: app.set_a1_here()
                 PanelLabel:
-                    text: 'Selected well: ' + app.selected_well_str
-                    size_hint_x: 0.6
-                FlatButton:
-                    text: 'Set A1 = here'
-                    on_press: app.set_a1_here()
-            FieldRow:
-                FlatButton:
-                    text: 'Flip plate X'
-                    on_press: app.toggle_invert('plate_x')
-                FlatButton:
-                    text: 'Flip plate Y'
-                    on_press: app.toggle_invert('plate_y')
-            PanelLabel:
-                text: 'Double-click a well to move the stage there'
+                    text: 'Double-click a well to move the stage there'
 
-            HeaderLabel:
-                text: 'STAGE'
-            Label:
-                text: app.stage_coord_str
-                color: TXT
-                font_size: '13sp'
-                bold: True
-                size_hint_y: None
-                height: '22dp'
-            GridLayout:
-                cols: 3
-                spacing: '3dp'
-                size_hint_y: None
-                height: '96dp'
-                Widget:
+                HeaderLabel:
+                    text: 'PLATE CALIBRATION'
+                PanelLabel:
+                    text: app.cal_info
+                BoxLayout:
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: '0dp' if app.cal_active else '30dp'
+                    opacity: 0 if app.cal_active else 1
+                    AccentButton:
+                        text: 'Calibrate plate...'
+                        disabled: app.cal_active
+                        on_press: app.cal_start()
+                BoxLayout:
+                    orientation: 'vertical'
+                    spacing: '3dp'
+                    size_hint_y: None
+                    height: '126dp' if app.cal_active else '0dp'
+                    opacity: 1 if app.cal_active else 0
+                    Label:
+                        text: app.cal_label
+                        color: (1.0, 0.45, 0.35, 1)
+                        bold: True
+                        font_size: '12sp'
+                        size_hint_y: None
+                        height: '20dp'
+                    PanelLabel:
+                        text: 'Center the FOV on the red target, then Mark'
+                    AccentButton:
+                        text: 'MARK (uses current XY)'
+                        disabled: not app.cal_active
+                        on_press: app.cal_mark()
+                    FieldRow:
+                        FlatButton:
+                            text: '< Prev'
+                            disabled: not app.cal_active
+                            on_press: app.cal_prev()
+                        FlatButton:
+                            text: 'Next >'
+                            disabled: not app.cal_active
+                            on_press: app.cal_next()
+                    FieldRow:
+                        FlatButton:
+                            text: 'Finish'
+                            disabled: not app.cal_active
+                            on_press: app.cal_finish()
+                        StopButton:
+                            text: 'Cancel'
+                            disabled: not app.cal_active
+                            on_press: app.cal_cancel()
                 FlatButton:
-                    text: 'Y +'
-                    on_press: app.jog('Y', 1000)
-                Widget:
-                FlatButton:
-                    text: 'X -'
-                    on_press: app.jog('X', -1000)
-                FlatButton:
-                    text: 'Center'
-                    on_press: app.goto_center()
-                FlatButton:
-                    text: 'X +'
-                    on_press: app.jog('X', 1000)
-                Widget:
-                FlatButton:
-                    text: 'Y -'
-                    on_press: app.jog('Y', -1000)
-                Widget:
-            GridLayout:
-                cols: 4
-                spacing: '3dp'
-                size_hint_y: None
-                height: '62dp'
-                FlatButton:
-                    text: 'Z +100'
-                    on_press: app.jog('Z', 100)
-                FlatButton:
-                    text: 'Z +10'
-                    on_press: app.jog('Z', 10)
-                FlatButton:
-                    text: 'Z -10'
-                    on_press: app.jog('Z', -10)
-                FlatButton:
-                    text: 'Z -100'
-                    on_press: app.jog('Z', -100)
-                FlatButton:
-                    text: 'XY -5k'
-                    on_press: app.jog('X', -5000); app.jog('Y', -5000)
-                FlatButton:
-                    text: 'Z +1k'
-                    on_press: app.jog('Z', 1000)
-                FlatButton:
-                    text: 'Z -1k'
-                    on_press: app.jog('Z', -1000)
-                FlatButton:
-                    text: 'Re-home'
-                    on_press: app.rehome()
+                    text: 'Save measured geometry as labware copy'
+                    on_press: app.cal_save_measured_labware()
+                FieldRow:
+                    FlatButton:
+                        text: 'Flip plate X'
+                        on_press: app.toggle_invert('plate_x')
+                    FlatButton:
+                        text: 'Flip plate Y'
+                        on_press: app.toggle_invert('plate_y')
 
-            HeaderLabel:
-                text: 'FOCUS SURFACE STATUS'
-            Label:
-                text: app.surface_info
-                color: TXT_DIM
-                font_size: '10sp'
-                size_hint_y: None
-                height: '40dp'
-                text_size: self.width, None
-                halign: 'left'
-                valign: 'top'
-            Widget:
+                HeaderLabel:
+                    text: 'STAGE'
+                Label:
+                    text: app.stage_coord_str
+                    color: TXT
+                    font_size: '13sp'
+                    bold: True
+                    size_hint_y: None
+                    height: '22dp'
+                GridLayout:
+                    cols: 3
+                    spacing: '3dp'
+                    size_hint_y: None
+                    height: '96dp'
+                    Widget:
+                    FlatButton:
+                        text: 'Y +'
+                        on_press: app.jog('Y', 1000)
+                    Widget:
+                    FlatButton:
+                        text: 'X -'
+                        on_press: app.jog('X', -1000)
+                    FlatButton:
+                        text: 'Center'
+                        on_press: app.goto_center()
+                    FlatButton:
+                        text: 'X +'
+                        on_press: app.jog('X', 1000)
+                    Widget:
+                    FlatButton:
+                        text: 'Y -'
+                        on_press: app.jog('Y', -1000)
+                    Widget:
+                GridLayout:
+                    cols: 4
+                    spacing: '3dp'
+                    size_hint_y: None
+                    height: '62dp'
+                    FlatButton:
+                        text: 'Z +100'
+                        on_press: app.jog('Z', 100)
+                    FlatButton:
+                        text: 'Z +10'
+                        on_press: app.jog('Z', 10)
+                    FlatButton:
+                        text: 'Z -10'
+                        on_press: app.jog('Z', -10)
+                    FlatButton:
+                        text: 'Z -100'
+                        on_press: app.jog('Z', -100)
+                    FlatButton:
+                        text: 'XY -5k'
+                        on_press: app.jog('X', -5000); app.jog('Y', -5000)
+                    FlatButton:
+                        text: 'Z +1k'
+                        on_press: app.jog('Z', 1000)
+                    FlatButton:
+                        text: 'Z -1k'
+                        on_press: app.jog('Z', -1000)
+                    FlatButton:
+                        text: 'Re-home'
+                        on_press: app.rehome()
+
+                HeaderLabel:
+                    text: 'FOCUS SURFACE STATUS'
+                Label:
+                    text: app.surface_info
+                    color: TXT_DIM
+                    font_size: '10sp'
+                    size_hint_y: None
+                    height: '40dp'
+                    text_size: self.width, None
+                    halign: 'left'
+                    valign: 'top'
 
     # ============================= STATUS BAR =============================
     BoxLayout:

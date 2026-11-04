@@ -57,3 +57,4 @@ data/lvp_custom_settings.json
 data/shading/
 captures/
 .venv*/
+data/custom_labware.json

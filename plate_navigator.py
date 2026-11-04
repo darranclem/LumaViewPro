@@ -207,21 +207,55 @@ class ZoomPanCameraWidget(Image):
 class WellPlateMapWidget(Widget):
     """Interactive well plate navigator map (LAS X Navigator style).
 
-    Draws the plate with all wells; shows the current stage position as a
-    marker. Single click selects a well; double-click fires
+    Draws the current labware (round or square wells); shows the stage
+    position as a marker and, during plate calibration, the guided target
+    position. Single click selects a well; double-click fires
     ``on_well_double_click(row, col, plate_x_mm, plate_y_mm)`` where the
     plate coordinates are the well center relative to the A1 center
-    (+x toward column 12, +y toward row H).
+    (+x toward the last column, +y toward the last row).
     """
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.plate_format = WellPlateFormat(num_wells=96)
+        self.labware = None            # LabwareDef overrides plate_format
         self.selected_well: tuple[int, int] | None = None
         self.marker_plate_mm: tuple[float, float] | None = None
+        self.target_plate_mm: tuple[float, float] | None = None  # calibration
         self.on_well_double_click = None  # callable(row, col, x_mm, y_mm)
         self.on_well_selected = None      # callable(row, col, x_mm, y_mm)
         self.bind(pos=self.redraw, size=self.redraw)
+
+    # ----------------------------------------------------- labware access
+
+    def _lw(self):
+        return self.labware if self.labware is not None else self.plate_format
+
+    def _spacing(self) -> tuple[float, float]:
+        lw = self._lw()
+        sx = getattr(lw, 'spacing_x_mm', None)
+        sy = getattr(lw, 'spacing_y_mm', None)
+        if sx is None:
+            sx = sy = lw.well_spacing_mm
+        return sx, sy
+
+    def _well_size(self) -> tuple[float, float]:
+        lw = self._lw()
+        wx = getattr(lw, 'well_size_x_mm', None)
+        wy = getattr(lw, 'well_size_y_mm', None)
+        if wx is None:
+            wx = wy = lw.well_diameter
+        return wx, wy
+
+    def _plate_dims(self) -> tuple[float, float]:
+        lw = self._lw()
+        return (getattr(lw, 'plate_length_mm', WellPlateFormat.PLATE_LENGTH_MM),
+                getattr(lw, 'plate_width_mm', WellPlateFormat.PLATE_WIDTH_MM))
+
+    def set_labware(self, labware):
+        self.labware = labware
+        self.selected_well = None
+        self.redraw()
 
     # ------------------------------------------------------------ mapping
 
@@ -229,9 +263,10 @@ class WellPlateMapWidget(Widget):
         """(x, y, w, h) of the plate outline inside the widget, keeping the
         physical aspect ratio."""
         pad = 8.0
+        pl, pw = self._plate_dims()
         avail_w = max(self.width - 2 * pad, 10.0)
         avail_h = max(self.height - 2 * pad, 10.0)
-        aspect = WellPlateFormat.PLATE_LENGTH_MM / WellPlateFormat.PLATE_WIDTH_MM
+        aspect = pl / pw
         if avail_w / avail_h > aspect:
             h = avail_h
             w = h * aspect
@@ -245,45 +280,58 @@ class WellPlateMapWidget(Widget):
     def _mm_to_screen(self, mm_x: float, mm_y: float) -> tuple[float, float]:
         """Plate mm (origin = plate top-left corner, +y down) -> screen."""
         x, y, w, h = self._plate_draw_rect()
-        sx = x + (mm_x / WellPlateFormat.PLATE_LENGTH_MM) * w
-        sy = y + h - (mm_y / WellPlateFormat.PLATE_WIDTH_MM) * h
+        pl, pw = self._plate_dims()
+        sx = x + (mm_x / pl) * w
+        sy = y + h - (mm_y / pw) * h
         return sx, sy
 
     def _screen_to_mm(self, sx: float, sy: float) -> tuple[float, float]:
         x, y, w, h = self._plate_draw_rect()
-        mm_x = (sx - x) / w * WellPlateFormat.PLATE_LENGTH_MM
-        mm_y = (y + h - sy) / h * WellPlateFormat.PLATE_WIDTH_MM
+        pl, pw = self._plate_dims()
+        mm_x = (sx - x) / w * pl
+        mm_y = (y + h - sy) / h * pw
         return mm_x, mm_y
 
     def _well_center_mm(self, row: int, col: int) -> tuple[float, float]:
-        pf = self.plate_format
-        return (pf.a1_offset_x + col * pf.well_spacing_mm,
-                pf.a1_offset_y + row * pf.well_spacing_mm)
+        lw = self._lw()
+        sx, sy = self._spacing()
+        return (lw.a1_offset_x + col * sx, lw.a1_offset_y + row * sy)
 
     def _nearest_well(self, mm_x: float, mm_y: float) -> tuple[int, int] | None:
-        pf = self.plate_format
-        col = round((mm_x - pf.a1_offset_x) / pf.well_spacing_mm)
-        row = round((mm_y - pf.a1_offset_y) / pf.well_spacing_mm)
-        if 0 <= row < pf.rows and 0 <= col < pf.cols:
+        lw = self._lw()
+        sx, sy = self._spacing()
+        col = round((mm_x - lw.a1_offset_x) / sx) if sx > 0 else 0
+        row = round((mm_y - lw.a1_offset_y) / sy) if sy > 0 else 0
+        if 0 <= row < lw.rows and 0 <= col < lw.cols:
             wx, wy = self._well_center_mm(row, col)
-            if math.hypot(mm_x - wx, mm_y - wy) <= pf.well_spacing_mm * 0.75:
+            lim = max(sx, sy) * 0.75
+            if math.hypot(mm_x - wx, mm_y - wy) <= lim:
                 return row, col
         return None
 
     def set_marker_plate_mm(self, x_mm_from_a1: float, y_mm_from_a1: float):
         """Place the stage-position marker (coords relative to A1 center)."""
-        pf = self.plate_format
-        self.marker_plate_mm = (pf.a1_offset_x + x_mm_from_a1,
-                                pf.a1_offset_y + y_mm_from_a1)
+        lw = self._lw()
+        self.marker_plate_mm = (lw.a1_offset_x + x_mm_from_a1,
+                                lw.a1_offset_y + y_mm_from_a1)
+        self.redraw()
+
+    def set_target_plate_mm(self, plate_mm: tuple[float, float] | None):
+        """Show/clear the guided calibration target (plate top-left origin)."""
+        self.target_plate_mm = plate_mm
         self.redraw()
 
     # ------------------------------------------------------------- drawing
 
     def redraw(self, *args):
         self.canvas.clear()
-        pf = self.plate_format
+        lw = self._lw()
         x, y, w, h = self._plate_draw_rect()
-        well_r = (pf.well_diameter / 2.0) / WellPlateFormat.PLATE_LENGTH_MM * w
+        pl, pw = self._plate_dims()
+        wx_mm, wy_mm = self._well_size()
+        well_rx = (wx_mm / 2.0) / pl * w
+        well_ry = (wy_mm / 2.0) / pw * h
+        shape = getattr(lw, 'shape', 'round')
         with self.canvas:
             # Plate body
             Color(0.13, 0.15, 0.19, 1)
@@ -293,15 +341,20 @@ class WellPlateMapWidget(Widget):
             # A1 corner chamfer marker (top-left)
             Line(points=[x, y + h - 14, x + 14, y + h], width=1.2)
             # Wells
-            for r in range(pf.rows):
-                for c in range(pf.cols):
+            for r in range(lw.rows):
+                for c in range(lw.cols):
                     mmx, mmy = self._well_center_mm(r, c)
                     sx, sy = self._mm_to_screen(mmx, mmy)
                     if self.selected_well == (r, c):
                         Color(0.1, 0.8, 1.0, 1)
                     else:
                         Color(0.35, 0.4, 0.48, 1)
-                    Line(circle=(sx, sy, well_r), width=1.0)
+                    if shape == 'square':
+                        Line(rectangle=(sx - well_rx, sy - well_ry,
+                                        2 * well_rx, 2 * well_ry), width=1.0)
+                    else:
+                        Line(ellipse=(sx - well_rx, sy - well_ry,
+                                      2 * well_rx, 2 * well_ry), width=1.0)
             # Stage position marker
             if self.marker_plate_mm is not None:
                 sx, sy = self._mm_to_screen(*self.marker_plate_mm)
@@ -309,6 +362,15 @@ class WellPlateMapWidget(Widget):
                 Line(points=[sx - 7, sy, sx + 7, sy], width=1.4)
                 Line(points=[sx, sy - 7, sx, sy + 7], width=1.4)
                 Line(circle=(sx, sy, 5), width=1.2)
+            # Calibration target marker
+            if self.target_plate_mm is not None:
+                sx, sy = self._mm_to_screen(*self.target_plate_mm)
+                Color(1.0, 0.35, 0.25, 1)
+                Line(circle=(sx, sy, 8), width=1.6)
+                Line(points=[sx - 12, sy, sx - 4, sy], width=1.6)
+                Line(points=[sx + 4, sy, sx + 12, sy], width=1.6)
+                Line(points=[sx, sy - 12, sx, sy - 4], width=1.6)
+                Line(points=[sx, sy + 4, sx, sy + 12], width=1.6)
 
     # --------------------------------------------------------------- input
 
@@ -320,9 +382,9 @@ class WellPlateMapWidget(Widget):
         if well is None:
             return True
         row, col = well
-        pf = self.plate_format
-        rel_x_mm = col * pf.well_spacing_mm   # relative to A1 center
-        rel_y_mm = row * pf.well_spacing_mm
+        sx, sy = self._spacing()
+        rel_x_mm = col * sx   # relative to A1 center
+        rel_y_mm = row * sy
         self.selected_well = well
         self.redraw()
         if touch.is_double_tap:

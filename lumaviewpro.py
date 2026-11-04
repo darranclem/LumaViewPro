@@ -72,9 +72,10 @@ from kivy.factory import Factory
 
 import plate_navigator
 import acquisition as acq
+import labware_defs
 from acquisition import (CHANNELS, LED_CHANNEL_MAP, ChannelSettings,
                          AutofocusConfig, ScopeHW, FocusSurface,
-                         ShadingCorrector, AcquisitionWorker)
+                         ShadingCorrector, AcquisitionWorker, PlateCalibration)
 
 Factory.register('ZoomPanCameraWidget', cls=plate_navigator.ZoomPanCameraWidget)
 Factory.register('WellPlateMapWidget', cls=plate_navigator.WellPlateMapWidget)
@@ -123,6 +124,13 @@ class LumaViewProApp(App):
     shading_on = BooleanProperty(False)
     surface_info = StringProperty('Surface: no anchor')
     worker_busy = BooleanProperty(False)
+    labware_options = ListProperty(['96-well plate'])
+    labware_name = StringProperty('96-well plate')
+    cal_active = BooleanProperty(False)
+    cal_label = StringProperty('')
+    cal_info = StringProperty('Plate not calibrated')
+    use_surface_on = BooleanProperty(True)
+    use_z_offsets_on = BooleanProperty(True)
 
     # -------------------------------------------------------------- setup
 
@@ -155,6 +163,12 @@ class LumaViewProApp(App):
         self.stage_y_um = 0.0
         self.stage_z_um = 0.0
 
+        # Labware + plate calibration
+        self.labware_lib = labware_defs.LabwareLibrary()
+        self.current_labware = self.labware_lib.get('96-well plate')
+        self.plate_cal: PlateCalibration | None = None   # solved calibration
+        self.cal_wizard: PlateCalibration | None = None  # in-progress wizard
+
         self._load_persisted()
 
     def build(self):
@@ -169,6 +183,10 @@ class LumaViewProApp(App):
         if plate:
             plate.on_well_double_click = self.on_well_double_click
             plate.on_well_selected = self.on_well_selected
+            plate.set_labware(self.current_labware)
+        self.labware_options = self.labware_lib.names()
+        self.labware_name = self.current_labware.name
+        self._refresh_cal_info()
         self._sync_channel_fields()
         self._sync_af_fields()
         Clock.schedule_once(lambda dt: self._start_init_thread(), 0.1)
@@ -298,11 +316,277 @@ class LumaViewProApp(App):
 
     def _update_plate_marker(self):
         plate = self.root.ids.get('plate_map') if self.root else None
-        if plate is None or self.a1_stage_um is None:
+        if plate is None:
             return
-        rel_x_mm = (self.stage_x_um - self.a1_stage_um[0]) * self.plate_sign_x / 1000.0
-        rel_y_mm = (self.stage_y_um - self.a1_stage_um[1]) * self.plate_sign_y / 1000.0
-        plate.set_marker_plate_mm(rel_x_mm, rel_y_mm)
+        rel = self.stage_to_plate_rel(self.stage_x_um, self.stage_y_um)
+        if rel is None:
+            return
+        plate.set_marker_plate_mm(rel[0], rel[1])
+
+    # -------------------------------------------- plate <-> stage transform
+
+    def plate_rel_to_stage(self, rel_x_mm: float,
+                           rel_y_mm: float) -> tuple[float, float] | None:
+        """Plate position relative to the A1 center (mm) -> stage um.
+
+        Uses the full plate calibration (rotation-aware affine) when solved,
+        else the quick 'Set A1 = here' anchor with the flip signs."""
+        if self.plate_cal is not None and self.plate_cal.matrix is not None:
+            lw = self.current_labware
+            return self.plate_cal.plate_mm_to_stage_um(
+                lw.a1_offset_x_mm + rel_x_mm, lw.a1_offset_y_mm + rel_y_mm)
+        if self.a1_stage_um is not None:
+            return (self.a1_stage_um[0] + rel_x_mm * 1000.0 * self.plate_sign_x,
+                    self.a1_stage_um[1] + rel_y_mm * 1000.0 * self.plate_sign_y)
+        return None
+
+    def stage_to_plate_rel(self, x_um: float,
+                           y_um: float) -> tuple[float, float] | None:
+        if self.plate_cal is not None and self.plate_cal.matrix is not None:
+            p = self.plate_cal.stage_um_to_plate_mm(x_um, y_um)
+            if p is None:
+                return None
+            lw = self.current_labware
+            return (p[0] - lw.a1_offset_x_mm, p[1] - lw.a1_offset_y_mm)
+        if self.a1_stage_um is not None:
+            return ((x_um - self.a1_stage_um[0]) * self.plate_sign_x / 1000.0,
+                    (y_um - self.a1_stage_um[1]) * self.plate_sign_y / 1000.0)
+        return None
+
+    # ----------------------------------------------------- labware library
+
+    def select_labware(self, name: str):
+        lw = self.labware_lib.get(name)
+        if lw is None:
+            return
+        self.current_labware = lw
+        self.labware_name = lw.name
+        plate = self.root.ids.get('plate_map') if self.root else None
+        if plate:
+            plate.set_labware(lw)
+        # A calibration belongs to a specific labware/mounting.
+        if self.plate_cal is not None and \
+                getattr(self.plate_cal.labware, 'name', '') != lw.name:
+            self.plate_cal = None
+            self._refresh_cal_info()
+        self._persist()
+
+    def duplicate_labware(self):
+        dup = self.labware_lib.duplicate(self.labware_name)
+        if dup is None:
+            return
+        self.labware_options = self.labware_lib.names()
+        self.select_labware(dup.name)
+        self._set_status(f'Created "{dup.name}" - use Edit to modify it')
+
+    def delete_labware(self):
+        name = self.labware_name
+        if self.labware_lib.get(name) is None or self.labware_lib.get(name).builtin:
+            self._set_status('Built-in labware cannot be deleted')
+            return
+        self.labware_lib.delete(name)
+        self.labware_options = self.labware_lib.names()
+        self.select_labware('96-well plate')
+        self._set_status(f'Deleted "{name}"')
+
+    def open_labware_editor(self):
+        """Edit the selected labware (built-ins are edited as a new copy)."""
+        from kivy.uix.gridlayout import GridLayout
+        from kivy.uix.textinput import TextInput
+        from kivy.uix.button import Button
+        from kivy.uix.spinner import Spinner
+
+        src = self.current_labware
+        grid = GridLayout(cols=2, spacing=4, padding=8)
+        fields = {}
+
+        def add_field(label, value):
+            grid.add_widget(Label(text=label, font_size='12sp'))
+            ti = TextInput(text=str(value), multiline=False, font_size='12sp')
+            grid.add_widget(ti)
+            fields[label] = ti
+
+        suggested = src.name if not src.builtin else f'{src.name} (custom)'
+        add_field('Name', suggested)
+        add_field('Rows', src.rows)
+        add_field('Columns', src.cols)
+        add_field('Spacing X (mm)', src.spacing_x_mm)
+        add_field('Spacing Y (mm)', src.spacing_y_mm)
+        add_field('Well size X (mm)', src.well_size_x_mm)
+        add_field('Well size Y (mm)', src.well_size_y_mm)
+        add_field('A1 offset X (mm)', src.a1_offset_x_mm)
+        add_field('A1 offset Y (mm)', src.a1_offset_y_mm)
+        add_field('Plate length (mm)', src.plate_length_mm)
+        add_field('Plate width (mm)', src.plate_width_mm)
+        grid.add_widget(Label(text='Well shape', font_size='12sp'))
+        shape_spin = Spinner(text=src.shape, values=['round', 'square'],
+                             font_size='12sp')
+        grid.add_widget(shape_spin)
+
+        box = BoxLayout(orientation='vertical', spacing=6, padding=6)
+        box.add_widget(grid)
+        btns = BoxLayout(size_hint_y=None, height='36dp', spacing=6)
+        save_btn = Button(text='Save')
+        cancel_btn = Button(text='Cancel')
+        btns.add_widget(save_btn)
+        btns.add_widget(cancel_btn)
+        box.add_widget(btns)
+        popup = Popup(title='Labware designer', content=box,
+                      size_hint=(None, None), size=('420dp', '560dp'))
+
+        def _save(*_):
+            try:
+                d = labware_defs.LabwareDef(
+                    name=fields['Name'].text.strip() or suggested,
+                    rows=int(float(fields['Rows'].text)),
+                    cols=int(float(fields['Columns'].text)),
+                    spacing_x_mm=float(fields['Spacing X (mm)'].text),
+                    spacing_y_mm=float(fields['Spacing Y (mm)'].text),
+                    well_size_x_mm=float(fields['Well size X (mm)'].text),
+                    well_size_y_mm=float(fields['Well size Y (mm)'].text),
+                    shape=shape_spin.text,
+                    a1_offset_x_mm=float(fields['A1 offset X (mm)'].text),
+                    a1_offset_y_mm=float(fields['A1 offset Y (mm)'].text),
+                    plate_length_mm=float(fields['Plate length (mm)'].text),
+                    plate_width_mm=float(fields['Plate width (mm)'].text),
+                )
+            except ValueError:
+                self._set_status('Labware editor: invalid number in a field')
+                return
+            self.labware_lib.save(d)
+            self.labware_options = self.labware_lib.names()
+            self.select_labware(d.name)
+            popup.dismiss()
+            self._set_status(f'Saved labware "{d.name}"')
+
+        save_btn.bind(on_press=_save)
+        cancel_btn.bind(on_press=popup.dismiss)
+        popup.open()
+
+    # ----------------------------------------------- plate calibration wizard
+
+    def cal_start(self):
+        """Begin the guided LAS X-style plate calibration."""
+        if not self.stage_connected:
+            self._set_status('Calibration needs the stage')
+            return
+        self.cal_wizard = PlateCalibration(self.current_labware)
+        self.cal_active = True
+        self._cal_show_current(move=False)
+        self._set_status('Calibration: drive the FOV center to the marked '
+                         'position, then press Mark')
+
+    def _cal_show_current(self, move: bool = True):
+        wiz = self.cal_wizard
+        if wiz is None:
+            return
+        t = wiz.current
+        n = len(wiz.targets)
+        done = '*' if t.marked_stage_um is not None else ''
+        self.cal_label = f'[{wiz.index + 1}/{n}] {t.label} {done}'
+        plate = self.root.ids.get('plate_map') if self.root else None
+        if plate:
+            plate.set_target_plate_mm(t.plate_mm)
+        if move:
+            est = wiz.estimate_stage_for(
+                t, self.plate_rel_to_stage
+                if (self.plate_cal or self.a1_stage_um) else None)
+            if est is not None:
+                self._bg(self.hw.move_xy, est[0], est[1])
+
+    def cal_mark(self):
+        """Record the current stage position for the shown target and
+        advance to the next one."""
+        wiz = self.cal_wizard
+        if wiz is None:
+            return
+        wiz.mark_current(self.stage_x_um, self.stage_y_um)
+        self._set_status(f'Marked {wiz.current.label}')
+        if wiz.index == 3:
+            # All four A1 edges marked: provisional solve enables
+            # auto-driving to the two long-range targets.
+            wiz.provisional_solve()
+        if wiz.complete:
+            self.cal_finish()
+            return
+        if wiz.next():
+            self._cal_show_current(move=True)
+
+    def cal_next(self):
+        if self.cal_wizard and self.cal_wizard.next():
+            self._cal_show_current(move=True)
+
+    def cal_prev(self):
+        if self.cal_wizard and self.cal_wizard.prev():
+            self._cal_show_current(move=True)
+
+    def cal_cancel(self):
+        self.cal_wizard = None
+        self.cal_active = False
+        self.cal_label = ''
+        plate = self.root.ids.get('plate_map') if self.root else None
+        if plate:
+            plate.set_target_plate_mm(None)
+        self._set_status('Calibration canceled')
+
+    def cal_finish(self):
+        wiz = self.cal_wizard
+        if wiz is None:
+            return
+        if not wiz.complete:
+            self._set_status('Calibration: not all positions are marked yet')
+            return
+        if not wiz.solve():
+            self._set_status('Calibration solve FAILED - review the marks')
+            return
+        self.plate_cal = wiz
+        self.cal_wizard = None
+        self.cal_active = False
+        self.cal_label = ''
+        plate = self.root.ids.get('plate_map') if self.root else None
+        if plate:
+            plate.set_target_plate_mm(None)
+        self._refresh_cal_info()
+        self._persist()
+        self._update_plate_marker()
+        self._set_status('Plate calibrated: ' + self.cal_info)
+
+    def _refresh_cal_info(self):
+        c = self.plate_cal
+        if c is None or c.matrix is None:
+            self.cal_info = 'Plate not calibrated'
+            return
+        parts = []
+        if c.measured_well_diameter_mm is not None:
+            parts.append(f'well {c.measured_well_diameter_mm:.2f} mm')
+        if c.measured_spacing_x_mm is not None:
+            parts.append(f'pitch X {c.measured_spacing_x_mm:.2f} mm')
+        if c.measured_spacing_y_mm is not None:
+            parts.append(f'pitch Y {c.measured_spacing_y_mm:.2f} mm')
+        if c.rotation_deg is not None:
+            parts.append(f'rot {c.rotation_deg:+.2f} deg')
+        self.cal_info = 'Calibrated: ' + ', '.join(parts)
+
+    def cal_save_measured_labware(self):
+        """Store the measured geometry as a custom copy of the labware."""
+        c = self.plate_cal
+        if c is None or c.matrix is None:
+            self._set_status('Calibrate the plate first')
+            return
+        import dataclasses
+        src = self.current_labware
+        d = dataclasses.replace(
+            src,
+            name=f'{src.name} (measured)',
+            builtin=False,
+            spacing_x_mm=c.measured_spacing_x_mm or src.spacing_x_mm,
+            spacing_y_mm=c.measured_spacing_y_mm or src.spacing_y_mm,
+            well_size_x_mm=c.measured_well_diameter_mm or src.well_size_x_mm,
+            well_size_y_mm=c.measured_well_diameter_mm or src.well_size_y_mm,
+        )
+        self.labware_lib.save(d)
+        self.labware_options = self.labware_lib.names()
+        self._set_status(f'Saved measured geometry as "{d.name}"')
 
     # --------------------------------------------------------- bg helper
 
@@ -355,6 +639,7 @@ class LumaViewProApp(App):
         zstack_chk = ids.get('zstack_enabled_chk')
         if zstack_chk is not None:
             zstack_chk.active = cs.zstack.enabled
+        self._sync_channel_sliders()
 
     @staticmethod
     def _f(widget_text, fallback):
@@ -399,6 +684,55 @@ class LumaViewProApp(App):
         self._sync_channel_fields()
         self._bg(self.hw.set_channel, channel, self._cs(channel))
         self._set_status(f'Live: {channel}')
+
+    def cycle_channel(self):
+        """Single-toggle channel skip: advance live view to the next channel
+        (wraps around; OFF -> first channel)."""
+        if self.live_channel in CHANNELS:
+            idx = (CHANNELS.index(self.live_channel) + 1) % len(CHANNELS)
+        else:
+            idx = 0
+        self.set_live(CHANNELS[idx])
+
+    # -------- sliders: sync with the text fields, debounce live apply
+
+    def slider_changed(self, kind: str, value: float):
+        if not self.root:
+            return
+        ids = self.root.ids
+        cs = self._cs()
+        if kind == 'exposure':
+            cs.exposure_ms = float(value)
+            ids.exposure_input.text = f'{cs.exposure_ms:.1f}'
+        elif kind == 'gain':
+            cs.gain_db = float(value)
+            ids.gain_input.text = f'{cs.gain_db:.1f}'
+        elif kind == 'led':
+            cs.led_power = int(value)
+            ids.led_input.text = f'{cs.led_power}'
+        if self.live_channel == self.selected_channel:
+            self._live_apply_debounced()
+
+    def _live_apply_debounced(self):
+        if not hasattr(self, '_apply_trigger'):
+            def _do(dt):
+                ch = self.selected_channel
+                if self.live_channel == ch and not self.worker_busy:
+                    self._bg(self.hw.set_channel, ch, self._cs(ch))
+            self._apply_trigger = Clock.create_trigger(_do, 0.25)
+        self._apply_trigger()
+
+    def _sync_channel_sliders(self):
+        if not self.root:
+            return
+        ids = self.root.ids
+        cs = self._cs()
+        for key, val in (('exposure_slider', min(cs.exposure_ms, 1000.0)),
+                         ('gain_slider', min(cs.gain_db, 48.0)),
+                         ('led_slider', min(cs.led_power, 600))):
+            w = ids.get(key)
+            if w is not None:
+                w.value = float(val)
 
     # ---------------------------------------------------- camera controls
 
@@ -488,27 +822,29 @@ class LumaViewProApp(App):
                          f'Y={self.stage_y_um / 1000:.2f} mm')
 
     def on_well_selected(self, row: int, col: int, rel_x_mm: float, rel_y_mm: float):
-        name = self.root.ids.plate_map.plate_format.get_well_name(row, col)
+        name = self.current_labware.get_well_name(row, col)
         self.selected_well_str = name
 
     def on_well_double_click(self, row: int, col: int, rel_x_mm: float, rel_y_mm: float):
         """Double-click on the plate navigator: move stage to that well."""
-        name = self.root.ids.plate_map.plate_format.get_well_name(row, col)
+        lw = self.current_labware
+        name = lw.get_well_name(row, col)
         self.selected_well_str = name
         if not self.stage_connected:
             self._set_status(f'{name}: stage not connected')
             return
-        if self.a1_stage_um is None:
-            self._set_status('Set A1 position first (move to A1, press "Set A1 = here")')
+        target = self.plate_rel_to_stage(rel_x_mm, rel_y_mm)
+        if target is None:
+            self._set_status('Calibrate the plate first (or "Set A1 = here")')
             return
-        tx = self.a1_stage_um[0] + rel_x_mm * 1000.0 * self.plate_sign_x
-        ty = self.a1_stage_um[1] + rel_y_mm * 1000.0 * self.plate_sign_y
+        tx, ty = target
         self._set_status(f'Moving to {name}...')
         def _move():
             self.hw.move_xy(tx, ty)
-            z = self.surface.z_at(tx, ty)
-            if z is not None:
-                self.hw.move_z(z)
+            if self.use_surface_on:
+                z = self.surface.z_at(tx, ty)
+                if z is not None:
+                    self.hw.move_z(z)
             self._set_status(f'At {name}')
         self._bg(_move)
 
@@ -710,12 +1046,14 @@ class LumaViewProApp(App):
             positions = acq.tile_positions_grid(cx, cy, fov_x, fov_y,
                                                 rows, cols, overlap_pct=overlap)
         out_dir = acq.timestamp_dir(CAPTURES_DIR, f'tiles_{pattern}')
+        use_surface = self.use_surface_on and self.surface.current_z is not None
         def _job():
             acq.run_tile_scan(self.hw, positions, self.channel_settings,
-                              self.surface if self.surface.current_z is not None else None,
+                              self.surface if use_surface else None,
                               self.shading if self.shading_on else None,
                               self.effective_um_per_px(), out_dir,
-                              self.worker.cancel, status_cb=self._set_status)
+                              self.worker.cancel, status_cb=self._set_status,
+                              use_channel_z_offsets=self.use_z_offsets_on)
             Clock.schedule_once(lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
         self._bg(_job, busy_job=True)
 
@@ -732,7 +1070,9 @@ class LumaViewProApp(App):
         if not channels:
             self._set_status('No channels enabled for z-stack')
             return
-        center_z = self.surface.z_at(self.stage_x_um, self.stage_y_um)
+        center_z = None
+        if self.use_surface_on:
+            center_z = self.surface.z_at(self.stage_x_um, self.stage_y_um)
         if center_z is None:
             center_z = self.stage_z_um
         out_dir = acq.timestamp_dir(CAPTURES_DIR, 'zstack')
@@ -740,7 +1080,8 @@ class LumaViewProApp(App):
             acq.run_z_stack(self.hw, self.channel_settings, channels,
                             center_z, self.shading if self.shading_on else None,
                             out_dir, self.worker.cancel,
-                            status_cb=self._set_status)
+                            status_cb=self._set_status,
+                            use_channel_z_offsets=self.use_z_offsets_on)
             Clock.schedule_once(lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
         self._bg(_job, busy_job=True)
 
@@ -762,6 +1103,10 @@ class LumaViewProApp(App):
                 'channel': self.af_config.channel,
             },
             'surface': self.surface.to_dict(),
+            'labware_name': self.labware_name,
+            'plate_cal': self.plate_cal.to_dict() if self.plate_cal else None,
+            'use_surface_on': self.use_surface_on,
+            'use_z_offsets_on': self.use_z_offsets_on,
         }
         try:
             acq.save_settings(payload)
@@ -791,6 +1136,17 @@ class LumaViewProApp(App):
                 channel=af.get('channel', 'BF'))
             if d.get('surface'):
                 self.surface.from_dict(d['surface'])
+            lw_name = d.get('labware_name')
+            if lw_name and self.labware_lib.get(lw_name) is not None:
+                self.current_labware = self.labware_lib.get(lw_name)
+            cal = d.get('plate_cal')
+            if cal and cal.get('matrix') and \
+                    cal.get('labware_name') == self.current_labware.name:
+                pc = PlateCalibration(self.current_labware)
+                pc.from_dict(cal)
+                self.plate_cal = pc
+            self.use_surface_on = bool(d.get('use_surface_on', True))
+            self.use_z_offsets_on = bool(d.get('use_z_offsets_on', True))
         except Exception:
             pass
         self.shading.load_all()
