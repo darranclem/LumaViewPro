@@ -65,7 +65,7 @@ class ZoomPanCameraWidget(Image):
         tex.flip_vertical()
         self.texture = tex
 
-    def update_frame_texture(self, frame_np: np.ndarray):
+    def update_frame_texture(self, frame_np: np.ndarray, tint=None):
         if frame_np is None or not isinstance(frame_np, np.ndarray) or frame_np.size == 0:
             return
 
@@ -80,7 +80,23 @@ class ZoomPanCameraWidget(Image):
                 frame_8u = np.clip(frame_np, 0, 255).astype(np.uint8)
 
             if len(frame_8u.shape) == 2:
-                frame_rgb = np.stack([frame_8u] * 3, axis=-1)
+                # Apply the channel LUT tint (RGB weights 0..1). Weights of
+                # 0/1 are the common case (grayscale, cyan, green, red,
+                # magenta) and need no float math.
+                if tint is None:
+                    tint = (1.0, 1.0, 1.0)
+                zeros = None
+                chans = []
+                for weight in tint[:3]:
+                    if weight >= 0.999:
+                        chans.append(frame_8u)
+                    elif weight <= 0.001:
+                        if zeros is None:
+                            zeros = np.zeros_like(frame_8u)
+                        chans.append(zeros)
+                    else:
+                        chans.append((frame_8u.astype(np.float32) * weight).astype(np.uint8))
+                frame_rgb = np.stack(chans, axis=-1)
             else:
                 frame_rgb = frame_8u
 

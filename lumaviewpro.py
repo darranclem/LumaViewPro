@@ -67,6 +67,21 @@ import plate_navigator
 # Wire command format: 'LED{channel}_{value}' / 'LED{channel}_OFF' / 'LEDS_OFF'
 LED_CHANNEL_MAP = {'BLUE': 0, 'GREEN': 1, 'RED': 2, 'BF': 3, 'PC': 4, 'DF': 5}
 
+# Display LUTs: (R, G, B) tint applied to the mono camera image per channel.
+# Fluorescence channels get false color matched to their emission band;
+# transmitted channels (BF/PC/DF) stay grayscale. 'LONG' is reserved for a
+# longer excitation/detection channel (shown magenta) if such hardware is
+# fitted -- standard Etaluma LED boards do not have one.
+CHANNEL_LUTS = {
+    'BF': (1.0, 1.0, 1.0),
+    'PC': (1.0, 1.0, 1.0),
+    'DF': (1.0, 1.0, 1.0),
+    'BLUE': (0.0, 1.0, 1.0),   # ~420 nm emission -> cyan
+    'GREEN': (0.0, 1.0, 0.0),  # 500 nm+ -> green
+    'RED': (1.0, 0.0, 0.0),    # 560-650 nm -> red
+    'LONG': (1.0, 0.0, 1.0),   # longer ex/em (if fitted) -> magenta
+}
+
 
 class LumaViewProMainLayout(BoxLayout):
     pass
@@ -259,7 +274,8 @@ class LumaViewProApp(App):
                 try:
                     viewport = self.root_widget.ids.get('main_camera_viewport')
                     if viewport:
-                        viewport.update_frame_texture(frame_arr)
+                        tint = CHANNEL_LUTS.get(self.active_channel_name, (1.0, 1.0, 1.0))
+                        viewport.update_frame_texture(frame_arr, tint=tint)
                 except Exception as e:
                     print(f'[LumaViewPro] Viewport update error: {e}', flush=True)
 
