@@ -136,6 +136,7 @@ class LumaViewProApp(App):
     cal_info = StringProperty('Plate not calibrated')
     use_surface_on = BooleanProperty(True)
     use_z_offsets_on = BooleanProperty(True)
+    xy_step_um = NumericProperty(100.0)
     af_each_cycle_on = BooleanProperty(True)
     output_dir = StringProperty(CAPTURES_DIR)
     positions_info = StringProperty('No positions defined')
@@ -215,6 +216,30 @@ class LumaViewProApp(App):
         Clock.schedule_once(lambda dt: self._start_init_thread(), 0.1)
         Clock.schedule_interval(self.update_live_feed, 1.0 / 30.0)
         threading.Thread(target=self._position_poller, daemon=True).start()
+        from kivy.core.window import Window
+        Window.bind(on_key_down=self._on_key_down)
+
+    def _text_input_focused(self) -> bool:
+        if not self.root:
+            return False
+        return any(getattr(w, 'focus', False) for w in self.root.walk())
+
+    def _on_key_down(self, window, key, scancode, codepoint, modifiers):
+        """Keyboard nudge: arrows = XY jog by the step size (Shift = 10x);
+        PgUp/PgDn = Z +/-10 um (Shift = 100 um)."""
+        if self._text_input_focused():
+            return False
+        mult = 10.0 if 'shift' in (modifiers or []) else 1.0
+        s = self.xy_step_um * mult
+        if key == 276:    self.jog('X', -s)
+        elif key == 275:  self.jog('X', s)
+        elif key == 273:  self.jog('Y', s)
+        elif key == 274:  self.jog('Y', -s)
+        elif key == 280:  self.jog('Z', 10.0 * mult)
+        elif key == 281:  self.jog('Z', -10.0 * mult)
+        else:
+            return False
+        return True
 
     # --------------------------------------------------- hardware startup
 

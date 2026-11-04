@@ -718,6 +718,43 @@ LumaViewProMainLayout:
                     size_hint_y: None
                     height: '22dp'
                 GridLayout:
+                    cols: 6
+                    spacing: '2dp'
+                    size_hint_y: None
+                    height: '24dp'
+                    FlatButton:
+                        text: '10'
+                        height: '24dp'
+                        background_color: ACCENT if app.xy_step_um == 10 else PANEL2
+                        on_press: app.xy_step_um = 10
+                    FlatButton:
+                        text: '50'
+                        height: '24dp'
+                        background_color: ACCENT if app.xy_step_um == 50 else PANEL2
+                        on_press: app.xy_step_um = 50
+                    FlatButton:
+                        text: '100'
+                        height: '24dp'
+                        background_color: ACCENT if app.xy_step_um == 100 else PANEL2
+                        on_press: app.xy_step_um = 100
+                    FlatButton:
+                        text: '500'
+                        height: '24dp'
+                        background_color: ACCENT if app.xy_step_um == 500 else PANEL2
+                        on_press: app.xy_step_um = 500
+                    FlatButton:
+                        text: '1k'
+                        height: '24dp'
+                        background_color: ACCENT if app.xy_step_um == 1000 else PANEL2
+                        on_press: app.xy_step_um = 1000
+                    FlatButton:
+                        text: '5k'
+                        height: '24dp'
+                        background_color: ACCENT if app.xy_step_um == 5000 else PANEL2
+                        on_press: app.xy_step_um = 5000
+                PanelLabel:
+                    text: 'XY step (um) - arrow keys also jog, Shift = 10x'
+                GridLayout:
                     cols: 3
                     spacing: '3dp'
                     size_hint_y: None
@@ -725,21 +762,21 @@ LumaViewProMainLayout:
                     Widget:
                     FlatButton:
                         text: 'Y +'
-                        on_press: app.jog('Y', 1000)
+                        on_press: app.jog('Y', app.xy_step_um)
                     Widget:
                     FlatButton:
                         text: 'X -'
-                        on_press: app.jog('X', -1000)
+                        on_press: app.jog('X', -app.xy_step_um)
                     FlatButton:
                         text: 'Center'
                         on_press: app.goto_center()
                     FlatButton:
                         text: 'X +'
-                        on_press: app.jog('X', 1000)
+                        on_press: app.jog('X', app.xy_step_um)
                     Widget:
                     FlatButton:
                         text: 'Y -'
-                        on_press: app.jog('Y', -1000)
+                        on_press: app.jog('Y', -app.xy_step_um)
                     Widget:
                 GridLayout:
                     cols: 4
