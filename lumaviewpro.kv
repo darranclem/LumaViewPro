@@ -47,249 +47,215 @@
         orientation: 'horizontal'
         spacing: '8dp'
 
-        BoxLayout:
-            orientation: 'horizontal'
-            size_hint_x: 0.62
-            spacing: '4dp'
-
-            ZoomPanCameraWidget:
-                id: main_camera_viewport
-                size_hint_x: 0.82
-
-            BoxLayout:
-                orientation: 'vertical'
-                size_hint_x: 0.18
-                padding: '4dp'
-                spacing: '3dp'
-                canvas.before:
-                    Color:
-                        rgba: 0.15, 0.17, 0.22, 1.0
-                    Rectangle:
-                        pos: self.pos
-                        size: self.size
-
-                Label:
-                    text: "Z Focus"
-                    font_size: '12sp'
-                    bold: True
-                    size_hint_y: None
-                    height: '18dp'
-                    color: 0.2, 0.8, 1.0, 1.0
-
-                Button:
-                    text: 'Z ++'
-                    size_hint_y: None
-                    height: '24dp'
-                    font_size: '11sp'
-                    on_press: app.jog_z(100)
-
-                Button:
-                    text: 'Z +'
-                    size_hint_y: None
-                    height: '22dp'
-                    font_size: '11sp'
-                    on_press: app.jog_z(10)
-
-                Button:
-                    text: 'z +'
-                    size_hint_y: None
-                    height: '20dp'
-                    font_size: '10sp'
-                    on_press: app.jog_z(1)
-
-                Slider:
-                    id: z_focus_slider
-                    orientation: 'vertical'
-                    min: -10.0
-                    max: 10.0
-                    value: app.stage_z
-                    on_value: app.set_z_focus_absolute(self.value)
-
-                Button:
-                    text: 'z -'
-                    size_hint_y: None
-                    height: '20dp'
-                    font_size: '10sp'
-                    on_press: app.jog_z(-1)
-
-                Button:
-                    text: 'Z -'
-                    size_hint_y: None
-                    height: '22dp'
-                    font_size: '11sp'
-                    on_press: app.jog_z(-10)
-
-                Button:
-                    text: 'Z --'
-                    size_hint_y: None
-                    height: '24dp'
-                    font_size: '11sp'
-                    on_press: app.jog_z(-100)
-
-                Button:
-                    text: 'Zero'
-                    size_hint_y: None
-                    height: '22dp'
-                    font_size: '11sp'
-                    on_press: app.zero_z_baseline()
+        ZoomPanCameraWidget:
+            id: main_camera_viewport
+            size_hint_x: 0.65
 
         BoxLayout:
             orientation: 'vertical'
-            size_hint_x: 0.38
-            spacing: '6dp'
+            size_hint_x: 0.12
+            spacing: '4dp'
+            padding: '4dp'
+            canvas.before:
+                Color:
+                    rgba: 0.14, 0.16, 0.20, 1.0
+                Rectangle:
+                    pos: self.pos
+                    size: self.size
 
-            InteractiveScaledPlateCanvas:
-                id: main_plate_canvas
-                size_hint_y: 0.42
+            Label:
+                text: "Z Focus"
+                font_size: '13sp'
+                bold: True
+                size_hint_y: None
+                height: '20dp'
+                color: 0.3, 0.8, 1.0, 1.0
+
+            Button:
+                text: 'Z ++'
+                size_hint_y: None
+                height: '28dp'
+                on_press: app.jog_z_rel(100.0)
+
+            Button:
+                text: 'Z +'
+                size_hint_y: None
+                height: '28dp'
+                on_press: app.jog_z_rel(10.0)
+
+            Button:
+                text: 'z +'
+                size_hint_y: None
+                height: '26dp'
+                on_press: app.jog_z_rel(1.0)
+
+            Slider:
+                orientation: 'vertical'
+                min: -10.0
+                max: 10.0
+                value: app.stage_z
+                on_value: app.set_z_focus_absolute(self.value)
+
+            Button:
+                text: 'z -'
+                size_hint_y: None
+                height: '26dp'
+                on_press: app.jog_z_rel(-1.0)
+
+            Button:
+                text: 'Z -'
+                size_hint_y: None
+                height: '28dp'
+                on_press: app.jog_z_rel(-10.0)
+
+            Button:
+                text: 'Z --'
+                size_hint_y: None
+                height: '28dp'
+                on_press: app.jog_z_rel(-100.0)
+
+            Button:
+                text: 'Zero Z'
+                size_hint_y: None
+                height: '28dp'
+                on_press: app.reset_z_baseline()
+
+        BoxLayout:
+            orientation: 'vertical'
+            size_hint_x: 0.23
+            spacing: '6dp'
+            padding: '6dp'
+            canvas.before:
+                Color:
+                    rgba: 0.15, 0.17, 0.22, 1.0
+                Rectangle:
+                    pos: self.pos
+                    size: self.size
+
+            Label:
+                text: "Camera & Illumination"
+                font_size: '14sp'
+                bold: True
+                size_hint_y: None
+                height: '20dp'
+                color: 0.3, 0.8, 1.0, 1.0
 
             BoxLayout:
-                orientation: 'vertical'
-                size_hint_y: 0.58
+                size_hint_y: None
+                height: '28dp'
+                spacing: '6dp'
+                Label:
+                    text: "Exp: " + str(round(app.camera_exposure_ms, 1)) + "ms"
+                    size_hint_x: 0.45
+                    font_size: '12sp'
+                Slider:
+                    min: 0.1
+                    max: 200.0
+                    value: app.camera_exposure_ms
+                    on_value: app.set_camera_exposure(self.value)
+                    size_hint_x: 0.55
+
+            BoxLayout:
+                size_hint_y: None
+                height: '28dp'
+                spacing: '6dp'
+                Label:
+                    text: "LED: " + str(int(app.led_power_pct)) + "%"
+                    size_hint_x: 0.45
+                    font_size: '12sp'
+                Slider:
+                    min: 0
+                    max: 100
+                    value: app.led_power_pct
+                    on_value: app.set_led_power(self.value)
+                    size_hint_x: 0.55
+
+            GridLayout:
+                cols: 3
                 spacing: '4dp'
-                padding: '6dp'
-                canvas.before:
-                    Color:
-                        rgba: 0.15, 0.17, 0.22, 1.0
-                    Rectangle:
-                        pos: self.pos
-                        size: self.size
+                size_hint_y: None
+                height: '30dp'
+                Button:
+                    text: 'Gain'
+                    on_press: app.toggle_auto_gain()
+                Button:
+                    text: 'Exp'
+                    on_press: app.toggle_auto_exposure()
+                Button:
+                    text: 'Diag'
+                    on_press: app.run_hardware_stream_diagnostic()
 
-                Label:
-                    text: "Camera Stream & Illumination Controls"
-                    font_size: '14sp'
-                    bold: True
-                    size_hint_y: None
-                    height: '20dp'
-                    color: 0.3, 0.8, 1.0, 1.0
+            Label:
+                text: "Optical Illumination Channels"
+                font_size: '14sp'
+                bold: True
+                size_hint_y: None
+                height: '20dp'
+                color: 0.3, 0.8, 1.0, 1.0
 
-                BoxLayout:
-                    size_hint_y: None
-                    height: '28dp'
-                    spacing: '6dp'
-                    Label:
-                        text: "Exposure (ms): " + str(round(app.camera_exposure_ms, 1))
-                        size_hint_x: 0.40
-                        font_size: '12sp'
-                    Slider:
-                        min: 0.1
-                        max: 200.0
-                        value: app.camera_exposure_ms
-                        on_value: app.set_camera_exposure(self.value)
-                        size_hint_x: 0.60
+            GridLayout:
+                cols: 2
+                spacing: '3dp'
+                size_hint_y: None
+                height: '110dp'
+                Button:
+                    text: 'Brightfield (White)'
+                    on_press: app.set_active_channel('BF')
+                Button:
+                    text: 'Phase (PC)'
+                    on_press: app.set_active_channel('PC')
+                Button:
+                    text: 'Darkfield (DF)'
+                    on_press: app.set_active_channel('DF')
+                Button:
+                    text: 'Violet (405nm)'
+                    on_press: app.set_active_channel('VIOLET')
+                Button:
+                    text: 'Blue (470nm)'
+                    on_press: app.set_active_channel('BLUE')
+                Button:
+                    text: 'Green (530nm)'
+                    on_press: app.set_active_channel('GREEN')
+                Button:
+                    text: 'Red (625nm)'
+                    on_press: app.set_active_channel('RED')
+                Button:
+                    text: 'ALL LEDs OFF'
+                    background_color: (0.8, 0.2, 0.2, 1.0)
+                    on_press: app.turn_off_all_leds()
 
-                BoxLayout:
-                    size_hint_y: None
-                    height: '28dp'
-                    spacing: '6dp'
-                    Label:
-                        text: "LED Power (%): " + str(int(app.led_power_pct))
-                        size_hint_x: 0.40
-                        font_size: '12sp'
-                    Slider:
-                        min: 0
-                        max: 100
-                        value: app.led_power_pct
-                        on_value: app.set_led_power(self.value)
-                        size_hint_x: 0.60
+            Label:
+                text: "XY Stage Jog"
+                font_size: '14sp'
+                bold: True
+                size_hint_y: None
+                height: '20dp'
+                color: 0.3, 0.8, 1.0, 1.0
 
-                GridLayout:
-                    cols: 3
-                    spacing: '4dp'
-                    size_hint_y: None
-                    height: '30dp'
-                    Button:
-                        text: 'Auto Gain: ON' if app.auto_gain_active else 'Auto Gain: OFF'
-                        on_press: app.toggle_auto_gain()
-                    Button:
-                        text: 'Auto Exp: ON' if app.auto_exp_active else 'Auto Exp: OFF'
-                        on_press: app.toggle_auto_exposure()
-                    Button:
-                        text: 'Stream Test'
-                        on_press: app.run_hardware_stream_diagnostic()
+            GridLayout:
+                cols: 3
+                spacing: '4dp'
+                size_hint_y: None
+                height: '70dp'
 
-                Label:
-                    text: "Optical Illumination Channels"
-                    font_size: '14sp'
-                    bold: True
-                    size_hint_y: None
-                    height: '20dp'
-                    color: 0.3, 0.8, 1.0, 1.0
+                Widget:
+                Button:
+                    text: 'Y+'
+                    on_press: app.jog_stage(0, 1)
+                Widget:
 
-                GridLayout:
-                    cols: 4
-                    spacing: '3dp'
-                    size_hint_y: None
-                    height: '56dp'
-                    Button:
-                        text: 'Brightfield'
-                        on_press: app.set_active_channel('BF')
-                    Button:
-                        text: 'Phase (PC)'
-                        on_press: app.set_active_channel('PC')
-                    Button:
-                        text: 'Darkfield (DF)'
-                        on_press: app.set_active_channel('DF')
-                    Button:
-                        text: 'Blue (470)'
-                        on_press: app.set_active_channel('BLUE')
-                    Button:
-                        text: 'Green (530)'
-                        on_press: app.set_active_channel('GREEN')
-                    Button:
-                        text: 'Red (625)'
-                        on_press: app.set_active_channel('RED')
-                    Button:
-                        text: 'Violet (405)'
-                        on_press: app.set_active_channel('VIOLET')
-                    Button:
-                        text: 'LEDs Off'
-                        background_color: (0.8, 0.2, 0.2, 1.0)
-                        on_press: app.turn_off_all_leds()
+                Button:
+                    text: 'X-'
+                    on_press: app.jog_stage(-1, 0)
+                Button:
+                    text: 'Home'
+                    on_press: app.home_stage_and_synchronize()
+                Button:
+                    text: 'X+'
+                    on_press: app.jog_stage(1, 0)
 
-                Label:
-                    text: "Focus Map & Protocol Steps"
-                    font_size: '14sp'
-                    bold: True
-                    size_hint_y: None
-                    height: '20dp'
-                    color: 0.3, 0.8, 1.0, 1.0
-
-                GridLayout:
-                    cols: 2
-                    spacing: '4dp'
-                    size_hint_y: None
-                    height: '32dp'
-                    Button:
-                        text: '+ Add Focus Map Point'
-                        on_press: app.add_current_focus_map_point()
-                    Button:
-                        text: '+ Add AF Step Point'
-                        on_press: app.add_current_autofocus_point()
-
-                GridLayout:
-                    cols: 3
-                    spacing: '4dp'
-                    size_hint_y: None
-                    height: '70dp'
-
-                    Widget:
-                    Button:
-                        text: 'Y+ (Up)'
-                        on_press: app.jog_stage(0, 1)
-                    Widget:
-
-                    Button:
-                        text: 'X- (Left)'
-                        on_press: app.jog_stage(-1, 0)
-                    Button:
-                        text: 'Home Stage'
-                        on_press: app.home_stage_and_synchronize()
-                    Button:
-                        text: 'X+ (Right)'
-                        on_press: app.jog_stage(1, 0)
-
-                    Widget:
-                    Button:
-                        text: 'Y- (Down)'
-                        on_press: app.jog_stage(0, -1)
-                    Widget:
+                Widget:
+                Button:
+                    text: 'Y-'
+                    on_press: app.jog_stage(0, -1)
+                Widget:

@@ -28,6 +28,8 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
 from kivy.uix.button import Button
 from kivy.uix.popup import Popup
+from kivy.factory import Factory
+
 import plate_navigator
 
 
@@ -40,15 +42,14 @@ class LumaViewProApp(App):
     stage_coord_str = StringProperty('Stage: X=0.00, Y=0.00, Z=0.000 mm')
     status_msg = StringProperty('Ready')
 
+    stage_x = NumericProperty(0.0)
+    stage_y = NumericProperty(0.0)
+    stage_z = NumericProperty(0.0)
+
     camera_exposure_ms = NumericProperty(20.0)
     led_power_pct = NumericProperty(100.0)
     auto_gain_active = BooleanProperty(False)
     auto_exp_active = BooleanProperty(False)
-
-    stage_x = NumericProperty(0.0)
-    stage_y = NumericProperty(0.0)
-    stage_z = NumericProperty(0.0)
-    jog_step_mm = NumericProperty(1.0)
 
     active_channel_name = 'BF'
 
@@ -71,6 +72,9 @@ class LumaViewProApp(App):
         return super().load_kv(filename)
 
     def build(self):
+        Factory.register('ZoomPanCameraWidget', cls=plate_navigator.ZoomPanCameraWidget)
+        Factory.register('InteractiveScaledPlateCanvas', cls=plate_navigator.InteractiveScaledPlateCanvas)
+
         self.root_widget = LumaViewProMainLayout()
         plate_navigator.attach_navigator_to_lumaviewpro(self)
 
@@ -81,6 +85,8 @@ class LumaViewProApp(App):
         self.led_connected = False
         self.led_board = None
 
+        self.jog_step_mm = 1.0
+
         Clock.schedule_once(self._start_async_hardware_init, 0.05)
         Clock.schedule_interval(self.update_live_feed, 1.0 / 30.0)
 
@@ -90,7 +96,7 @@ class LumaViewProApp(App):
         threading.Thread(target=self.init_hardware_synchronized, daemon=True).start()
 
     def init_hardware_synchronized(self):
-        Clock.schedule_once(lambda dt: self._set_status('Initializing Camera...'), 0)
+        self.status_msg = 'Initializing Camera...'
         try:
             import pyloncamera
             cam = pyloncamera.PylonCamera()
@@ -118,14 +124,13 @@ class LumaViewProApp(App):
             print('[LumaViewPro] Connected to Basler USB Camera.', flush=True)
 
             self._introspect_camera(cam)
-            threading.Thread(target=self._camera_grab_loop, daemon=True).start()
             self.set_camera_exposure(self.camera_exposure_ms)
         except Exception as e:
             print(f'[LumaViewPro] Camera connection error: {e}', flush=True)
             self.last_cam_err = str(e)
 
         time.sleep(0.3)
-        Clock.schedule_once(lambda dt: self._set_status('Initializing Stage...'), 0)
+        self.status_msg = 'Initializing Stage...'
 
         try:
             import motorboard
@@ -133,13 +138,13 @@ class LumaViewProApp(App):
             stg.connect()
             self.motor_stage = stg
             self.stage_connected = True
-            print('[LumaViewPro] Connected to Stage & Focus Motor Board.', flush=True)
+            print('[LumaViewPro] Connected to Stage Motor Board.', flush=True)
             self.update_stage_coordinates_display()
         except Exception as e:
             print(f'[LumaViewPro] Stage connection error: {e}', flush=True)
 
         time.sleep(0.3)
-        Clock.schedule_once(lambda dt: self._set_status('Initializing LEDs...'), 0)
+        self.status_msg = 'Initializing LEDs...'
 
         try:
             import ledboard
@@ -152,10 +157,7 @@ class LumaViewProApp(App):
         except Exception as e:
             print(f'[LumaViewPro] LED connection error: {e}', flush=True)
 
-        Clock.schedule_once(lambda dt: self._set_status('System Ready'), 0)
-
-    def _set_status(self, msg: str):
-        self.status_msg = msg
+        self.status_msg = 'System Ready'
 
     def _introspect_camera(self, cam):
         print('=== PYLONCAMERA HARDWARE INTROSPECTION PROBE ===', flush=True)
@@ -164,70 +166,49 @@ class LumaViewProApp(App):
             handler = getattr(cam, 'cam_image_handler')
             print(f'Handler Class: {type(handler).__module__}.{type(handler).__name__}', flush=True)
             if hasattr(handler, 'last_img'):
-                img = getattr(handler, 'last_img')
-                shape = getattr(img, 'shape', None)
-                print(f"  [HANDLER ATTR] 'last_img': type={type(img).__name__}, shape={shape}", flush=True)
+                l_img = getattr(handler, 'last_img')
+                l_shape = getattr(l_img, 'shape', None)
+                l_type = type(l_img).__name__
+                print(f"  [HANDLER ATTR] 'last_img': type={l_type}, shape={l_shape}", flush=True)
         print('================================================', flush=True)
 
-    def _camera_grab_loop(self):
-        print('[CAM LOOP] Continuous PyPylon image acquisition thread active...', flush=True)
-        while True:
-            if self.camera_connected and self.camera:
+    def update_live_feed(self, dt: float):
+        if not self.camera_connected or not self.camera:
+            return
+
+        cam = self.camera
+        frame_arr = None
+
+        if hasattr(cam, 'array'):
+            arr = getattr(cam, 'array')
+            if isinstance(arr, np.ndarray) and arr.size > 0:
+                frame_arr = arr
+
+        if frame_arr is None and hasattr(cam, 'cam_image_handler'):
+            handler = getattr(cam, 'cam_image_handler')
+            if hasattr(handler, 'last_img'):
+                arr = getattr(handler, 'last_img')
+                if isinstance(arr, np.ndarray) and arr.size > 0:
+                    frame_arr = arr
+
+        if frame_arr is not None and isinstance(frame_arr, np.ndarray) and frame_arr.size > 0:
+            self.latest_frame = frame_arr
+            self.frame_count += 1
+            now = time.time()
+            if now - self.last_log_time >= 2.0:
+                self.last_log_time = now
+                f_min, f_max = frame_arr.min(), frame_arr.max()
+                f_mean = float(frame_arr.mean())
+                f_std = float(frame_arr.std())
+                print(f'[CAM STREAM LIVE 30FPS] Frame #{self.frame_count}: shape={frame_arr.shape}, dtype={frame_arr.dtype}, min={f_min}, max={f_max}, mean={f_mean:.1f}, std={f_std:.1f}', flush=True)
+
+            if hasattr(self, 'root_widget') and self.root_widget:
                 try:
-                    cam = self.camera
-                    frame = None
-
-                    if hasattr(cam, 'grab_new_capture'):
-                        try:
-                            frame = cam.grab_new_capture(30)
-                        except Exception as e:
-                            self.last_cam_err = f'grab_new_capture err: {e}'
-
-                    if frame is None or (isinstance(frame, np.ndarray) and frame.size == 0):
-                        if hasattr(cam, 'cam_image_handler'):
-                            handler = getattr(cam, 'cam_image_handler')
-                            if hasattr(handler, 'last_img'):
-                                raw = getattr(handler, 'last_img')
-                                if isinstance(raw, np.ndarray) and raw.size > 0:
-                                    frame = raw
-
-                    if frame is None or (isinstance(frame, np.ndarray) and frame.size == 0):
-                        raw_arr = getattr(cam, 'array', None)
-                        if isinstance(raw_arr, np.ndarray) and raw_arr.size > 0:
-                            frame = raw_arr
-
-                    frame_arr = self._extract_numpy_array(frame)
-                    if frame_arr is not None and isinstance(frame_arr, np.ndarray) and frame_arr.size > 0:
-                        self.latest_frame = frame_arr
-                        self.frame_count += 1
-                        now = time.time()
-                        if now - self.last_log_time >= 2.0:
-                            self.last_log_time = now
-                            f_min, f_max = frame_arr.min(), frame_arr.max()
-                            f_mean = float(frame_arr.mean())
-                            f_std = float(frame_arr.std())
-                            print(f'[CAM STREAM ACTIVE] Frame #{self.frame_count}: shape={frame_arr.shape}, dtype={frame_arr.dtype}, min={f_min}, max={f_max}, mean={f_mean:.1f}, std={f_std:.2f}', flush=True)
+                    viewport = self.root_widget.ids.get('main_camera_viewport')
+                    if viewport:
+                        viewport.update_frame_texture(frame_arr)
                 except Exception as e:
-                    self.last_cam_err = f'Grab loop exception: {e}'
-            time.sleep(0.01)
-
-    def _extract_numpy_array(self, obj):
-        if obj is None:
-            return None
-        if isinstance(obj, np.ndarray):
-            return obj if obj.size > 0 else None
-
-        for attr_name in ['Array', 'GetArray', 'array', 'buffer', 'image', 'img', 'frame', 'last_img']:
-            if hasattr(obj, attr_name):
-                try:
-                    val = getattr(obj, attr_name)
-                    if callable(val):
-                        val = val()
-                    if isinstance(val, np.ndarray) and val.size > 0:
-                        return val
-                except Exception:
-                    pass
-        return None
+                    print(f'[LumaViewPro] Viewport update error: {e}', flush=True)
 
     def run_hardware_stream_diagnostic(self):
         diag_lines = []
@@ -235,22 +216,22 @@ class LumaViewProApp(App):
             diag_lines.append('Camera Driver Status: CONNECTED')
             diag_lines.append(f'  Camera Class: {type(self.camera).__name__}')
             diag_lines.append(f'  Last Camera Error: {self.last_cam_err}')
-            diag_lines.append(f'  Total Frames Streamed: {self.frame_count}')
+            diag_lines.append(f'  Total Frames Received: {self.frame_count}')
 
             frame = self.latest_frame
             if frame is not None and isinstance(frame, np.ndarray) and frame.size > 0:
                 diag_lines.append('Live Frame Buffer Stream: ACTIVE')
-                diag_lines.append(f'  Resolution: {frame.shape[1]} x {frame.shape[0]}')
+                diag_lines.append(f'  Resolution: {frame.shape[0]} x {frame.shape[1]}')
                 diag_lines.append(f'  Data Type: {frame.dtype}')
                 diag_lines.append(f'  Pixel Range: min={frame.min()}, max={frame.max()}, mean={frame.mean():.1f}')
             else:
-                diag_lines.append('Live Frame Buffer Stream: INACTIVE (Waiting for USB frames)')
+                diag_lines.append('Live Frame Buffer Stream: INACTIVE (Waiting for first USB frame)')
         else:
             diag_lines.append('Hardware Diagnosis: Camera hardware object not initialized or failed connection.')
 
         content = BoxLayout(orientation='vertical', padding=10, spacing=8)
         content.add_widget(Label(text='Hardware Stream Diagnostic Report', font_size='16sp', bold=True))
-        report_text = '\n'.join(diag_lines)
+        report_text = chr(10).join(diag_lines)
         content.add_widget(Label(text=report_text, font_size='13sp', halign='left', valign='top'))
         close_btn = Button(text='Close Report', size_hint_y=None, height='36dp')
         content.add_widget(close_btn)
@@ -282,20 +263,16 @@ class LumaViewProApp(App):
         def _exec():
             try:
                 ch_map = {
-                    'BF': 4, 'BRIGHTFIELD': 4,
-                    'PC': 5, 'PHASE': 5,
-                    'DF': 6, 'DARKFIELD': 6,
-                    'VIOLET': 3, 'BLUE_FLUOR': 3,
-                    'BLUE': 0, 'GREEN_FLUOR': 0,
-                    'GREEN': 1, 'RED_FLUOR': 1,
-                    'RED': 2, 'FAR_RED_FLUOR': 2
+                    'BF': 4, 'PC': 5, 'DF': 6,
+                    'VIOLET': 3, 'BLUE': 0, 'GREEN': 1, 'RED': 2
                 }
                 ch_num = ch_map.get(self.active_channel_name.upper(), 4)
                 self.led_board.exchange_command('LEDS_ENT')
-                res = self.led_board.exchange_command(f'LED{ch_num}_{int(val_pct)}')
-                print(f'[LED CTRL] Updated active LED {self.active_channel_name} power to {int(val_pct)}%: Response={res}', flush=True)
+                cmd = f'LED{ch_num}_{int(val_pct)}'
+                res = self.led_board.exchange_command(cmd)
+                print(f'[LED CTRL] {cmd} -> {res}', flush=True)
             except Exception as e:
-                print(f'[LED CTRL] Error setting LED power: {e}', flush=True)
+                print(f'[LED CTRL ERROR] {e}', flush=True)
         threading.Thread(target=_exec, daemon=True).start()
 
     def turn_off_all_leds(self):
@@ -305,10 +282,10 @@ class LumaViewProApp(App):
             try:
                 for ch in range(7):
                     self.led_board.exchange_command(f'LED{ch}_OFF')
-                res = self.led_board.exchange_command('LEDS_OFF')
-                print(f'[LED CTRL] All LED channels turned OFF: Response={res}', flush=True)
+                self.led_board.exchange_command('LEDS_OFF')
+                print('[LED CTRL] All LED channels turned OFF.', flush=True)
             except Exception as e:
-                print(f'[LED CTRL] Error turning off LEDs: {e}', flush=True)
+                print(f'[LED CTRL ERROR] {e}', flush=True)
         threading.Thread(target=_exec, daemon=True).start()
 
     def set_active_channel(self, channel_name: str, power_pct: int = None):
@@ -326,83 +303,70 @@ class LumaViewProApp(App):
 
         def _exec():
             try:
+                self.led_board.exchange_command('LEDS_OFF')
                 for ch in range(7):
                     self.led_board.exchange_command(f'LED{ch}_OFF')
 
                 ch_map = {
-                    'BF': 4, 'BRIGHTFIELD': 4,
-                    'PC': 5, 'PHASE': 5,
-                    'DF': 6, 'DARKFIELD': 6,
-                    'VIOLET': 3, 'BLUE_FLUOR': 3,
-                    'BLUE': 0, 'GREEN_FLUOR': 0,
-                    'GREEN': 1, 'RED_FLUOR': 1,
-                    'RED': 2, 'FAR_RED_FLUOR': 2
+                    'BF': 4, 'PC': 5, 'DF': 6,
+                    'VIOLET': 3, 'BLUE': 0, 'GREEN': 1, 'RED': 2
                 }
                 ch_num = ch_map.get(self.active_channel_name, 4)
 
                 self.led_board.exchange_command('LEDS_ENT')
-                res = self.led_board.exchange_command(f'LED{ch_num}_{int(saved_power)}')
-                print(f'[LED CTRL] Switched illumination to {self.active_channel_name} (Index {ch_num}) at {int(saved_power)}%: Response={res}', flush=True)
+                cmd = f'LED{ch_num}_{int(saved_power)}'
+                res = self.led_board.exchange_command(cmd)
+                print(f'[LED CTRL] Switched to {self.active_channel_name} (Index {ch_num}, {int(saved_power)}%) -> {res}', flush=True)
                 self.set_camera_exposure(saved_exp)
             except Exception as e:
-                print(f'[LED CTRL] Error setting channel {channel_name}: {e}', flush=True)
+                print(f'[LED CTRL ERROR] Error setting channel {channel_name}: {e}', flush=True)
         threading.Thread(target=_exec, daemon=True).start()
 
-    def jog_z(self, dz_um: float):
-        dz_mm = float(dz_um) / 1000.0
-        self.stage_z += dz_mm
-        self.update_stage_coordinates_display()
+    def set_z_focus_absolute(self, val_mm: float):
+        target_z = float(val_mm)
+        dz_mm = target_z - self.stage_z
+        self.stage_z = target_z
+        self.jog_z(dz_mm * 1000.0)
 
+    def jog_z_rel(self, dz_um: float):
+        dz_mm = dz_um / 1000.0
+        self.stage_z += dz_mm
+        self.jog_z(dz_um)
+
+    def jog_z(self, dz_um: float):
+        self.update_stage_coordinates_display()
         if not self.stage_connected or not self.motor_stage:
-            print(f'[STAGE Z] Offline jog Z by {dz_um:.1f} um (New Z: {self.stage_z:.3f} mm)', flush=True)
             return
 
         def _exec():
-            stg = self.motor_stage
             try:
+                stg = self.motor_stage
+                int_um = int(dz_um)
+                res = None
                 if hasattr(stg, 'move_z_rel'):
-                    stg.move_z_rel(int(dz_um))
-                    print(f'[STAGE Z] Moved Z rel by {dz_um:.1f} um via move_z_rel', flush=True)
-                    return
+                    res = stg.move_z_rel(int_um)
+                elif hasattr(stg, 'move_rel_pos'):
+                    try:
+                        res = stg.move_rel_pos('Z', int_um)
+                    except Exception:
+                        res = stg.move_rel_pos('z', int_um)
+                elif hasattr(stg, 'exchange_command'):
+                    res = stg.exchange_command(f'TARGET_WZ{int_um}')
+                print(f'[STAGE Z] jog_z({dz_um:.1f}um) -> {res}', flush=True)
             except Exception as e:
-                print(f'[STAGE Z] move_z_rel note: {e}', flush=True)
-
-            try:
-                if hasattr(stg, 'move_rel_pos'):
-                    stg.move_rel_pos('Z', int(dz_um))
-                    print(f'[STAGE Z] Moved Z rel by {dz_um:.1f} um via move_rel_pos Z', flush=True)
-                    return
-            except Exception as e:
-                print(f'[STAGE Z] move_rel_pos Z note: {e}', flush=True)
-
-            try:
-                if hasattr(stg, 'exchange_command'):
-                    res = stg.exchange_command(f'TARGET_WZ{int(dz_um)}')
-                    print(f'[STAGE Z] TARGET_WZ {dz_um} um response: {res}', flush=True)
-            except Exception as e:
-                print(f'[STAGE Z] exchange_command Z note: {e}', flush=True)
-
+                print(f'[STAGE Z ERROR] {e}', flush=True)
         threading.Thread(target=_exec, daemon=True).start()
 
-    def set_z_focus_absolute(self, target_z_mm: float):
-        dz_mm = target_z_mm - self.stage_z
-        if abs(dz_mm) < 0.0001:
-            return
-        dz_um = dz_mm * 1000.0
-        self.jog_z(dz_um)
-
-    def zero_z_baseline(self):
+    def reset_z_baseline(self):
         self.stage_z = 0.0
         self.update_stage_coordinates_display()
-        print('[STAGE Z] Zeroed Z baseline.', flush=True)
 
     def toggle_auto_gain(self):
         self.auto_gain_active = not self.auto_gain_active
         if self.camera_connected and self.camera and hasattr(self.camera, 'auto_gain'):
             try:
-                if hasattr(self.camera, 'active') and not isinstance(getattr(self.camera, 'active'), bool):
-                    self.camera.auto_gain(self.auto_gain_active)
-                    print(f'[LumaViewPro] Auto Gain set to {self.auto_gain_active}', flush=True)
+                self.camera.auto_gain(self.auto_gain_active)
+                print(f'[LumaViewPro] Auto Gain set to {self.auto_gain_active}', flush=True)
             except Exception as e:
                 print(f'[LumaViewPro] Auto gain error: {e}', flush=True)
 
@@ -410,9 +374,8 @@ class LumaViewProApp(App):
         self.auto_exp_active = not self.auto_exp_active
         if self.camera_connected and self.camera and hasattr(self.camera, 'auto_exposure'):
             try:
-                if hasattr(self.camera, 'active') and not isinstance(getattr(self.camera, 'active'), bool):
-                    self.camera.auto_exposure(self.auto_exp_active)
-                    print(f'[LumaViewPro] Auto Exposure set to {self.auto_exp_active}', flush=True)
+                self.camera.auto_exposure(self.auto_exp_active)
+                print(f'[LumaViewPro] Auto Exposure set to {self.auto_exp_active}', flush=True)
             except Exception as e:
                 print(f'[LumaViewPro] Auto exposure error: {e}', flush=True)
 
@@ -477,10 +440,6 @@ class LumaViewProApp(App):
                 return
             except Exception:
                 pass
-        if axis.upper() == 'X' and hasattr(stg, 'move_x_rel'):
-            stg.move_x_rel(um_dist)
-        elif axis.upper() == 'Y' and hasattr(stg, 'move_y_rel'):
-            stg.move_y_rel(um_dist)
 
     def home_stage_and_synchronize(self):
         self.stage_x = 0.0
@@ -503,27 +462,6 @@ class LumaViewProApp(App):
 
     def update_stage_coordinates_display(self):
         self.stage_coord_str = f'Stage: X={self.stage_x:.2f}, Y={self.stage_y:.2f}, Z={self.stage_z:.3f} mm'
-        if hasattr(self, 'root_widget') and self.root_widget:
-            try:
-                canvas_widget = self.root_widget.ids.get('main_plate_canvas')
-                if canvas_widget and hasattr(canvas_widget, 'redraw_canvas'):
-                    canvas_widget.redraw_canvas()
-            except Exception:
-                pass
-
-    def update_live_feed(self, dt: float):
-        if not self.camera_connected or not self.camera:
-            return
-
-        frame_arr = self.latest_frame
-        if frame_arr is not None and isinstance(frame_arr, np.ndarray) and frame_arr.size > 0:
-            if hasattr(self, 'root_widget') and self.root_widget:
-                try:
-                    viewport = self.root_widget.ids.get('main_camera_viewport')
-                    if viewport:
-                        viewport.update_frame_texture(frame_arr)
-                except Exception as e:
-                    print(f'[LumaViewPro] Viewport update error: {e}', flush=True)
 
 
 if __name__ == '__main__':

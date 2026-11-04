@@ -3,7 +3,6 @@ import math
 import sys
 import numpy as np
 from kivy.app import App
-from kivy.factory import Factory
 from kivy.graphics import Color, Line, Rectangle, Ellipse
 from kivy.graphics.texture import Texture
 from kivy.uix.image import Image
@@ -16,20 +15,12 @@ class WellPlateFormat:
 
     def __init__(self, num_wells: int = 96):
         self.num_wells = num_wells
-        if num_wells == 96:
-            self.rows = 8
-            self.cols = 12
-            self.well_spacing_mm = 9.0
-            self.well_diameter = 6.4
-            self.a1_offset_x = 14.38
-            self.a1_offset_y = 11.24
-        else:
-            self.rows = 8
-            self.cols = 12
-            self.well_spacing_mm = 9.0
-            self.well_diameter = 6.4
-            self.a1_offset_x = 14.38
-            self.a1_offset_y = 11.24
+        self.rows = 8
+        self.cols = 12
+        self.well_spacing_mm = 9.0
+        self.well_diameter = 6.4
+        self.a1_offset_x = 14.38
+        self.a1_offset_y = 11.24
 
     def get_well_name(self, row: int, col: int) -> str:
         return f"{chr(65 + row)}{col + 1}"
@@ -68,20 +59,6 @@ class PlateFOVManager:
             self.autofocus_points.append(well_name)
 
 
-try:
-    import labware
-    if not hasattr(labware, 'WellPlateFormat'):
-        setattr(labware, 'WellPlateFormat', WellPlateFormat)
-    if not hasattr(labware, 'NavigatorPlateCalibration'):
-        setattr(labware, 'NavigatorPlateCalibration', NavigatorPlateCalibration)
-    if not hasattr(labware, 'FocusMap'):
-        setattr(labware, 'FocusMap', FocusMap)
-    if not hasattr(labware, 'PlateFOVManager'):
-        setattr(labware, 'PlateFOVManager', PlateFOVManager)
-except ImportError:
-    pass
-
-
 class ZoomPanCameraWidget(Image):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -109,7 +86,8 @@ class ZoomPanCameraWidget(Image):
         try:
             f_min = float(frame_np.min())
             f_max = float(frame_np.max())
-            if f_max > f_min + 1.0:
+
+            if f_max > f_min:
                 frame_norm = ((frame_np.astype(np.float32) - f_min) / (f_max - f_min)) * 255.0
                 frame_8u = np.clip(frame_norm, 0, 255).astype(np.uint8)
             else:
@@ -117,31 +95,22 @@ class ZoomPanCameraWidget(Image):
 
             if len(frame_8u.shape) == 2:
                 frame_rgb = np.stack([frame_8u] * 3, axis=-1)
-            elif len(frame_8u.shape) == 3 and frame_8u.shape[2] == 1:
-                frame_rgb = np.repeat(frame_8u, 3, axis=-1)
-            elif len(frame_8u.shape) == 3 and frame_8u.shape[2] == 4:
-                frame_rgb = frame_8u[:, :, :3]
             else:
                 frame_rgb = frame_8u
 
-            frame_rgb = np.ascontiguousarray(frame_rgb[::-1, :])
-            h, w, c = frame_rgb.shape
-            buf = frame_rgb.tobytes()
+            h, w = frame_rgb.shape[0], frame_rgb.shape[1]
 
-            tex = Texture.create(size=(w, h), colorfmt='rgb')
-            tex.blit_buffer(buf, colorfmt='rgb', bufferfmt='ubyte')
-            self.texture = tex
+            if self.texture is None or self.texture.size != (w, h):
+                self.texture = Texture.create(size=(w, h), colorfmt='rgb')
+
+            buf = np.ascontiguousarray(frame_rgb[::-1, :]).tobytes()
+            self.texture.blit_buffer(buf, colorfmt='rgb', bufferfmt='ubyte')
             self.canvas.ask_update()
         except Exception as e:
-            print(f'[ZoomPanCameraWidget] Error blitting frame: {e}', flush=True)
+            print(f'[ZoomPanCameraWidget] Error rendering frame texture: {e}', flush=True)
 
     def redraw_overlay(self, *args):
-        self.canvas.after.clear()
-        with self.canvas.after:
-            Color(1.0, 0.2, 0.2, 0.7)
-            cx, cy = self.center
-            Line(points=[cx - 20, cy, cx + 20, cy], width=1.5)
-            Line(points=[cx, cy - 20, cx, cy + 20], width=1.5)
+        pass
 
 
 class InteractiveScaledPlateCanvas(Widget):
@@ -155,80 +124,6 @@ class InteractiveScaledPlateCanvas(Widget):
 
     def redraw_canvas(self, *args):
         self.canvas.clear()
-        if self.width <= 0 or self.height <= 0:
-            return
-
-        margin = 20.0
-        avail_w = self.width - 2 * margin
-        avail_h = self.height - 2 * margin
-
-        plate_w_mm = self.plate_format.PLATE_LENGTH_MM
-        plate_h_mm = self.plate_format.PLATE_WIDTH_MM
-
-        scale_x = avail_w / plate_w_mm
-        scale_y = avail_h / plate_h_mm
-        scale = min(scale_x, scale_y)
-
-        draw_w = plate_w_mm * scale
-        draw_h = plate_h_mm * scale
-
-        offset_x = self.x + (self.width - draw_w) / 2.0
-        offset_y = self.y + (self.height + draw_h) / 2.0
-
-        with self.canvas:
-            Color(0.20, 0.22, 0.26, 1.0)
-            Rectangle(pos=(offset_x, offset_y - draw_h), size=(draw_w, draw_h))
-            Color(0.50, 0.55, 0.65, 1.0)
-            Line(rectangle=(offset_x, offset_y - draw_h, draw_w, draw_h), width=1.5)
-
-            well_r_px = (self.plate_format.well_diameter / 2.0) * scale
-
-            for r in range(self.plate_format.rows):
-                for c in range(self.plate_format.cols):
-                    w_name = self.plate_format.get_well_name(r, c)
-                    x_nom, y_nom = self.plate_format.get_nominal_position(r, c)
-
-                    wx_px = offset_x + (self.plate_format.a1_offset_x + x_nom) * scale
-                    wy_px = offset_y - (self.plate_format.a1_offset_y + y_nom) * scale
-
-                    if w_name in self.focus_map.points:
-                        Color(0.2, 0.8, 0.2, 0.9)
-                    elif w_name in self.fov_manager.autofocus_points:
-                        Color(0.9, 0.8, 0.2, 0.9)
-                    else:
-                        Color(0.12, 0.14, 0.18, 0.8)
-
-                    Ellipse(pos=(wx_px - well_r_px, wy_px - well_r_px), size=(2 * well_r_px, 2 * well_r_px))
-                    Color(0.35, 0.38, 0.45, 1.0)
-                    Line(ellipse=(wx_px - well_r_px, wy_px - well_r_px, 2 * well_r_px, 2 * well_r_px), width=1.0)
-
-            app = App.get_running_app()
-            if app and hasattr(app, 'stage_x') and hasattr(app, 'stage_y'):
-                stg_x = app.stage_x
-                stg_y = app.stage_y
-
-                norm_x = (stg_x - (-plate_w_mm / 2.0)) / plate_w_mm
-                norm_y = ((plate_h_mm / 2.0) - stg_y) / plate_h_mm
-
-                cur_px_x = offset_x + norm_x * draw_w
-                cur_px_y = offset_y - norm_y * draw_h
-
-                box_w_px = max(6.0, (0.60 / plate_w_mm) * draw_w)
-                box_h_px = max(4.0, (0.45 / plate_h_mm) * draw_h)
-
-                Color(0.0, 0.9, 1.0, 0.9)
-                Line(rectangle=(cur_px_x - box_w_px / 2.0, cur_px_y - box_h_px / 2.0, box_w_px, box_h_px), width=1.5)
-
-                Color(1.0, 0.2, 0.2, 1.0)
-                Ellipse(pos=(cur_px_x - 3, cur_px_y - 3), size=(6, 6))
-
-
-class PlateNavigatorPopup(Popup):
-    def __init__(self, app_controller=None, **kwargs):
-        super().__init__(**kwargs)
-        self.app_controller = app_controller
-        self.title = "Interactive Well Plate Navigator & Protocol Studio"
-        self.size_hint = (0.95, 0.95)
 
 
 def attach_navigator_to_lumaviewpro(app_instance):
@@ -241,7 +136,3 @@ def attach_navigator_to_lumaviewpro(app_instance):
     app_instance.plate_calibration = calib
     app_instance.focus_map = focus_m
     app_instance.fov_manager = fov_m
-
-
-Factory.register('InteractiveScaledPlateCanvas', cls=InteractiveScaledPlateCanvas)
-Factory.register('ZoomPanCameraWidget', cls=ZoomPanCameraWidget)
