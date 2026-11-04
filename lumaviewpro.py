@@ -125,7 +125,8 @@ class LumaViewProApp(App):
     bit_depth = StringProperty('8-bit')
     binning = StringProperty('1')
     crosshair_on = BooleanProperty(False)
-    autoscale_on = BooleanProperty(False)
+    autoscale_on = BooleanProperty(True)
+    frame_stats = StringProperty('No frames yet')
     shading_on = BooleanProperty(False)
     surface_info = StringProperty('Surface: no anchor')
     worker_busy = BooleanProperty(False)
@@ -348,6 +349,11 @@ class LumaViewProApp(App):
             print(f'[CAM STREAM] Frame #{self.frame_count}: shape={frame.shape}, '
                   f'dtype={frame.dtype}, min={frame.min()}, max={frame.max()}, '
                   f'mean={frame.mean():.1f}', flush=True)
+        if self.frame_count % 15 == 0:
+            self.frame_stats = (f'Live #{self.frame_count}  {frame.shape[1]}x'
+                                f'{frame.shape[0]}  {self.significant_bits}-bit  '
+                                f'min {frame.min()}  max {frame.max()}  '
+                                f'mean {frame.mean():.1f}')
         viewport = self.root.ids.get('main_camera_viewport') if self.root else None
         if viewport:
             tint = CHANNEL_LUTS.get(ch, (1.0, 1.0, 1.0))
