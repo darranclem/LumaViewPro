@@ -761,7 +761,7 @@ class LumaViewProApp(App):
     # -------- sliders: sync with the text fields, debounce live apply
 
     def slider_changed(self, kind: str, value: float):
-        if not self.root:
+        if not self.root or getattr(self, '_slider_sync', False):
             return
         ids = self.root.ids
         cs = self._cs()
@@ -791,12 +791,16 @@ class LumaViewProApp(App):
             return
         ids = self.root.ids
         cs = self._cs()
-        for key, val in (('exposure_slider', min(cs.exposure_ms, 1000.0)),
-                         ('gain_slider', min(cs.gain_db, 48.0)),
-                         ('led_slider', min(cs.led_power, 600))):
-            w = ids.get(key)
-            if w is not None:
-                w.value = float(val)
+        self._slider_sync = True
+        try:
+            for key, val in (('exposure_slider', min(cs.exposure_ms, 1000.0)),
+                             ('gain_slider', min(cs.gain_db, 48.0)),
+                             ('led_slider', min(cs.led_power, 600))):
+                w = ids.get(key)
+                if w is not None:
+                    w.value = float(val)
+        finally:
+            self._slider_sync = False
 
     # ---------------------------------------------------- camera controls
 
