@@ -53,7 +53,7 @@
 
         BoxLayout:
             orientation: 'vertical'
-            size_hint_x: 0.12
+            size_hint_x: 0.08
             spacing: '4dp'
             padding: '4dp'
             canvas.before:
@@ -65,29 +65,31 @@
 
             Label:
                 text: "Z Focus"
-                font_size: '13sp'
+                font_size: '11sp'
                 bold: True
                 size_hint_y: None
-                height: '20dp'
-                color: 0.3, 0.8, 1.0, 1.0
+                height: '18dp'
 
             Button:
-                text: 'Z ++'
+                text: 'Z++'
+                font_size: '10sp'
                 size_hint_y: None
-                height: '28dp'
-                on_press: app.jog_z_rel(100.0)
+                height: '24dp'
+                on_press: app.jog_z(100)
 
             Button:
-                text: 'Z +'
+                text: 'Z+'
+                font_size: '10sp'
                 size_hint_y: None
-                height: '28dp'
-                on_press: app.jog_z_rel(10.0)
+                height: '24dp'
+                on_press: app.jog_z(10)
 
             Button:
-                text: 'z +'
+                text: 'z+'
+                font_size: '10sp'
                 size_hint_y: None
-                height: '26dp'
-                on_press: app.jog_z_rel(1.0)
+                height: '24dp'
+                on_press: app.jog_z(1)
 
             Slider:
                 orientation: 'vertical'
@@ -97,32 +99,36 @@
                 on_value: app.set_z_focus_absolute(self.value)
 
             Button:
-                text: 'z -'
+                text: 'z-'
+                font_size: '10sp'
                 size_hint_y: None
-                height: '26dp'
-                on_press: app.jog_z_rel(-1.0)
+                height: '24dp'
+                on_press: app.jog_z(-1)
 
             Button:
-                text: 'Z -'
+                text: 'Z-'
+                font_size: '10sp'
                 size_hint_y: None
-                height: '28dp'
-                on_press: app.jog_z_rel(-10.0)
+                height: '24dp'
+                on_press: app.jog_z(-10)
 
             Button:
-                text: 'Z --'
+                text: 'Z--'
+                font_size: '10sp'
                 size_hint_y: None
-                height: '28dp'
-                on_press: app.jog_z_rel(-100.0)
+                height: '24dp'
+                on_press: app.jog_z(-100)
 
             Button:
                 text: 'Zero Z'
+                font_size: '10sp'
                 size_hint_y: None
-                height: '28dp'
-                on_press: app.reset_z_baseline()
+                height: '24dp'
+                on_press: app.zero_z_baseline()
 
         BoxLayout:
             orientation: 'vertical'
-            size_hint_x: 0.23
+            size_hint_x: 0.27
             spacing: '6dp'
             padding: '6dp'
             canvas.before:
@@ -133,7 +139,7 @@
                     size: self.size
 
             Label:
-                text: "Camera & Illumination"
+                text: "Illumination & Camera"
                 font_size: '14sp'
                 bold: True
                 size_hint_y: None
@@ -145,9 +151,9 @@
                 height: '28dp'
                 spacing: '6dp'
                 Label:
-                    text: "Exp: " + str(round(app.camera_exposure_ms, 1)) + "ms"
+                    text: "Exposure (ms): " + str(round(app.camera_exposure_ms, 1))
                     size_hint_x: 0.45
-                    font_size: '12sp'
+                    font_size: '11sp'
                 Slider:
                     min: 0.1
                     max: 200.0
@@ -160,9 +166,9 @@
                 height: '28dp'
                 spacing: '6dp'
                 Label:
-                    text: "LED: " + str(int(app.led_power_pct)) + "%"
+                    text: "LED Power (%): " + str(int(app.led_power_pct))
                     size_hint_x: 0.45
-                    font_size: '12sp'
+                    font_size: '11sp'
                 Slider:
                     min: 0
                     max: 100
@@ -171,22 +177,19 @@
                     size_hint_x: 0.55
 
             GridLayout:
-                cols: 3
+                cols: 2
                 spacing: '4dp'
                 size_hint_y: None
                 height: '30dp'
                 Button:
-                    text: 'Gain'
+                    text: 'Auto Gain'
                     on_press: app.toggle_auto_gain()
                 Button:
-                    text: 'Exp'
-                    on_press: app.toggle_auto_exposure()
-                Button:
-                    text: 'Diag'
+                    text: 'Stream Test'
                     on_press: app.run_hardware_stream_diagnostic()
 
             Label:
-                text: "Optical Illumination Channels"
+                text: "Optical Channels"
                 font_size: '14sp'
                 bold: True
                 size_hint_y: None
@@ -199,7 +202,7 @@
                 size_hint_y: None
                 height: '110dp'
                 Button:
-                    text: 'Brightfield (White)'
+                    text: 'Brightfield'
                     on_press: app.set_active_channel('BF')
                 Button:
                     text: 'Phase (PC)'
@@ -208,24 +211,21 @@
                     text: 'Darkfield (DF)'
                     on_press: app.set_active_channel('DF')
                 Button:
-                    text: 'Violet (405nm)'
-                    on_press: app.set_active_channel('VIOLET')
-                Button:
-                    text: 'Blue (470nm)'
+                    text: 'Blue (470)'
                     on_press: app.set_active_channel('BLUE')
                 Button:
-                    text: 'Green (530nm)'
+                    text: 'Green (530)'
                     on_press: app.set_active_channel('GREEN')
                 Button:
-                    text: 'Red (625nm)'
+                    text: 'Red (625)'
                     on_press: app.set_active_channel('RED')
                 Button:
-                    text: 'ALL LEDs OFF'
+                    text: 'LEDs Off'
                     background_color: (0.8, 0.2, 0.2, 1.0)
                     on_press: app.turn_off_all_leds()
 
             Label:
-                text: "XY Stage Jog"
+                text: "Stage Controls"
                 font_size: '14sp'
                 bold: True
                 size_hint_y: None
@@ -236,26 +236,26 @@
                 cols: 3
                 spacing: '4dp'
                 size_hint_y: None
-                height: '70dp'
+                height: '90dp'
 
                 Widget:
                 Button:
-                    text: 'Y+'
+                    text: 'Y+ (Up)'
                     on_press: app.jog_stage(0, 1)
                 Widget:
 
                 Button:
-                    text: 'X-'
+                    text: 'X- (Left)'
                     on_press: app.jog_stage(-1, 0)
                 Button:
                     text: 'Home'
                     on_press: app.home_stage_and_synchronize()
                 Button:
-                    text: 'X+'
+                    text: 'X+ (Right)'
                     on_press: app.jog_stage(1, 0)
 
                 Widget:
                 Button:
-                    text: 'Y-'
+                    text: 'Y- (Down)'
                     on_press: app.jog_stage(0, -1)
                 Widget:

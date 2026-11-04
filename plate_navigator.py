@@ -1,6 +1,5 @@
 from __future__ import annotations
 import math
-import sys
 import numpy as np
 from kivy.app import App
 from kivy.graphics import Color, Line, Rectangle, Ellipse
@@ -8,6 +7,7 @@ from kivy.graphics.texture import Texture
 from kivy.uix.image import Image
 from kivy.uix.widget import Widget
 from kivy.uix.popup import Popup
+
 
 class WellPlateFormat:
     PLATE_LENGTH_MM = 127.76
@@ -26,9 +26,7 @@ class WellPlateFormat:
         return f"{chr(65 + row)}{col + 1}"
 
     def get_nominal_position(self, row: int, col: int) -> tuple[float, float]:
-        x_mm = col * self.well_spacing_mm
-        y_mm = row * self.well_spacing_mm
-        return x_mm, y_mm
+        return col * self.well_spacing_mm, row * self.well_spacing_mm
 
 
 class NavigatorPlateCalibration:
@@ -43,20 +41,12 @@ class FocusMap:
     def add_point(self, well_name: str, x_mm: float, y_mm: float, z_mm: float):
         self.points[well_name] = {'x': x_mm, 'y': y_mm, 'z': z_mm}
 
-    def clear(self):
-        self.points.clear()
-
 
 class PlateFOVManager:
     def __init__(self, plate_format: WellPlateFormat, calib: NavigatorPlateCalibration, focus_map: FocusMap):
         self.plate_format = plate_format
         self.calib = calib
         self.focus_map = focus_map
-        self.autofocus_points = []
-
-    def add_autofocus_point(self, well_name: str):
-        if well_name not in self.autofocus_points:
-            self.autofocus_points.append(well_name)
 
 
 class ZoomPanCameraWidget(Image):
@@ -64,16 +54,12 @@ class ZoomPanCameraWidget(Image):
         super().__init__(**kwargs)
         self.allow_stretch = True
         self.keep_ratio = True
-        self.bind(pos=self.redraw_overlay, size=self.redraw_overlay)
         self.set_standby_texture()
 
     def set_standby_texture(self):
         h, w = 480, 640
         img = np.zeros((h, w, 3), dtype=np.uint8)
         img[:, :] = [15, 18, 24]
-        img[h // 2 - 1:h // 2 + 2, :] = [50, 70, 90]
-        img[:, w // 2 - 1:w // 2 + 2] = [50, 70, 90]
-
         tex = Texture.create(size=(w, h), colorfmt='rgb')
         tex.blit_buffer(img.tobytes(), colorfmt='rgb', bufferfmt='ubyte')
         tex.flip_vertical()
@@ -98,32 +84,23 @@ class ZoomPanCameraWidget(Image):
             else:
                 frame_rgb = frame_8u
 
-            h, w = frame_rgb.shape[0], frame_rgb.shape[1]
+            h, w = frame_rgb.shape[:2]
 
-            if self.texture is None or self.texture.size != (w, h):
-                self.texture = Texture.create(size=(w, h), colorfmt='rgb')
+            if self.texture is None or self.texture.width != w or self.texture.height != h:
+                tex = Texture.create(size=(w, h), colorfmt='rgb')
+                self.texture = tex
 
             buf = np.ascontiguousarray(frame_rgb[::-1, :]).tobytes()
             self.texture.blit_buffer(buf, colorfmt='rgb', bufferfmt='ubyte')
             self.canvas.ask_update()
         except Exception as e:
-            print(f'[ZoomPanCameraWidget] Error rendering frame texture: {e}', flush=True)
-
-    def redraw_overlay(self, *args):
-        pass
+            pass
 
 
 class InteractiveScaledPlateCanvas(Widget):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.plate_format = WellPlateFormat(num_wells=96)
-        self.calibration = NavigatorPlateCalibration(self.plate_format)
-        self.focus_map = FocusMap()
-        self.fov_manager = PlateFOVManager(self.plate_format, self.calibration, self.focus_map)
-        self.bind(pos=self.redraw_canvas, size=self.redraw_canvas)
-
-    def redraw_canvas(self, *args):
-        self.canvas.clear()
 
 
 def attach_navigator_to_lumaviewpro(app_instance):
