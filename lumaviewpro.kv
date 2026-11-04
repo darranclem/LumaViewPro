@@ -520,9 +520,49 @@ LumaViewProMainLayout:
         BoxLayout:
             orientation: 'vertical'
             spacing: '4dp'
-            ZoomPanCameraWidget:
-                id: main_camera_viewport
-                show_crosshair: app.crosshair_on
+            Label:
+                size_hint_y: None
+                height: '30dp' if app.initializing else '0dp'
+                opacity: 1 if app.initializing else 0
+                text: 'MICROSCOPE INITIALISING - ' + app.status_msg
+                color: (0.05, 0.05, 0.05, 1)
+                bold: True
+                font_size: '14sp'
+                canvas.before:
+                    Color:
+                        rgba: (1.0, 0.75, 0.1, 1) if app.initializing else (0, 0, 0, 0)
+                    Rectangle:
+                        pos: self.pos
+                        size: self.size
+            BoxLayout:
+                orientation: 'horizontal'
+                spacing: '4dp'
+                ZoomPanCameraWidget:
+                    id: main_camera_viewport
+                    show_crosshair: app.crosshair_on
+                BoxLayout:
+                    orientation: 'vertical'
+                    size_hint_x: None
+                    width: '52dp'
+                    PanelLabel:
+                        text: 'Z'
+                        halign: 'center'
+                        height: '16dp'
+                    Slider:
+                        id: z_slider
+                        orientation: 'vertical'
+                        min: 0
+                        max: 14000
+                        value: 0
+                        cursor_size: '16dp', '16dp'
+                        on_value: app.z_slider_changed(self.value)
+                    Label:
+                        size_hint_y: None
+                        height: '30dp'
+                        text: '%.0f' % app.stage_z_um + '\num'
+                        color: TXT
+                        font_size: '10sp'
+                        halign: 'center'
             Label:
                 size_hint_y: None
                 height: '18dp'
@@ -811,16 +851,7 @@ LumaViewProMainLayout:
                 HeaderLabel:
                     text: 'Z FOCUS'
                 PanelLabel:
-                    text: 'Slider = absolute Z; mouse wheel on image = fine focus'
-                Slider:
-                    id: z_slider
-                    min: 0
-                    max: 14000
-                    value: 0
-                    size_hint_y: None
-                    height: '28dp'
-                    cursor_size: '16dp', '16dp'
-                    on_value: app.z_slider_changed(self.value)
+                    text: 'Vertical slider is beside the image; wheel = fine'
                 FieldRow:
                     PanelLabel:
                         text: 'Go to Z (um)'

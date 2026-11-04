@@ -126,6 +126,7 @@ class LumaViewProApp(App):
     binning = StringProperty('1')
     crosshair_on = BooleanProperty(False)
     autoscale_on = BooleanProperty(True)
+    initializing = BooleanProperty(False)
     frame_stats = StringProperty('No frames yet')
     shading_on = BooleanProperty(False)
     surface_info = StringProperty('Surface: no anchor')
@@ -138,6 +139,9 @@ class LumaViewProApp(App):
     use_surface_on = BooleanProperty(True)
     use_z_offsets_on = BooleanProperty(True)
     xy_step_um = NumericProperty(100.0)
+    stage_x_um = NumericProperty(0.0)
+    stage_y_um = NumericProperty(0.0)
+    stage_z_um = NumericProperty(0.0)
     af_each_cycle_on = BooleanProperty(True)
     output_dir = StringProperty(CAPTURES_DIR)
     positions_info = StringProperty('No positions defined')
@@ -175,7 +179,7 @@ class LumaViewProApp(App):
 
         self.stage_x_um = 0.0
         self.stage_y_um = 0.0
-        self.stage_z_um = 0.0
+        self.stage_z_um = 0.0  # NumericProperties; values reset here
 
         # Labware + plate calibration
         self.labware_lib = labware_defs.LabwareLibrary()
@@ -251,6 +255,7 @@ class LumaViewProApp(App):
         Clock.schedule_once(lambda dt: setattr(self, 'status_msg', msg), 0)
 
     def _init_hardware(self):
+        Clock.schedule_once(lambda dt: setattr(self, 'initializing', True), 0)
         self._set_status('Initializing camera...')
         try:
             import pyloncamera
@@ -322,6 +327,7 @@ class LumaViewProApp(App):
             self.hw.home_and_center(status_cb=self._set_status)
         else:
             self._set_status('Ready (no stage)')
+        Clock.schedule_once(lambda dt: setattr(self, 'initializing', False), 0)
 
     # ------------------------------------------------- live view pipeline
 
@@ -389,20 +395,28 @@ class LumaViewProApp(App):
 
     # -------------------------------------------- plate <-> stage transform
 
+    def _default_a1_stage(self) -> tuple[float, float]:
+        """Approximate A1 position assuming the plate is centered on the
+        stage (X 120 mm, Y 80 mm travel) - used for the FOV marker before
+        any calibration has been done."""
+        lw = self.current_labware
+        return (60000.0 - (lw.plate_length_mm / 2.0 - lw.a1_offset_x_mm) * 1000.0,
+                40000.0 - (lw.plate_width_mm / 2.0 - lw.a1_offset_y_mm) * 1000.0)
+
     def plate_rel_to_stage(self, rel_x_mm: float,
                            rel_y_mm: float) -> tuple[float, float] | None:
         """Plate position relative to the A1 center (mm) -> stage um.
 
         Uses the full plate calibration (rotation-aware affine) when solved,
-        else the quick 'Set A1 = here' anchor with the flip signs."""
+        else the quick 'Set A1 = here' anchor with the flip signs, else an
+        approximate plate-centered-on-stage assumption."""
         if self.plate_cal is not None and self.plate_cal.matrix is not None:
             lw = self.current_labware
             return self.plate_cal.plate_mm_to_stage_um(
                 lw.a1_offset_x_mm + rel_x_mm, lw.a1_offset_y_mm + rel_y_mm)
-        if self.a1_stage_um is not None:
-            return (self.a1_stage_um[0] + rel_x_mm * 1000.0 * self.plate_sign_x,
-                    self.a1_stage_um[1] + rel_y_mm * 1000.0 * self.plate_sign_y)
-        return None
+        a1 = self.a1_stage_um or self._default_a1_stage()
+        return (a1[0] + rel_x_mm * 1000.0 * self.plate_sign_x,
+                a1[1] + rel_y_mm * 1000.0 * self.plate_sign_y)
 
     def stage_to_plate_rel(self, x_um: float,
                            y_um: float) -> tuple[float, float] | None:
@@ -412,10 +426,9 @@ class LumaViewProApp(App):
                 return None
             lw = self.current_labware
             return (p[0] - lw.a1_offset_x_mm, p[1] - lw.a1_offset_y_mm)
-        if self.a1_stage_um is not None:
-            return ((x_um - self.a1_stage_um[0]) * self.plate_sign_x / 1000.0,
-                    (y_um - self.a1_stage_um[1]) * self.plate_sign_y / 1000.0)
-        return None
+        a1 = self.a1_stage_um or self._default_a1_stage()
+        return ((x_um - a1[0]) * self.plate_sign_x / 1000.0,
+                (y_um - a1[1]) * self.plate_sign_y / 1000.0)
 
     # ----------------------------------------------------- labware library
 
