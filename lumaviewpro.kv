@@ -473,6 +473,32 @@ LumaViewProMainLayout:
                     on_press: app.run_protocol()
 
                 HeaderLabel:
+                    text: 'SAVED PROTOCOLS'
+                FieldRow:
+                    PanelLabel:
+                        text: 'Name'
+                        size_hint_x: 0.3
+                    SmallInput:
+                        id: protocol_name_input
+                        text: app.protocol_name
+                FieldRow:
+                    AccentButton:
+                        text: 'Save protocol'
+                        on_press: app.save_protocol(protocol_name_input.text)
+                FieldRow:
+                    DarkSpinner:
+                        id: protocol_file_spinner
+                        text: '(choose)'
+                        values: app.protocol_files
+                    FlatButton:
+                        text: 'Load'
+                        size_hint_x: None
+                        width: '52dp'
+                        on_press: app.load_protocol(protocol_file_spinner.text)
+                PanelLabel:
+                    text: 'After loading: calibrate plate, review positions, run'
+
+                HeaderLabel:
                     text: 'IMAGE SCALE'
                 FieldRow:
                     PanelLabel:
@@ -619,6 +645,70 @@ LumaViewProMainLayout:
                         on_press: app.toggle_invert('plate_y')
 
                 HeaderLabel:
+                    text: 'PROTOCOL POSITIONS'
+                PanelLabel:
+                    text: app.positions_info
+                FieldRow:
+                    FlatButton:
+                        text: '+ here'
+                        on_press: app.position_add_here()
+                    FlatButton:
+                        text: 'Remove last'
+                        on_press: app.position_remove_last()
+                    FlatButton:
+                        text: 'Clear'
+                        on_press: app.position_clear()
+                FieldRow:
+                    PanelLabel:
+                        text: 'Travel Z drop (um)'
+                        size_hint_x: 0.55
+                    SmallInput:
+                        id: travel_clearance_input
+                        text: str(int(app.travel_clearance_um)) if hasattr(app, 'travel_clearance_um') else '500'
+                        on_text_validate: app.travel_clearance_um = float(self.text or 500)
+                BoxLayout:
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: '0dp' if app.pos_review_active else '30dp'
+                    opacity: 0 if app.pos_review_active else 1
+                    AccentButton:
+                        text: 'Review positions...'
+                        disabled: app.pos_review_active
+                        on_press: app.pos_review_start()
+                BoxLayout:
+                    orientation: 'vertical'
+                    spacing: '3dp'
+                    size_hint_y: None
+                    height: '118dp' if app.pos_review_active else '0dp'
+                    opacity: 1 if app.pos_review_active else 0
+                    Label:
+                        text: app.pos_review_label
+                        color: (1.0, 0.85, 0.1, 1)
+                        bold: True
+                        font_size: '12sp'
+                        size_hint_y: None
+                        height: '20dp'
+                    PanelLabel:
+                        text: 'Fine-tune focus, then set and move on'
+                    AccentButton:
+                        text: 'Set focus = here'
+                        disabled: not app.pos_review_active
+                        on_press: app.pos_review_set_focus()
+                    FieldRow:
+                        FlatButton:
+                            text: '< Prev'
+                            disabled: not app.pos_review_active
+                            on_press: app.pos_review_prev()
+                        FlatButton:
+                            text: 'Next >'
+                            disabled: not app.pos_review_active
+                            on_press: app.pos_review_next()
+                    FlatButton:
+                        text: 'Done'
+                        disabled: not app.pos_review_active
+                        on_press: app.pos_review_done()
+
+                HeaderLabel:
                     text: 'STAGE'
                 Label:
                     text: app.stage_coord_str
@@ -670,7 +760,7 @@ LumaViewProMainLayout:
                         on_press: app.jog('Z', -100)
                     FlatButton:
                         text: 'XY -5k'
-                        on_press: app.jog('X', -5000); app.jog('Y', -5000)
+                        on_press: app.jog_xy(-5000, -5000)
                     FlatButton:
                         text: 'Z +1k'
                         on_press: app.jog('Z', 1000)

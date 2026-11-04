@@ -226,12 +226,31 @@ class ScopeHW:
         return False
 
     def move_xy(self, x_um: float, y_um: float, wait: bool = True) -> None:
+        """Vector move: both axis targets are written back-to-back so X and
+        Y travel simultaneously (straight diagonal), then wait for both."""
         with self.lock:
             if not self.stage_ok():
                 return
             try:
                 self.stage.move_abs_pos('X', float(x_um))
                 self.stage.move_abs_pos('Y', float(y_um))
+            except Exception:
+                return
+        if wait:
+            self._wait_axis('X')
+            self._wait_axis('Y')
+
+    def move_xy_rel(self, dx_um: float, dy_um: float, wait: bool = True) -> None:
+        """Relative vector move along (dx, dy): targets computed first, then
+        written together so the path is a straight line, not X-then-Y."""
+        with self.lock:
+            if not self.stage_ok():
+                return
+            try:
+                tx = float(self.stage.target_pos('X')) + float(dx_um)
+                ty = float(self.stage.target_pos('Y')) + float(dy_um)
+                self.stage.move_abs_pos('X', tx)
+                self.stage.move_abs_pos('Y', ty)
             except Exception:
                 return
         if wait:

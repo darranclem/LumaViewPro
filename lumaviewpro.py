@@ -101,6 +101,8 @@ CHANNEL_LUTS = {
 }
 
 CAPTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'captures')
+PROTOCOLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'data', 'protocols')
 
 # Basler daA3840-45um sensor pixel pitch is 2.0 um; divide by objective
 # magnification for the default sample-plane scale (editable in the UI).
@@ -136,6 +138,11 @@ class LumaViewProApp(App):
     use_z_offsets_on = BooleanProperty(True)
     af_each_cycle_on = BooleanProperty(True)
     output_dir = StringProperty(CAPTURES_DIR)
+    positions_info = StringProperty('No positions defined')
+    pos_review_active = BooleanProperty(False)
+    pos_review_label = StringProperty('')
+    protocol_name = StringProperty('protocol1')
+    protocol_files = ListProperty([])
 
     # -------------------------------------------------------------- setup
 
@@ -174,6 +181,14 @@ class LumaViewProApp(App):
         self.plate_cal: PlateCalibration | None = None   # solved calibration
         self.cal_wizard: PlateCalibration | None = None  # in-progress wizard
 
+        # Protocol interaction positions: dicts with name, x_um, y_um, z_um.
+        # z_um is stored drift-normalized (minus the surface drift at the
+        # time it was set) so per-cycle AF re-referencing shifts every
+        # position consistently.
+        self.protocol_positions: list[dict] = []
+        self._pos_review_index = 0
+        self.travel_clearance_um = 500.0
+
         self._load_persisted()
 
     def build(self):
@@ -193,6 +208,8 @@ class LumaViewProApp(App):
         self.labware_options = self.labware_lib.names()
         self.labware_name = self.current_labware.name
         self._refresh_cal_info()
+        self._refresh_positions()
+        self._refresh_protocol_files()
         self._sync_channel_fields()
         self._sync_af_fields()
         Clock.schedule_once(lambda dt: self._start_init_thread(), 0.1)
@@ -818,6 +835,12 @@ class LumaViewProApp(App):
             return
         self._bg(self.hw.move_rel, axis, um)
 
+    def jog_xy(self, dx_um: float, dy_um: float):
+        """Diagonal jog: both axes move together along the vector."""
+        if not self.stage_connected:
+            return
+        self._bg(self.hw.move_xy_rel, dx_um, dy_um)
+
     # ------------------------------------------------------- Z focus control
 
     def on_focus_scroll(self, direction: int):
@@ -880,6 +903,254 @@ class LumaViewProApp(App):
         except Exception as e:
             self._set_status(f'Open folder failed: {e}')
 
+    # ---------------------------------------------- protocol positions
+
+    def _safe_goto(self, x_um: float, y_um: float, z_um: float | None):
+        """Move to a position safely: drop Z by the travel clearance first,
+        make the XY move, then go to the target focus Z."""
+        clear = max(self.travel_clearance_um, 0.0)
+        cur_z = self.hw.get_pos()[2]
+        travel_z = max(cur_z - clear, 0.0)
+        if clear > 0:
+            self.hw.move_z(travel_z)
+        self.hw.move_xy(x_um, y_um)
+        if z_um is not None:
+            self.hw.move_z(max(z_um, 0.0))
+
+    def _pos_well_name(self, x_um: float, y_um: float) -> str | None:
+        rel = self.stage_to_plate_rel(x_um, y_um)
+        if rel is None:
+            return None
+        lw = self.current_labware
+        sx = lw.spacing_x_mm or 1.0
+        sy = lw.spacing_y_mm or 1.0
+        col = round(rel[0] / sx)
+        row = round(rel[1] / sy)
+        if 0 <= row < lw.rows and 0 <= col < lw.cols:
+            wx, wy = col * sx, row * sy
+            if abs(rel[0] - wx) < sx * 0.5 and abs(rel[1] - wy) < sy * 0.5:
+                return lw.get_well_name(row, col)
+        return None
+
+    def _refresh_positions(self, highlight: int | None = None):
+        n = len(self.protocol_positions)
+        if n == 0:
+            self.positions_info = 'No positions defined'
+        else:
+            names = ', '.join(p['name'] for p in self.protocol_positions[:8])
+            if n > 8:
+                names += ', ...'
+            self.positions_info = f'{n} positions: {names}'
+        plate = self.root.ids.get('plate_map') if self.root else None
+        if plate is not None:
+            lw = self.current_labware
+            marks = []
+            for p in self.protocol_positions:
+                rel = self.stage_to_plate_rel(p['x_um'], p['y_um'])
+                if rel is not None:
+                    marks.append((lw.a1_offset_x_mm + rel[0],
+                                  lw.a1_offset_y_mm + rel[1]))
+            plate.set_position_markers(marks, highlight)
+
+    def position_add_here(self):
+        """Add the current stage position (and focus) as a protocol
+        interaction point."""
+        drift = self.surface.drift_um
+        well = self._pos_well_name(self.stage_x_um, self.stage_y_um)
+        name = well or f'P{len(self.protocol_positions) + 1:02d}'
+        self.protocol_positions.append({
+            'name': name,
+            'x_um': self.stage_x_um,
+            'y_um': self.stage_y_um,
+            'z_um': self.stage_z_um - drift,
+        })
+        self._persist()
+        self._refresh_positions()
+        self._set_status(f'Position {name} added '
+                         f'({len(self.protocol_positions)} total)')
+
+    def position_remove_last(self):
+        if self.protocol_positions:
+            gone = self.protocol_positions.pop()
+            self._persist()
+            self._refresh_positions()
+            self._set_status(f'Removed position {gone["name"]}')
+
+    def position_clear(self):
+        self.protocol_positions = []
+        self._persist()
+        self._refresh_positions()
+        self._set_status('Positions cleared')
+
+    # --------------------------------------- position review walkthrough
+
+    def _pos_current_z(self, p: dict) -> float:
+        return p['z_um'] + self.surface.drift_um
+
+    def pos_review_start(self):
+        """Walk through every stored position: the stage moves there safely,
+        you fine-tune focus, press 'Set focus = here', then Next."""
+        if not self.protocol_positions:
+            self._set_status('No positions to review - add some first')
+            return
+        if not self.stage_connected:
+            self._set_status('Position review needs the stage')
+            return
+        self._pos_review_index = 0
+        self.pos_review_active = True
+        self._pos_review_goto()
+
+    def _pos_review_goto(self):
+        i = self._pos_review_index
+        p = self.protocol_positions[i]
+        n = len(self.protocol_positions)
+        self.pos_review_label = f'[{i + 1}/{n}] {p["name"]}'
+        self._refresh_positions(highlight=i)
+        z = self._pos_current_z(p)
+        self._set_status(f'Moving to {p["name"]}...')
+        self._bg(self._safe_goto, p['x_um'], p['y_um'], z)
+
+    def pos_review_next(self):
+        if not self.pos_review_active:
+            return
+        if self._pos_review_index < len(self.protocol_positions) - 1:
+            self._pos_review_index += 1
+            self._pos_review_goto()
+        else:
+            self._set_status('Last position - press Done when finished')
+
+    def pos_review_prev(self):
+        if not self.pos_review_active:
+            return
+        if self._pos_review_index > 0:
+            self._pos_review_index -= 1
+            self._pos_review_goto()
+
+    def pos_review_set_focus(self):
+        """Store the current focus (and XY trim) into the shown position."""
+        if not self.pos_review_active:
+            return
+        p = self.protocol_positions[self._pos_review_index]
+        p['x_um'] = self.stage_x_um
+        p['y_um'] = self.stage_y_um
+        p['z_um'] = self.stage_z_um - self.surface.drift_um
+        self._persist()
+        self._set_status(f'{p["name"]}: focus updated '
+                         f'(z={self.stage_z_um:.1f} um)')
+
+    def pos_review_done(self):
+        self.pos_review_active = False
+        self.pos_review_label = ''
+        self._refresh_positions(highlight=None)
+        self._set_status('Position review finished')
+
+    # ------------------------------------------------ protocol save/load
+
+    def _refresh_protocol_files(self):
+        try:
+            os.makedirs(PROTOCOLS_DIR, exist_ok=True)
+            names = [f[:-5] for f in os.listdir(PROTOCOLS_DIR)
+                     if f.endswith('.json')]
+        except Exception:
+            names = []
+        self.protocol_files = names or ['(none saved)']
+
+    def save_protocol(self, name: str):
+        """Save the full protocol definition: labware, channel settings,
+        AF configuration, focus surface, positions and timelapse settings.
+        Plate calibration is intentionally NOT included - redo that (plus
+        the position focus review) when the plate is remounted."""
+        name = (name or '').strip() or 'protocol1'
+        self.apply_channel_fields_quiet()
+        self.af_apply_fields()
+        payload = {
+            'format': 'lvp-protocol-1',
+            'name': name,
+            'labware_name': self.labware_name,
+            'channel_settings': acq.channel_settings_to_dict(self.channel_settings),
+            'af_config': {
+                'z_bottom_um': self.af_config.z_bottom_um,
+                'z_top_um': self.af_config.z_top_um,
+                'step_um': self.af_config.step_um,
+                'channel': self.af_config.channel,
+            },
+            'surface': self.surface.to_dict(),
+            'positions': self.protocol_positions,
+            'cycles': self.root.ids.protocol_cycles_input.text,
+            'interval_min': self.root.ids.protocol_interval_input.text,
+            'af_each_cycle': self.af_each_cycle_on,
+            'use_surface': self.use_surface_on,
+            'use_z_offsets': self.use_z_offsets_on,
+            'travel_clearance_um': self.travel_clearance_um,
+            'output_dir': self.output_dir,
+        }
+        try:
+            os.makedirs(PROTOCOLS_DIR, exist_ok=True)
+            import json
+            with open(os.path.join(PROTOCOLS_DIR, f'{name}.json'), 'w',
+                      encoding='utf-8') as f:
+                json.dump(payload, f, indent=2)
+            self.protocol_name = name
+            self._refresh_protocol_files()
+            self._set_status(f'Protocol "{name}" saved')
+        except Exception as e:
+            self._set_status(f'Protocol save failed: {e}')
+
+    def load_protocol(self, name: str):
+        """Load a saved protocol. Afterwards only the plate calibration and
+        the position focus review are needed before running."""
+        name = (name or '').strip()
+        if not name or name == '(none saved)':
+            return
+        try:
+            import json
+            with open(os.path.join(PROTOCOLS_DIR, f'{name}.json'), 'r',
+                      encoding='utf-8') as f:
+                d = json.load(f)
+        except Exception as e:
+            self._set_status(f'Protocol load failed: {e}')
+            return
+        try:
+            self.channel_settings = acq.channel_settings_from_dict(
+                d.get('channel_settings', {}))
+            af = d.get('af_config', {})
+            self.af_config = AutofocusConfig(
+                z_bottom_um=float(af.get('z_bottom_um', 0.0)),
+                z_top_um=float(af.get('z_top_um', 200.0)),
+                step_um=float(af.get('step_um', 10.0)),
+                channel=af.get('channel', 'BF'))
+            if d.get('surface'):
+                self.surface.from_dict(d['surface'])
+            self.protocol_positions = [dict(p) for p in d.get('positions', [])]
+            self.af_each_cycle_on = bool(d.get('af_each_cycle', True))
+            self.use_surface_on = bool(d.get('use_surface', True))
+            self.use_z_offsets_on = bool(d.get('use_z_offsets', True))
+            self.travel_clearance_um = float(d.get('travel_clearance_um', 500.0))
+            if d.get('output_dir'):
+                self.output_dir = d['output_dir']
+            lw_name = d.get('labware_name')
+            if lw_name and self.labware_lib.get(lw_name) is not None:
+                self.select_labware(lw_name)
+            ids = self.root.ids
+            ids.protocol_cycles_input.text = str(d.get('cycles', '1'))
+            ids.protocol_interval_input.text = str(d.get('interval_min', '5'))
+            self.protocol_name = name
+            self._sync_channel_fields()
+            self._sync_af_fields()
+            self._refresh_surface_info()
+            self._refresh_positions()
+            self._persist()
+            self._set_status(f'Protocol "{name}" loaded - calibrate the '
+                             f'plate, then run "Review positions"')
+        except Exception as e:
+            self._set_status(f'Protocol load failed: {e}')
+
+    def apply_channel_fields_quiet(self):
+        try:
+            self.apply_channel_fields()
+        except Exception:
+            pass
+
     def goto_center(self):
         if not self.stage_connected:
             return
@@ -927,17 +1198,15 @@ class LumaViewProApp(App):
         self._bg(_move)
 
     def on_image_double_click(self, dx_px: float, dy_px: float):
-        """Double-click on the live image: center the clicked point."""
+        """Double-click on the live image: center the clicked point.
+        Single vector move so the path is straight, not X-then-Y."""
         if not self.stage_connected:
             return
         scale = self.effective_um_per_px()
         dx_um = dx_px * scale * self.img_sign_x
         dy_um = dy_px * scale * self.img_sign_y
         self._set_status(f'Centering: dx={dx_um:.0f} um, dy={dy_um:.0f} um')
-        def _move():
-            self.hw.move_rel('X', dx_um)
-            self.hw.move_rel('Y', dy_um)
-        self._bg(_move)
+        self._bg(self.hw.move_xy_rel, dx_um, dy_um)
 
     def toggle_invert(self, which: str):
         if which == 'plate_x':
@@ -1166,10 +1435,15 @@ class LumaViewProApp(App):
     # ------------------------------------------------- timelapse protocol
 
     def run_protocol(self):
-        """Timelapse protocol: every cycle, optionally re-reference focus at
-        the AF anchor, then acquire all protocol-marked channels (plus their
-        z-stacks when marked) at the current position, saving each cycle to
-        its own folder under the protocol data directory."""
+        """Timelapse protocol over all stored positions.
+
+        Every cycle: optionally re-reference focus at the AF anchor (the
+        measured drift shifts every position's stored focus), then visit
+        each interaction position with safe Z-travel moves and acquire all
+        protocol-marked channels (plus their z-stacks). With no positions
+        defined, the current location is used. Focus per position: the
+        focus surface (if enabled and referenced with points), else the
+        position's reviewed focus plus drift."""
         if not (self.stage_connected and self.camera_connected):
             self._set_status('Protocol needs stage + camera')
             return
@@ -1183,7 +1457,11 @@ class LumaViewProApp(App):
         do_af = (self.af_each_cycle_on and
                  self.surface.anchor_xy is not None)
         self.af_apply_fields()
-        pos_x, pos_y = self.stage_x_um, self.stage_y_um
+        positions = [dict(p) for p in self.protocol_positions]
+        if not positions:
+            positions = [{'name': 'POS', 'x_um': self.stage_x_um,
+                          'y_um': self.stage_y_um,
+                          'z_um': self.stage_z_um - self.surface.drift_um}]
         base_dir = acq.timestamp_dir(self._out_base(), 'protocol')
         cancel = self.worker.cancel
 
@@ -1198,7 +1476,7 @@ class LumaViewProApp(App):
 
                 if do_af:
                     ax, ay = self.surface.anchor_xy
-                    self.hw.move_xy(ax, ay)
+                    self._safe_goto(ax, ay, None)
                     cfg = AutofocusConfig(
                         z_bottom_um=self.af_config.z_bottom_um,
                         z_top_um=self.af_config.z_top_um,
@@ -1216,33 +1494,43 @@ class LumaViewProApp(App):
                             lambda dt: self._refresh_surface_info(), 0)
                     if cancel.is_set():
                         break
-                    self.hw.move_xy(pos_x, pos_y)
 
-                base_z = None
-                if self.use_surface_on:
-                    base_z = self.surface.z_at(pos_x, pos_y)
-                for ch in channels:
+                drift = self.surface.drift_um
+                for p in positions:
                     if cancel.is_set():
                         break
-                    cs = self.channel_settings[ch]
-                    if base_z is not None:
+                    base_z = None
+                    if self.use_surface_on and self.surface.points and \
+                            self.surface.current_z is not None:
+                        base_z = self.surface.z_at(p['x_um'], p['y_um'])
+                    if base_z is None:
+                        base_z = p['z_um'] + drift
+                    self._set_status(f'Cycle {cyc + 1}: {p["name"]}...')
+                    self._safe_goto(p['x_um'], p['y_um'], base_z)
+                    for ch in channels:
+                        if cancel.is_set():
+                            break
+                        cs = self.channel_settings[ch]
                         z_off = cs.z_offset_um if self.use_z_offsets_on else 0.0
-                        self.hw.move_z(base_z + z_off)
-                    self.hw.set_channel(ch, cs)
-                    frame = self.hw.grab_settled(settle_s=0.2)
-                    if frame is not None:
-                        if self.shading_on:
-                            frame = self.shading.apply(frame, ch)
-                        acq.save_image(os.path.join(cyc_dir, f'{ch}.tiff'),
-                                       frame)
-                    if cs.zstack.enabled and not cancel.is_set():
-                        center = base_z if base_z is not None else self.hw.get_pos()[2]
-                        acq.run_z_stack(
-                            self.hw, self.channel_settings, [ch], center,
-                            self.shading if self.shading_on else None,
-                            cyc_dir, cancel, status_cb=self._set_status,
-                            use_channel_z_offsets=self.use_z_offsets_on)
-                self.hw.leds_off()
+                        if abs(z_off) > 0.01:
+                            self.hw.move_z(base_z + z_off)
+                        self.hw.set_channel(ch, cs)
+                        frame = self.hw.grab_settled(settle_s=0.2)
+                        if frame is not None:
+                            if self.shading_on:
+                                frame = self.shading.apply(frame, ch)
+                            acq.save_image(
+                                os.path.join(cyc_dir,
+                                             f'{p["name"]}_{ch}.tiff'), frame)
+                        if abs(z_off) > 0.01:
+                            self.hw.move_z(base_z)
+                        if cs.zstack.enabled and not cancel.is_set():
+                            acq.run_z_stack(
+                                self.hw, self.channel_settings, [ch], base_z,
+                                self.shading if self.shading_on else None,
+                                cyc_dir, cancel, status_cb=self._set_status,
+                                use_channel_z_offsets=self.use_z_offsets_on)
+                    self.hw.leds_off()
                 self._persist()
 
                 if cyc < cycles - 1:
@@ -1284,6 +1572,8 @@ class LumaViewProApp(App):
             'use_z_offsets_on': self.use_z_offsets_on,
             'af_each_cycle_on': self.af_each_cycle_on,
             'output_dir': self.output_dir,
+            'protocol_positions': self.protocol_positions,
+            'travel_clearance_um': self.travel_clearance_um,
         }
         try:
             acq.save_settings(payload)
@@ -1326,6 +1616,9 @@ class LumaViewProApp(App):
             self.use_z_offsets_on = bool(d.get('use_z_offsets_on', True))
             self.af_each_cycle_on = bool(d.get('af_each_cycle_on', True))
             self.output_dir = d.get('output_dir') or CAPTURES_DIR
+            self.protocol_positions = [dict(p) for p
+                                       in d.get('protocol_positions', [])]
+            self.travel_clearance_um = float(d.get('travel_clearance_um', 500.0))
         except Exception:
             pass
         self.shading.load_all()

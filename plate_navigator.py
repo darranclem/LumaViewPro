@@ -229,6 +229,8 @@ class WellPlateMapWidget(Widget):
         self.selected_well: tuple[int, int] | None = None
         self.marker_plate_mm: tuple[float, float] | None = None
         self.target_plate_mm: tuple[float, float] | None = None  # calibration
+        self.position_markers: list[tuple[float, float]] = []    # protocol
+        self.highlight_marker: int | None = None
         self.on_well_double_click = None  # callable(row, col, x_mm, y_mm)
         self.on_well_selected = None      # callable(row, col, x_mm, y_mm)
         self.bind(pos=self.redraw, size=self.redraw)
@@ -328,6 +330,13 @@ class WellPlateMapWidget(Widget):
         self.target_plate_mm = plate_mm
         self.redraw()
 
+    def set_position_markers(self, plate_mm_list: list[tuple[float, float]],
+                             highlight: int | None = None):
+        """Show the protocol interaction positions (plate top-left origin)."""
+        self.position_markers = list(plate_mm_list)
+        self.highlight_marker = highlight
+        self.redraw()
+
     # ------------------------------------------------------------- drawing
 
     def redraw(self, *args):
@@ -362,6 +371,17 @@ class WellPlateMapWidget(Widget):
                     else:
                         Line(ellipse=(sx - well_rx, sy - well_ry,
                                       2 * well_rx, 2 * well_ry), width=1.0)
+            # Protocol position markers
+            for i, pm in enumerate(self.position_markers):
+                sx, sy = self._mm_to_screen(*pm)
+                if i == self.highlight_marker:
+                    Color(1.0, 0.85, 0.1, 1)
+                    Line(points=[sx - 6, sy, sx, sy + 6, sx + 6, sy, sx, sy - 6,
+                                 sx - 6, sy], width=1.6)
+                else:
+                    Color(0.95, 0.75, 0.1, 0.9)
+                    Line(points=[sx - 4, sy, sx, sy + 4, sx + 4, sy, sx, sy - 4,
+                                 sx - 4, sy], width=1.1)
             # Stage position marker
             if self.marker_plate_mm is not None:
                 sx, sy = self._mm_to_screen(*self.marker_plate_mm)
