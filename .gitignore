@@ -51,3 +51,9 @@ docs/QUICK_ENHANCE.md
 docs/STITCHING.md
 docs/testing/
 stitching_benchmarking/
+
+# Custom Navigator app runtime state and outputs
+data/lvp_custom_settings.json
+data/shading/
+captures/
+.venv*/
