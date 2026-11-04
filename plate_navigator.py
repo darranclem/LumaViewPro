@@ -86,6 +86,7 @@ class ZoomPanCameraWidget(Image):
         self.fit_mode = 'contain'
         self.autoscale = False
         self.on_image_double_click = None  # callable(dx_px, dy_px)
+        self.on_focus_scroll = None        # callable(direction: +1 up / -1 down)
         self._frame_px_w = 0
         self._frame_px_h = 0
         self.set_standby_texture()
@@ -189,18 +190,24 @@ class ZoomPanCameraWidget(Image):
     # --------------------------------------------------------------- input
 
     def on_touch_down(self, touch):
-        if self.collide_point(*touch.pos) and touch.is_double_tap:
-            x, y, w, h = self._display_rect()
-            if w > 1 and h > 1 and self._frame_px_w > 0:
-                fx = (touch.x - (x + w / 2.0)) / w       # -0.5 .. +0.5
-                fy = (touch.y - (y + h / 2.0)) / h
-                if -0.5 <= fx <= 0.5 and -0.5 <= fy <= 0.5:
-                    dx_px = fx * self._frame_px_w
-                    # Screen +y is up; image rows grow downward.
-                    dy_px = -fy * self._frame_px_h
-                    if self.on_image_double_click:
-                        self.on_image_double_click(dx_px, dy_px)
-                    return True
+        if self.collide_point(*touch.pos):
+            # Mouse wheel over the image = fine focus (Z).
+            if getattr(touch, 'button', '') in ('scrollup', 'scrolldown'):
+                if self.on_focus_scroll:
+                    self.on_focus_scroll(1 if touch.button == 'scrolldown' else -1)
+                return True
+            if touch.is_double_tap:
+                x, y, w, h = self._display_rect()
+                if w > 1 and h > 1 and self._frame_px_w > 0:
+                    fx = (touch.x - (x + w / 2.0)) / w       # -0.5 .. +0.5
+                    fy = (touch.y - (y + h / 2.0)) / h
+                    if -0.5 <= fx <= 0.5 and -0.5 <= fy <= 0.5:
+                        dx_px = fx * self._frame_px_w
+                        # Screen +y is up; image rows grow downward.
+                        dy_px = -fy * self._frame_px_h
+                        if self.on_image_double_click:
+                            self.on_image_double_click(dx_px, dy_px)
+                        return True
         return super().on_touch_down(touch)
 
 

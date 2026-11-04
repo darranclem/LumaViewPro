@@ -25,29 +25,32 @@ if not hasattr(enum, 'StrEnum'):
 driver_paths = [
     r"C:\Program Files (x86)\LumaViewPro-stock",
     r"C:\Program Files (x86)\Etaluma\LumaViewPro",
-    r"C:\Program Files (x86)\LumaViewPro-main",
-    os.path.dirname(os.path.abspath(__file__))
 ]
+# APPEND the stock install paths so this repo's own modules (lvp_logger,
+# modules/, image_utils, ...) always win; the stock drivers (pyloncamera,
+# ledboard, motorboard) have no same-named files here, so they still
+# resolve from the stock folder.
 for p in driver_paths:
     if os.path.exists(p) and p not in sys.path:
-        sys.path.insert(0, p)
+        sys.path.append(p)
 
 
 def _ensure_lvp_logger():
     """Make `from lvp_logger import logger` work for the stock drivers.
 
-    This repo's own lvp_logger.py pulls in modules that use Python 3.12-only
-    syntax, so importing it on older interpreters raises SyntaxError -- which
-    made `import pyloncamera` (stock driver) fail and the camera never
-    connect. Fall back to a minimal stand-in module providing `logger`.
+    With this repo first on sys.path, a bare import resolves to the repo's
+    own lvp_logger (requires Python 3.12+ for its module chain). If that
+    fails (older interpreter, missing deps), fall back to a minimal
+    stand-in module that just provides `logger`.
     """
     import types
     import logging
     try:
-        import lvp_logger  # noqa: F401
-        return
+        import lvp_logger
+        if hasattr(lvp_logger, 'logger'):
+            return
     except Exception:
-        pass
+        sys.modules.pop('lvp_logger', None)
     logger = logging.getLogger('lumaviewpro')
     if not logger.handlers:
         handler = logging.StreamHandler()
@@ -131,6 +134,8 @@ class LumaViewProApp(App):
     cal_info = StringProperty('Plate not calibrated')
     use_surface_on = BooleanProperty(True)
     use_z_offsets_on = BooleanProperty(True)
+    af_each_cycle_on = BooleanProperty(True)
+    output_dir = StringProperty(CAPTURES_DIR)
 
     # -------------------------------------------------------------- setup
 
@@ -179,6 +184,7 @@ class LumaViewProApp(App):
         viewport = self.root.ids.get('main_camera_viewport')
         if viewport:
             viewport.on_image_double_click = self.on_image_double_click
+            viewport.on_focus_scroll = self.on_focus_scroll
         plate = self.root.ids.get('plate_map')
         if plate:
             plate.on_well_double_click = self.on_well_double_click
@@ -243,6 +249,15 @@ class LumaViewProApp(App):
                 led.connect()
             self.hw.led = led
             self.led_connected = bool(getattr(led, 'driver', False))
+            if self.led_connected:
+                # The firmware reset issued during connect() leaves a
+                # partial line in the serial buffer, so the first command
+                # gets a garbled response ('...mand not recognized').
+                # Absorb it with a STATUS exchange before real commands.
+                try:
+                    led.exchange_command('STATUS')
+                except Exception:
+                    pass
             self.hw.leds_off()
         except Exception as e:
             self._set_status(f'LED board error: {e}')
@@ -312,6 +327,7 @@ class LumaViewProApp(App):
                 self.stage_coord_str = (f'X {x / 1000:.3f}  Y {y / 1000:.3f}  '
                                         f'Z {z / 1000:.3f} mm')
                 self._update_plate_marker()
+                self._sync_z_slider(z)
             Clock.schedule_once(_apply, 0)
 
     def _update_plate_marker(self):
@@ -788,9 +804,9 @@ class LumaViewProApp(App):
         if frame is None:
             self._set_status('No frame to save')
             return
-        os.makedirs(CAPTURES_DIR, exist_ok=True)
+        os.makedirs(self._out_base(), exist_ok=True)
         ch = self.live_channel if self.live_channel in CHANNELS else 'IMG'
-        path = os.path.join(CAPTURES_DIR,
+        path = os.path.join(self._out_base(),
                             f'snap_{ch}_{time.strftime("%Y%m%d_%H%M%S")}.tiff')
         acq.save_image(path, frame)
         self._set_status(f'Saved {os.path.basename(path)}')
@@ -801,6 +817,68 @@ class LumaViewProApp(App):
         if not self.stage_connected:
             return
         self._bg(self.hw.move_rel, axis, um)
+
+    # ------------------------------------------------------- Z focus control
+
+    def on_focus_scroll(self, direction: int):
+        """Mouse wheel over the live image: fine focus (10 um per notch)."""
+        self.jog('Z', direction * 10.0)
+
+    def _sync_z_slider(self, z_um: float):
+        ids = self.root.ids if self.root else None
+        if not ids:
+            return
+        # Don't fight the user: skip sync shortly after a manual slider move.
+        if time.time() - getattr(self, '_z_user_ts', 0.0) < 1.5:
+            return
+        slider = ids.get('z_slider')
+        if slider is not None:
+            self._z_slider_sync = True
+            slider.value = min(max(z_um, slider.min), slider.max)
+            self._z_slider_sync = False
+
+    def z_slider_changed(self, value: float):
+        """Absolute Z from the focus slider (debounced while dragging)."""
+        if getattr(self, '_z_slider_sync', False):
+            return
+        if not self.stage_connected:
+            return
+        self._z_user_ts = time.time()
+        self._z_target = float(value)
+        if not hasattr(self, '_z_trigger'):
+            def _go(dt):
+                self._bg(self.hw.move_z, self._z_target)
+            self._z_trigger = Clock.create_trigger(_go, 0.2)
+        self._z_trigger()
+
+    def z_goto(self, text: str):
+        """Absolute Z position typed in um."""
+        z = self._f(text, None)
+        if z is None or not self.stage_connected:
+            return
+        self._bg(self.hw.move_z, float(z))
+
+    # ------------------------------------------------------ output directory
+
+    def _out_base(self) -> str:
+        base = (self.output_dir or '').strip() or CAPTURES_DIR
+        try:
+            os.makedirs(base, exist_ok=True)
+        except Exception:
+            base = CAPTURES_DIR
+            os.makedirs(base, exist_ok=True)
+        return base
+
+    def set_output_dir(self, text: str):
+        self.output_dir = text.strip() or CAPTURES_DIR
+        self._persist()
+        self._set_status(f'Protocol data directory: {self.output_dir}')
+
+    def open_output_dir(self):
+        try:
+            os.startfile(self._out_base())
+        except Exception as e:
+            self._set_status(f'Open folder failed: {e}')
 
     def goto_center(self):
         if not self.stage_connected:
@@ -1045,7 +1123,7 @@ class LumaViewProApp(App):
         else:
             positions = acq.tile_positions_grid(cx, cy, fov_x, fov_y,
                                                 rows, cols, overlap_pct=overlap)
-        out_dir = acq.timestamp_dir(CAPTURES_DIR, f'tiles_{pattern}')
+        out_dir = acq.timestamp_dir(self._out_base(), f'tiles_{pattern}')
         use_surface = self.use_surface_on and self.surface.current_z is not None
         def _job():
             acq.run_tile_scan(self.hw, positions, self.channel_settings,
@@ -1075,7 +1153,7 @@ class LumaViewProApp(App):
             center_z = self.surface.z_at(self.stage_x_um, self.stage_y_um)
         if center_z is None:
             center_z = self.stage_z_um
-        out_dir = acq.timestamp_dir(CAPTURES_DIR, 'zstack')
+        out_dir = acq.timestamp_dir(self._out_base(), 'zstack')
         def _job():
             acq.run_z_stack(self.hw, self.channel_settings, channels,
                             center_z, self.shading if self.shading_on else None,
@@ -1083,6 +1161,103 @@ class LumaViewProApp(App):
                             status_cb=self._set_status,
                             use_channel_z_offsets=self.use_z_offsets_on)
             Clock.schedule_once(lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
+        self._bg(_job, busy_job=True)
+
+    # ------------------------------------------------- timelapse protocol
+
+    def run_protocol(self):
+        """Timelapse protocol: every cycle, optionally re-reference focus at
+        the AF anchor, then acquire all protocol-marked channels (plus their
+        z-stacks when marked) at the current position, saving each cycle to
+        its own folder under the protocol data directory."""
+        if not (self.stage_connected and self.camera_connected):
+            self._set_status('Protocol needs stage + camera')
+            return
+        ids = self.root.ids
+        cycles = max(int(self._f(ids.protocol_cycles_input.text, 1)), 1)
+        interval_s = max(self._f(ids.protocol_interval_input.text, 5.0), 0.0) * 60.0
+        channels = [ch for ch in CHANNELS if self.channel_settings[ch].enabled]
+        if not channels:
+            self._set_status('No channels marked "Use in protocol"')
+            return
+        do_af = (self.af_each_cycle_on and
+                 self.surface.anchor_xy is not None)
+        self.af_apply_fields()
+        pos_x, pos_y = self.stage_x_um, self.stage_y_um
+        base_dir = acq.timestamp_dir(self._out_base(), 'protocol')
+        cancel = self.worker.cancel
+
+        def _job():
+            for cyc in range(cycles):
+                t0 = time.time()
+                if cancel.is_set():
+                    break
+                cyc_dir = os.path.join(base_dir, f'cycle_{cyc:04d}')
+                os.makedirs(cyc_dir, exist_ok=True)
+                self._set_status(f'Protocol cycle {cyc + 1}/{cycles}...')
+
+                if do_af:
+                    ax, ay = self.surface.anchor_xy
+                    self.hw.move_xy(ax, ay)
+                    cfg = AutofocusConfig(
+                        z_bottom_um=self.af_config.z_bottom_um,
+                        z_top_um=self.af_config.z_top_um,
+                        step_um=self.af_config.step_um,
+                        channel=self.surface.anchor_channel)
+                    best = acq.autofocus_sweep(
+                        self.hw, cfg, self._cs(self.surface.anchor_channel),
+                        cancel=cancel, status_cb=self._set_status)
+                    if best is not None:
+                        if self.surface.ref_z is None:
+                            self.surface.set_reference_z(best)
+                        else:
+                            self.surface.update_cycle(best)
+                        Clock.schedule_once(
+                            lambda dt: self._refresh_surface_info(), 0)
+                    if cancel.is_set():
+                        break
+                    self.hw.move_xy(pos_x, pos_y)
+
+                base_z = None
+                if self.use_surface_on:
+                    base_z = self.surface.z_at(pos_x, pos_y)
+                for ch in channels:
+                    if cancel.is_set():
+                        break
+                    cs = self.channel_settings[ch]
+                    if base_z is not None:
+                        z_off = cs.z_offset_um if self.use_z_offsets_on else 0.0
+                        self.hw.move_z(base_z + z_off)
+                    self.hw.set_channel(ch, cs)
+                    frame = self.hw.grab_settled(settle_s=0.2)
+                    if frame is not None:
+                        if self.shading_on:
+                            frame = self.shading.apply(frame, ch)
+                        acq.save_image(os.path.join(cyc_dir, f'{ch}.tiff'),
+                                       frame)
+                    if cs.zstack.enabled and not cancel.is_set():
+                        center = base_z if base_z is not None else self.hw.get_pos()[2]
+                        acq.run_z_stack(
+                            self.hw, self.channel_settings, [ch], center,
+                            self.shading if self.shading_on else None,
+                            cyc_dir, cancel, status_cb=self._set_status,
+                            use_channel_z_offsets=self.use_z_offsets_on)
+                self.hw.leds_off()
+                self._persist()
+
+                if cyc < cycles - 1:
+                    while time.time() - t0 < interval_s:
+                        if cancel.is_set():
+                            break
+                        remaining = interval_s - (time.time() - t0)
+                        self._set_status(
+                            f'Protocol: cycle {cyc + 1}/{cycles} done, '
+                            f'next in {remaining / 60:.1f} min')
+                        time.sleep(min(2.0, max(remaining, 0.1)))
+                    if cancel.is_set():
+                        break
+            Clock.schedule_once(lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
+            self._set_status(f'Protocol finished -> {base_dir}')
         self._bg(_job, busy_job=True)
 
     # -------------------------------------------------------- persistence
@@ -1107,6 +1282,8 @@ class LumaViewProApp(App):
             'plate_cal': self.plate_cal.to_dict() if self.plate_cal else None,
             'use_surface_on': self.use_surface_on,
             'use_z_offsets_on': self.use_z_offsets_on,
+            'af_each_cycle_on': self.af_each_cycle_on,
+            'output_dir': self.output_dir,
         }
         try:
             acq.save_settings(payload)
@@ -1147,6 +1324,8 @@ class LumaViewProApp(App):
                 self.plate_cal = pc
             self.use_surface_on = bool(d.get('use_surface_on', True))
             self.use_z_offsets_on = bool(d.get('use_z_offsets_on', True))
+            self.af_each_cycle_on = bool(d.get('af_each_cycle_on', True))
+            self.output_dir = d.get('output_dir') or CAPTURES_DIR
         except Exception:
             pass
         self.shading.load_all()

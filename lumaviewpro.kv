@@ -437,6 +437,42 @@ LumaViewProMainLayout:
                         on_press: app.run_tile_scan('spiral')
 
                 HeaderLabel:
+                    text: 'PROTOCOL DATA / TIMELAPSE'
+                PanelLabel:
+                    text: 'Output directory'
+                SmallInput:
+                    id: output_dir_input
+                    text: app.output_dir
+                    on_text_validate: app.set_output_dir(self.text)
+                FieldRow:
+                    FlatButton:
+                        text: 'Set directory'
+                        on_press: app.set_output_dir(output_dir_input.text)
+                    FlatButton:
+                        text: 'Open folder'
+                        on_press: app.open_output_dir()
+                FieldRow:
+                    PanelLabel:
+                        text: 'Cycles'
+                        size_hint_x: 0.3
+                    SmallInput:
+                        id: protocol_cycles_input
+                        text: '1'
+                    PanelLabel:
+                        text: 'Every (min)'
+                        size_hint_x: 0.38
+                    SmallInput:
+                        id: protocol_interval_input
+                        text: '5'
+                FlatButton:
+                    text: 'AF each cycle: ' + ('ON' if app.af_each_cycle_on else 'off')
+                    background_color: ACCENT if app.af_each_cycle_on else PANEL2
+                    on_press: app.af_each_cycle_on = not app.af_each_cycle_on
+                AccentButton:
+                    text: 'Run protocol (timelapse)'
+                    on_press: app.run_protocol()
+
+                HeaderLabel:
                     text: 'IMAGE SCALE'
                 FieldRow:
                     PanelLabel:
@@ -464,7 +500,7 @@ LumaViewProMainLayout:
             Label:
                 size_hint_y: None
                 height: '18dp'
-                text: 'Double-click the image to center that point under the optics'
+                text: 'Double-click: center that point under the optics  |  Mouse wheel: fine focus (Z)'
                 color: TXT_DIM
                 font_size: '10sp'
 
@@ -644,6 +680,33 @@ LumaViewProMainLayout:
                     FlatButton:
                         text: 'Re-home'
                         on_press: app.rehome()
+
+                HeaderLabel:
+                    text: 'Z FOCUS'
+                PanelLabel:
+                    text: 'Slider = absolute Z; mouse wheel on image = fine focus'
+                Slider:
+                    id: z_slider
+                    min: 0
+                    max: 14000
+                    value: 0
+                    size_hint_y: None
+                    height: '28dp'
+                    cursor_size: '16dp', '16dp'
+                    on_value: app.z_slider_changed(self.value)
+                FieldRow:
+                    PanelLabel:
+                        text: 'Go to Z (um)'
+                        size_hint_x: 0.45
+                    SmallInput:
+                        id: z_goto_input
+                        text: '0'
+                        on_text_validate: app.z_goto(self.text)
+                    FlatButton:
+                        text: 'Go'
+                        size_hint_x: None
+                        width: '40dp'
+                        on_press: app.z_goto(z_goto_input.text)
 
                 HeaderLabel:
                     text: 'FOCUS SURFACE STATUS'
