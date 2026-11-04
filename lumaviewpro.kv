@@ -1,261 +1,556 @@
-#:kivy 2.3.0
+#:kivy 2.3
+#:set BG (0.118, 0.118, 0.129, 1)
+#:set PANEL (0.161, 0.165, 0.180, 1)
+#:set PANEL2 (0.196, 0.200, 0.216, 1)
+#:set ACCENT (0.0, 0.62, 0.84, 1)
+#:set TXT (0.88, 0.89, 0.90, 1)
+#:set TXT_DIM (0.60, 0.62, 0.65, 1)
 
-<LumaViewProMainLayout>:
+<FlatButton@Button>:
+    background_normal: ''
+    background_down: ''
+    background_color: PANEL2
+    color: TXT
+    font_size: '12sp'
+    size_hint_y: None
+    height: '28dp'
+
+<AccentButton@FlatButton>:
+    background_color: ACCENT
+
+<StopButton@FlatButton>:
+    background_color: (0.75, 0.20, 0.17, 1)
+
+<PanelLabel@Label>:
+    color: TXT_DIM
+    font_size: '11sp'
+    size_hint_y: None
+    height: '18dp'
+    halign: 'left'
+    valign: 'middle'
+    text_size: self.size
+
+<HeaderLabel@Label>:
+    color: ACCENT
+    bold: True
+    font_size: '12sp'
+    size_hint_y: None
+    height: '22dp'
+    halign: 'left'
+    valign: 'middle'
+    text_size: self.size
+
+<SmallInput@TextInput>:
+    multiline: False
+    write_tab: False
+    background_color: (0.09, 0.09, 0.10, 1)
+    foreground_color: TXT
+    cursor_color: ACCENT
+    font_size: '12sp'
+    size_hint_y: None
+    height: '26dp'
+    padding: ['6dp', '4dp']
+
+<DarkSpinner@Spinner>:
+    background_normal: ''
+    background_down: ''
+    background_color: PANEL2
+    color: TXT
+    font_size: '12sp'
+    size_hint_y: None
+    height: '28dp'
+
+<FieldRow@BoxLayout>:
+    orientation: 'horizontal'
+    size_hint_y: None
+    height: '26dp'
+    spacing: '4dp'
+
+LumaViewProMainLayout:
     orientation: 'vertical'
-    padding: ('8dp', 0)
-    spacing: '6dp'
+    canvas.before:
+        Color:
+            rgba: BG
+        Rectangle:
+            pos: self.pos
+            size: self.size
 
+    # ============================= TOP TOOLBAR =============================
     BoxLayout:
         size_hint_y: None
-        height: '42dp'
-        spacing: '10dp'
+        height: '38dp'
+        padding: '6dp', '4dp'
+        spacing: '6dp'
         canvas.before:
             Color:
-                rgba: 0.12, 0.14, 0.18, 1.0
+                rgba: PANEL
             Rectangle:
                 pos: self.pos
                 size: self.size
-
         Label:
-            text: "LumaViewPro Microscope Control System"
-            font_size: '18sp'
+            text: 'LumaViewPro Navigator'
+            color: ACCENT
             bold: True
-            color: 0.2, 0.8, 1.0, 1.0
-            size_hint_x: 0.40
-            halign: 'left'
-            valign: 'middle'
-            text_size: self.size
-
+            font_size: '15sp'
+            size_hint_x: None
+            width: '190dp'
         Label:
-            text: app.status_msg
-            font_size: '13sp'
-            color: 0.8, 0.8, 0.2, 1.0
-            size_hint_x: 0.25
-            halign: 'center'
-            valign: 'middle'
-
+            text: 'Depth:'
+            color: TXT_DIM
+            font_size: '12sp'
+            size_hint_x: None
+            width: '42dp'
+        DarkSpinner:
+            id: bit_depth_spinner
+            size_hint_x: None
+            width: '70dp'
+            text: app.bit_depth
+            values: app.bit_depth_options
+            on_text: app.set_bit_depth(self.text)
         Label:
-            text: app.stage_coord_str
-            font_size: '14sp'
-            color: 0.9, 0.9, 0.9, 1.0
-            size_hint_x: 0.35
-            halign: 'right'
-            valign: 'middle'
-            text_size: self.size
+            text: 'Binning:'
+            color: TXT_DIM
+            font_size: '12sp'
+            size_hint_x: None
+            width: '50dp'
+        DarkSpinner:
+            id: binning_spinner
+            size_hint_x: None
+            width: '52dp'
+            text: app.binning
+            values: ['1', '2', '3', '4']
+            on_text: app.binning = self.text; app.set_binning(self.text)
+        FlatButton:
+            text: 'Crosshair: ' + ('ON' if app.crosshair_on else 'off')
+            size_hint_x: None
+            width: '96dp'
+            background_color: ACCENT if app.crosshair_on else PANEL2
+            on_press: app.crosshair_on = not app.crosshair_on
+        FlatButton:
+            text: 'Autoscale: ' + ('ON' if app.autoscale_on else 'off')
+            size_hint_x: None
+            width: '100dp'
+            background_color: ACCENT if app.autoscale_on else PANEL2
+            on_press: app.autoscale_on = not app.autoscale_on
+        FlatButton:
+            text: 'Shading: ' + ('ON' if app.shading_on else 'off')
+            size_hint_x: None
+            width: '92dp'
+            background_color: ACCENT if app.shading_on else PANEL2
+            on_press: app.toggle_shading(not app.shading_on)
+        FlatButton:
+            text: 'Snap'
+            size_hint_x: None
+            width: '58dp'
+            on_press: app.snap_image()
+        Widget:
+        StopButton:
+            text: 'STOP JOB'
+            size_hint_x: None
+            width: '86dp'
+            opacity: 1 if app.worker_busy else 0.35
+            on_press: app.cancel_job()
 
+    # ============================== MAIN AREA ==============================
     BoxLayout:
         orientation: 'horizontal'
-        spacing: '8dp'
+        spacing: '4dp'
+        padding: '4dp'
 
-        ZoomPanCameraWidget:
-            id: main_camera_viewport
-            size_hint_x: 0.65
+        # ---------------- LEFT: channels + acquisition ----------------
+        ScrollView:
+            size_hint_x: None
+            width: '250dp'
+            do_scroll_x: False
+            bar_width: '4dp'
+            BoxLayout:
+                orientation: 'vertical'
+                size_hint_y: None
+                height: self.minimum_height
+                spacing: '4dp'
+                padding: '6dp'
+                canvas.before:
+                    Color:
+                        rgba: PANEL
+                    Rectangle:
+                        pos: self.pos
+                        size: self.size
 
+                HeaderLabel:
+                    text: 'LIVE CHANNEL'
+                GridLayout:
+                    cols: 4
+                    spacing: '3dp'
+                    size_hint_y: None
+                    height: '62dp'
+                    FlatButton:
+                        text: 'BF'
+                        background_color: ACCENT if app.live_channel == 'BF' else PANEL2
+                        on_press: app.set_live('BF')
+                    FlatButton:
+                        text: 'PC'
+                        background_color: ACCENT if app.live_channel == 'PC' else PANEL2
+                        on_press: app.set_live('PC')
+                    FlatButton:
+                        text: 'DF'
+                        background_color: ACCENT if app.live_channel == 'DF' else PANEL2
+                        on_press: app.set_live('DF')
+                    FlatButton:
+                        text: 'OFF'
+                        background_color: (0.75, 0.20, 0.17, 1) if app.live_channel == 'OFF' else PANEL2
+                        on_press: app.set_live('OFF')
+                    FlatButton:
+                        text: 'Blue'
+                        color: (0.3, 0.95, 1.0, 1)
+                        background_color: ACCENT if app.live_channel == 'BLUE' else PANEL2
+                        on_press: app.set_live('BLUE')
+                    FlatButton:
+                        text: 'Green'
+                        color: (0.35, 0.95, 0.35, 1)
+                        background_color: ACCENT if app.live_channel == 'GREEN' else PANEL2
+                        on_press: app.set_live('GREEN')
+                    FlatButton:
+                        text: 'Red'
+                        color: (1.0, 0.4, 0.3, 1)
+                        background_color: ACCENT if app.live_channel == 'RED' else PANEL2
+                        on_press: app.set_live('RED')
+                    Widget:
+
+                HeaderLabel:
+                    text: 'CHANNEL SETTINGS'
+                FieldRow:
+                    PanelLabel:
+                        text: 'Channel'
+                        size_hint_x: 0.45
+                    DarkSpinner:
+                        id: channel_spinner
+                        text: app.selected_channel
+                        values: ['BF', 'PC', 'DF', 'BLUE', 'GREEN', 'RED']
+                        on_text: app.select_channel(self.text)
+                FieldRow:
+                    PanelLabel:
+                        text: 'Exposure (ms)'
+                        size_hint_x: 0.55
+                    SmallInput:
+                        id: exposure_input
+                        text: '20'
+                FieldRow:
+                    PanelLabel:
+                        text: 'Gain (dB)'
+                        size_hint_x: 0.55
+                    SmallInput:
+                        id: gain_input
+                        text: '0'
+                FieldRow:
+                    PanelLabel:
+                        text: 'LED power (mA)'
+                        size_hint_x: 0.55
+                    SmallInput:
+                        id: led_input
+                        text: '50'
+                FieldRow:
+                    PanelLabel:
+                        text: 'Colour Z offset (um)'
+                        size_hint_x: 0.55
+                    SmallInput:
+                        id: zoffset_input
+                        text: '0'
+                FieldRow:
+                    PanelLabel:
+                        text: 'Use in acquisition'
+                        size_hint_x: 0.75
+                    CheckBox:
+                        id: channel_enabled_chk
+                        active: True
+                        size_hint_x: 0.25
+                AccentButton:
+                    text: 'Apply channel settings'
+                    on_press: app.apply_channel_fields()
+
+                HeaderLabel:
+                    text: 'Z-STACK (per channel)'
+                FieldRow:
+                    PanelLabel:
+                        text: 'Stack this channel'
+                        size_hint_x: 0.75
+                    CheckBox:
+                        id: zstack_enabled_chk
+                        size_hint_x: 0.25
+                FieldRow:
+                    PanelLabel:
+                        text: 'Range (um)'
+                        size_hint_x: 0.55
+                    SmallInput:
+                        id: zstack_range_input
+                        text: '50'
+                FieldRow:
+                    PanelLabel:
+                        text: 'Step (um)'
+                        size_hint_x: 0.55
+                    SmallInput:
+                        id: zstack_step_input
+                        text: '5'
+                FieldRow:
+                    FlatButton:
+                        text: 'Stack marked'
+                        on_press: app.run_zstack(all_channels=False)
+                    FlatButton:
+                        text: 'Stack all'
+                        on_press: app.run_zstack(all_channels=True)
+
+                HeaderLabel:
+                    text: 'AUTOFOCUS'
+                FieldRow:
+                    PanelLabel:
+                        text: 'Bottom (um)'
+                        size_hint_x: 0.45
+                    SmallInput:
+                        id: af_bottom_input
+                        text: '0'
+                    FlatButton:
+                        text: 'here'
+                        size_hint_x: None
+                        width: '44dp'
+                        on_press: app.af_set_bottom_here()
+                FieldRow:
+                    PanelLabel:
+                        text: 'Top (um)'
+                        size_hint_x: 0.45
+                    SmallInput:
+                        id: af_top_input
+                        text: '200'
+                    FlatButton:
+                        text: 'here'
+                        size_hint_x: None
+                        width: '44dp'
+                        on_press: app.af_set_top_here()
+                FieldRow:
+                    PanelLabel:
+                        text: 'Interval (um)'
+                        size_hint_x: 0.45
+                    SmallInput:
+                        id: af_step_input
+                        text: '10'
+                FieldRow:
+                    FlatButton:
+                        text: 'Anchor = here'
+                        on_press: app.af_set_anchor_here()
+                    FlatButton:
+                        text: 'Go to anchor'
+                        on_press: app.af_goto_anchor()
+                AccentButton:
+                    text: 'Run AF cycle (updates surface)'
+                    on_press: app.run_af_cycle()
+
+                HeaderLabel:
+                    text: 'FOCUS SURFACE'
+                FieldRow:
+                    FlatButton:
+                        text: '+ point here'
+                        on_press: app.surface_add_point_here()
+                    FlatButton:
+                        text: 'Clear'
+                        on_press: app.surface_clear_points()
+                FlatButton:
+                    text: 'Z -> surface here'
+                    on_press: app.surface_goto_here_z()
+
+                HeaderLabel:
+                    text: 'SHADING CORRECTION'
+                FlatButton:
+                    text: 'Capture reference (selected ch)'
+                    on_press: app.capture_shading_reference()
+
+                HeaderLabel:
+                    text: 'TILE SCAN'
+                FieldRow:
+                    PanelLabel:
+                        text: 'Rows'
+                        size_hint_x: 0.3
+                    SmallInput:
+                        id: tile_rows_input
+                        text: '3'
+                    PanelLabel:
+                        text: 'Cols'
+                        size_hint_x: 0.3
+                    SmallInput:
+                        id: tile_cols_input
+                        text: '3'
+                FieldRow:
+                    PanelLabel:
+                        text: 'Overlap (%)'
+                        size_hint_x: 0.55
+                    SmallInput:
+                        id: tile_overlap_input
+                        text: '10'
+                FieldRow:
+                    AccentButton:
+                        text: 'Grid scan'
+                        on_press: app.run_tile_scan('grid')
+                    AccentButton:
+                        text: 'Spiral scan'
+                        on_press: app.run_tile_scan('spiral')
+
+                HeaderLabel:
+                    text: 'IMAGE SCALE'
+                FieldRow:
+                    PanelLabel:
+                        text: 'um / pixel (bin 1)'
+                        size_hint_x: 0.55
+                    SmallInput:
+                        id: um_per_px_input
+                        text: str(app.base_um_per_px)
+                        on_text_validate: app.set_um_per_px(self.text)
+                FieldRow:
+                    FlatButton:
+                        text: 'Flip img X'
+                        on_press: app.toggle_invert('img_x')
+                    FlatButton:
+                        text: 'Flip img Y'
+                        on_press: app.toggle_invert('img_y')
+
+        # ------------------------- CENTER: image -------------------------
         BoxLayout:
             orientation: 'vertical'
-            size_hint_x: 0.08
             spacing: '4dp'
-            padding: '4dp'
-            canvas.before:
-                Color:
-                    rgba: 0.14, 0.16, 0.20, 1.0
-                Rectangle:
-                    pos: self.pos
-                    size: self.size
-
+            ZoomPanCameraWidget:
+                id: main_camera_viewport
+                show_crosshair: app.crosshair_on
             Label:
-                text: "Z Focus"
-                font_size: '11sp'
-                bold: True
                 size_hint_y: None
                 height: '18dp'
-
-            Button:
-                text: 'Z++'
+                text: 'Double-click the image to center that point under the optics'
+                color: TXT_DIM
                 font_size: '10sp'
-                size_hint_y: None
-                height: '24dp'
-                on_press: app.jog_z(100)
 
-            Button:
-                text: 'Z+'
-                font_size: '10sp'
-                size_hint_y: None
-                height: '24dp'
-                on_press: app.jog_z(10)
-
-            Button:
-                text: 'z+'
-                font_size: '10sp'
-                size_hint_y: None
-                height: '24dp'
-                on_press: app.jog_z(1)
-
-            Slider:
-                orientation: 'vertical'
-                min: -10.0
-                max: 10.0
-                value: app.stage_z
-                on_value: app.set_z_focus_absolute(self.value)
-
-            Button:
-                text: 'z-'
-                font_size: '10sp'
-                size_hint_y: None
-                height: '24dp'
-                on_press: app.jog_z(-1)
-
-            Button:
-                text: 'Z-'
-                font_size: '10sp'
-                size_hint_y: None
-                height: '24dp'
-                on_press: app.jog_z(-10)
-
-            Button:
-                text: 'Z--'
-                font_size: '10sp'
-                size_hint_y: None
-                height: '24dp'
-                on_press: app.jog_z(-100)
-
-            Button:
-                text: 'Zero Z'
-                font_size: '10sp'
-                size_hint_y: None
-                height: '24dp'
-                on_press: app.zero_z_baseline()
-
+        # --------------- RIGHT: plate navigator + stage ---------------
         BoxLayout:
             orientation: 'vertical'
-            size_hint_x: 0.27
-            spacing: '6dp'
+            size_hint_x: None
+            width: '300dp'
+            spacing: '4dp'
             padding: '6dp'
             canvas.before:
                 Color:
-                    rgba: 0.15, 0.17, 0.22, 1.0
+                    rgba: PANEL
                 Rectangle:
                     pos: self.pos
                     size: self.size
 
+            HeaderLabel:
+                text: 'PLATE NAVIGATOR'
+            WellPlateMapWidget:
+                id: plate_map
+                size_hint_y: None
+                height: '200dp'
+            FieldRow:
+                PanelLabel:
+                    text: 'Selected well: ' + app.selected_well_str
+                    size_hint_x: 0.6
+                FlatButton:
+                    text: 'Set A1 = here'
+                    on_press: app.set_a1_here()
+            FieldRow:
+                FlatButton:
+                    text: 'Flip plate X'
+                    on_press: app.toggle_invert('plate_x')
+                FlatButton:
+                    text: 'Flip plate Y'
+                    on_press: app.toggle_invert('plate_y')
+            PanelLabel:
+                text: 'Double-click a well to move the stage there'
+
+            HeaderLabel:
+                text: 'STAGE'
             Label:
-                text: "Illumination & Camera"
-                font_size: '14sp'
+                text: app.stage_coord_str
+                color: TXT
+                font_size: '13sp'
                 bold: True
                 size_hint_y: None
-                height: '20dp'
-                color: 0.3, 0.8, 1.0, 1.0
-
-            BoxLayout:
-                size_hint_y: None
-                height: '28dp'
-                spacing: '6dp'
-                Label:
-                    text: "Exposure (ms): " + str(round(app.camera_exposure_ms, 1))
-                    size_hint_x: 0.45
-                    font_size: '11sp'
-                Slider:
-                    min: 0.1
-                    max: 200.0
-                    value: app.camera_exposure_ms
-                    on_value: app.set_camera_exposure(self.value)
-                    size_hint_x: 0.55
-
-            BoxLayout:
-                size_hint_y: None
-                height: '28dp'
-                spacing: '6dp'
-                Label:
-                    text: "LED Power (%): " + str(int(app.led_power_pct))
-                    size_hint_x: 0.45
-                    font_size: '11sp'
-                Slider:
-                    min: 0
-                    max: 100
-                    value: app.led_power_pct
-                    on_value: app.set_led_power(self.value)
-                    size_hint_x: 0.55
-
-            GridLayout:
-                cols: 2
-                spacing: '4dp'
-                size_hint_y: None
-                height: '30dp'
-                Button:
-                    text: 'Auto Gain'
-                    on_press: app.toggle_auto_gain()
-                Button:
-                    text: 'Stream Test'
-                    on_press: app.run_hardware_stream_diagnostic()
-
-            Label:
-                text: "Optical Channels"
-                font_size: '14sp'
-                bold: True
-                size_hint_y: None
-                height: '20dp'
-                color: 0.3, 0.8, 1.0, 1.0
-
-            GridLayout:
-                cols: 2
-                spacing: '3dp'
-                size_hint_y: None
-                height: '110dp'
-                Button:
-                    text: 'Brightfield'
-                    on_press: app.set_active_channel('BF')
-                Button:
-                    text: 'Phase (PC)'
-                    on_press: app.set_active_channel('PC')
-                Button:
-                    text: 'Darkfield (DF)'
-                    on_press: app.set_active_channel('DF')
-                Button:
-                    text: 'Blue (470)'
-                    on_press: app.set_active_channel('BLUE')
-                Button:
-                    text: 'Green (530)'
-                    on_press: app.set_active_channel('GREEN')
-                Button:
-                    text: 'Red (625)'
-                    on_press: app.set_active_channel('RED')
-                Button:
-                    text: 'LEDs Off'
-                    background_color: (0.8, 0.2, 0.2, 1.0)
-                    on_press: app.turn_off_all_leds()
-
-            Label:
-                text: "Stage Controls"
-                font_size: '14sp'
-                bold: True
-                size_hint_y: None
-                height: '20dp'
-                color: 0.3, 0.8, 1.0, 1.0
-
+                height: '22dp'
             GridLayout:
                 cols: 3
-                spacing: '4dp'
+                spacing: '3dp'
                 size_hint_y: None
-                height: '90dp'
+                height: '96dp'
+                Widget:
+                FlatButton:
+                    text: 'Y +'
+                    on_press: app.jog('Y', 1000)
+                Widget:
+                FlatButton:
+                    text: 'X -'
+                    on_press: app.jog('X', -1000)
+                FlatButton:
+                    text: 'Center'
+                    on_press: app.goto_center()
+                FlatButton:
+                    text: 'X +'
+                    on_press: app.jog('X', 1000)
+                Widget:
+                FlatButton:
+                    text: 'Y -'
+                    on_press: app.jog('Y', -1000)
+                Widget:
+            GridLayout:
+                cols: 4
+                spacing: '3dp'
+                size_hint_y: None
+                height: '62dp'
+                FlatButton:
+                    text: 'Z +100'
+                    on_press: app.jog('Z', 100)
+                FlatButton:
+                    text: 'Z +10'
+                    on_press: app.jog('Z', 10)
+                FlatButton:
+                    text: 'Z -10'
+                    on_press: app.jog('Z', -10)
+                FlatButton:
+                    text: 'Z -100'
+                    on_press: app.jog('Z', -100)
+                FlatButton:
+                    text: 'XY -5k'
+                    on_press: app.jog('X', -5000); app.jog('Y', -5000)
+                FlatButton:
+                    text: 'Z +1k'
+                    on_press: app.jog('Z', 1000)
+                FlatButton:
+                    text: 'Z -1k'
+                    on_press: app.jog('Z', -1000)
+                FlatButton:
+                    text: 'Re-home'
+                    on_press: app.rehome()
 
-                Widget:
-                Button:
-                    text: 'Y+ (Up)'
-                    on_press: app.jog_stage(0, 1)
-                Widget:
+            HeaderLabel:
+                text: 'FOCUS SURFACE STATUS'
+            Label:
+                text: app.surface_info
+                color: TXT_DIM
+                font_size: '10sp'
+                size_hint_y: None
+                height: '40dp'
+                text_size: self.width, None
+                halign: 'left'
+                valign: 'top'
+            Widget:
 
-                Button:
-                    text: 'X- (Left)'
-                    on_press: app.jog_stage(-1, 0)
-                Button:
-                    text: 'Home'
-                    on_press: app.home_stage_and_synchronize()
-                Button:
-                    text: 'X+ (Right)'
-                    on_press: app.jog_stage(1, 0)
-
-                Widget:
-                Button:
-                    text: 'Y- (Down)'
-                    on_press: app.jog_stage(0, -1)
-                Widget:
+    # ============================= STATUS BAR =============================
+    BoxLayout:
+        size_hint_y: None
+        height: '24dp'
+        padding: '8dp', '2dp'
+        canvas.before:
+            Color:
+                rgba: PANEL
+            Rectangle:
+                pos: self.pos
+                size: self.size
+        Label:
+            text: app.status_msg
+            color: (1.0, 0.75, 0.2, 1) if app.worker_busy else TXT
+            font_size: '12sp'
+            halign: 'left'
+            valign: 'middle'
+            text_size: self.size
