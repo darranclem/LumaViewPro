@@ -222,7 +222,14 @@ class LumaViewProApp(App):
         Clock.schedule_interval(self.update_live_feed, 1.0 / 30.0)
         threading.Thread(target=self._position_poller, daemon=True).start()
         from kivy.core.window import Window
-        Window.bind(on_key_down=self._on_key_down)
+        Window.bind(on_key_down=self._on_key_down, on_key_up=self._on_key_up)
+
+    def _on_key_up(self, window, key, scancode):
+        if key in (304, 303):
+            self._shift_down = False
+        elif key in (305, 306):
+            self._ctrl_down = False
+        return False
 
     def _text_input_focused(self) -> bool:
         if not self.root:
@@ -231,7 +238,14 @@ class LumaViewProApp(App):
 
     def _on_key_down(self, window, key, scancode, codepoint, modifiers):
         """Keyboard nudge: arrows = XY jog by the step size (Shift = 10x);
-        PgUp/PgDn = Z +/-10 um (Shift = 100 um)."""
+        PgUp/PgDn = Z +/-10 um (Shift = 100 um). Also tracks Shift/Ctrl
+        for mouse-wheel focus speed."""
+        if key in (304, 303):
+            self._shift_down = True
+            return False
+        if key in (305, 306):
+            self._ctrl_down = True
+            return False
         if self._text_input_focused():
             return False
         mult = 10.0 if 'shift' in (modifiers or []) else 1.0
@@ -892,8 +906,15 @@ class LumaViewProApp(App):
     # ------------------------------------------------------- Z focus control
 
     def on_focus_scroll(self, direction: int):
-        """Mouse wheel over the live image: fine focus (10 um per notch)."""
-        self.jog('Z', direction * 10.0)
+        """Mouse wheel over the live image: focus jog. Default 10 um per
+        notch; Shift = 2 um (fine), Ctrl = 100 um (coarse)."""
+        if getattr(self, '_shift_down', False):
+            step = 2.0
+        elif getattr(self, '_ctrl_down', False):
+            step = 100.0
+        else:
+            step = 10.0
+        self.jog('Z', direction * step)
 
     def _sync_z_slider(self, z_um: float):
         ids = self.root.ids if self.root else None
@@ -1316,6 +1337,40 @@ class LumaViewProApp(App):
             return
         x, y = self.surface.anchor_xy
         self._bg(self.hw.move_xy, x, y)
+
+    def run_af_test(self):
+        """Test autofocus on the CURRENT field of view with the selected
+        channel and the configured bottom/top/interval. Does not touch the
+        focus surface."""
+        if not (self.stage_connected and self.camera_connected):
+            self._set_status('AF test needs stage + camera')
+            return
+        self.af_apply_fields()
+        ch = self.selected_channel
+        cfg = AutofocusConfig(z_bottom_um=self.af_config.z_bottom_um,
+                              z_top_um=self.af_config.z_top_um,
+                              step_um=self.af_config.step_um,
+                              channel=ch)
+        def _job():
+            t0 = time.time()
+            def _pos(z):
+                Clock.schedule_once(lambda dt: setattr(self, 'stage_z_um', z), 0)
+            best, ok = acq.autofocus_sweep(self.hw, cfg, self._cs(ch),
+                                           cancel=self.worker.cancel,
+                                           status_cb=self._set_status,
+                                           pos_cb=_pos)
+            self.hw.leds_off()
+            Clock.schedule_once(lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
+            dt_s = time.time() - t0
+            if best is None:
+                self._set_status('AF test canceled')
+            elif ok:
+                self._set_status(f'AF TEST: best focus z={best:.2f} um '
+                                 f'({ch}, {dt_s:.1f} s)')
+            else:
+                self._set_status(f'AF TEST: LOW CONTRAST - parked mid-range '
+                                 f'z={best:.1f} um ({dt_s:.1f} s)')
+        self._bg(_job, busy_job=True)
 
     def run_af_cycle(self):
         """Move to the AF anchor, autofocus over the configured range, and
