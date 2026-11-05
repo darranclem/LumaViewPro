@@ -70,7 +70,7 @@ class ChannelSettings:
     exposure_ms: float = 20.0
     gain_db: float = 0.0
     led_power: int = 50        # value sent on the wire: LED{ch}_{value} (mA)
-    enabled: bool = True       # include in acquisitions (tiles / z-stacks)
+    enabled: bool = False      # include in protocols - must be actively set
     z_offset_um: float = 0.0   # chromatic aberration compensation
     zstack: ZStackConfig = field(default_factory=ZStackConfig)
 
@@ -1075,7 +1075,7 @@ def channel_settings_from_dict(d: dict) -> dict[str, ChannelSettings]:
             exposure_ms=float(v.get('exposure_ms', 20.0)),
             gain_db=float(v.get('gain_db', 0.0)),
             led_power=int(v.get('led_power', 50)),
-            enabled=bool(v.get('enabled', True)),
+            enabled=bool(v.get('enabled', False)),
             z_offset_um=float(v.get('z_offset_um', 0.0)),
             zstack=ZStackConfig(
                 enabled=bool(z.get('enabled', False)),

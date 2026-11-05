@@ -291,8 +291,16 @@ LumaViewProMainLayout:
                         size_hint_x: 0.75
                     CheckBox:
                         id: channel_enabled_chk
-                        active: True
+                        active: False
                         size_hint_x: 0.25
+                FieldRow:
+                    PanelLabel:
+                        text: 'AF channel (only one)'
+                        size_hint_x: 0.75
+                    CheckBox:
+                        id: af_channel_chk
+                        size_hint_x: 0.25
+                        on_active: app.set_af_channel(self.active)
                 AccentButton:
                     text: 'Apply channel settings'
                     on_press: app.apply_channel_fields()

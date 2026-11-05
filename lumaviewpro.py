@@ -121,6 +121,7 @@ class LumaViewProApp(App):
     selected_well_str = StringProperty('--')
     live_channel = StringProperty('OFF')
     selected_channel = StringProperty('BF')
+    af_channel = StringProperty('BF')   # the ONE channel used for autofocus
     bit_depth_options = ListProperty(['8-bit'])
     bit_depth = StringProperty('8-bit')
     binning = StringProperty('1')
@@ -733,6 +734,11 @@ class LumaViewProApp(App):
         zstack_chk = ids.get('zstack_enabled_chk')
         if zstack_chk is not None:
             zstack_chk.active = cs.zstack.enabled
+        af_chk = ids.get('af_channel_chk')
+        if af_chk is not None:
+            self._af_chk_sync = True
+            af_chk.active = (self.selected_channel == self.af_channel)
+            self._af_chk_sync = False
         self._sync_channel_sliders()
 
     @staticmethod
@@ -741,6 +747,22 @@ class LumaViewProApp(App):
             return float(widget_text)
         except Exception:
             return fallback
+
+    def set_af_channel(self, active: bool):
+        """Designate the selected channel as THE autofocus channel (single
+        choice: all other channels' protocol Z derives from its AF result
+        via focus points and the chromatic corrections)."""
+        if getattr(self, '_af_chk_sync', False):
+            return
+        if active:
+            self.af_channel = self.selected_channel
+            self.af_config.channel = self.af_channel
+            self.surface.anchor_channel = self.af_channel
+            self._persist()
+            self._set_status(f'Autofocus channel: {self.af_channel}')
+        else:
+            # Re-check: exactly one AF channel must exist.
+            Clock.schedule_once(lambda dt: self._sync_channel_fields(), 0)
 
     def apply_channel_fields(self):
         """Read the per-channel fields into the selected channel's settings
@@ -1151,6 +1173,7 @@ class LumaViewProApp(App):
             'cycles': self.root.ids.protocol_cycles_input.text,
             'interval_min': self.root.ids.protocol_interval_input.text,
             'af_each_cycle': self.af_each_cycle_on,
+            'af_channel': self.af_channel,
             'use_surface': self.use_surface_on,
             'use_z_offsets': self.use_z_offsets_on,
             'travel_clearance_um': self.travel_clearance_um,
@@ -1195,6 +1218,8 @@ class LumaViewProApp(App):
                 self.surface.from_dict(d['surface'])
             self.protocol_positions = [dict(p) for p in d.get('positions', [])]
             self.af_each_cycle_on = bool(d.get('af_each_cycle', True))
+            self.af_channel = d.get('af_channel', 'BF')
+            self.surface.anchor_channel = self.af_channel
             self.use_surface_on = bool(d.get('use_surface', True))
             self.use_z_offsets_on = bool(d.get('use_z_offsets', True))
             self.travel_clearance_um = float(d.get('travel_clearance_um', 500.0))
@@ -1407,14 +1432,15 @@ class LumaViewProApp(App):
         self._persist()
 
     def af_set_anchor_here(self):
-        """The autofocus point + channel used to re-reference every cycle."""
-        self.af_config.channel = self.selected_channel
+        """The autofocus point used to re-reference every cycle (uses the
+        designated AF channel)."""
+        self.af_config.channel = self.af_channel
         self.surface.set_anchor(self.stage_x_um, self.stage_y_um,
-                                self.selected_channel)
+                                self.af_channel)
         self._persist()
         self._refresh_surface_info()
         self._set_status(f'AF anchor set at X={self.stage_x_um / 1000:.2f}, '
-                         f'Y={self.stage_y_um / 1000:.2f} mm ({self.selected_channel})')
+                         f'Y={self.stage_y_um / 1000:.2f} mm ({self.af_channel})')
 
     def af_goto_anchor(self):
         if self.surface.anchor_xy is None:
@@ -1431,7 +1457,7 @@ class LumaViewProApp(App):
             self._set_status('AF test needs stage + camera')
             return
         self.af_apply_fields()
-        ch = self.selected_channel
+        ch = self.af_channel
         cfg = AutofocusConfig(z_bottom_um=self.af_config.z_bottom_um,
                               z_top_um=self.af_config.z_top_um,
                               step_um=self.af_config.step_um,
@@ -1770,6 +1796,7 @@ class LumaViewProApp(App):
             'protocol_positions': self.protocol_positions,
             'travel_clearance_um': self.travel_clearance_um,
             'img_cal': self.img_cal,
+            'af_channel': self.af_channel,
         }
         try:
             acq.save_settings(payload)
@@ -1816,6 +1843,7 @@ class LumaViewProApp(App):
                                        in d.get('protocol_positions', [])]
             self.travel_clearance_um = float(d.get('travel_clearance_um', 500.0))
             self.img_cal = d.get('img_cal')
+            self.af_channel = d.get('af_channel', 'BF')
         except Exception:
             pass
         self.shading.load_all()
