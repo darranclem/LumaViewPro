@@ -1,0 +1,120 @@
+{
+  "format": "lvp-protocol-1",
+  "name": "_autosave",
+  "labware_name": "96-well plate",
+  "channel_settings": {
+    "BF": {
+      "exposure_ms": 10.0,
+      "gain_db": 4.427184466019417,
+      "led_power": 5,
+      "enabled": false,
+      "z_offset_um": 0.0,
+      "zstack": {
+        "enabled": false,
+        "range_um": 50.0,
+        "step_um": 5.0
+      }
+    },
+    "PC": {
+      "exposure_ms": 30.0,
+      "gain_db": 0.0,
+      "led_power": 50,
+      "enabled": false,
+      "z_offset_um": 0.0,
+      "zstack": {
+        "enabled": false,
+        "range_um": 50.0,
+        "step_um": 5.0
+      }
+    },
+    "DF": {
+      "exposure_ms": 50.0,
+      "gain_db": 0.0,
+      "led_power": 100,
+      "enabled": false,
+      "z_offset_um": 0.0,
+      "zstack": {
+        "enabled": false,
+        "range_um": 50.0,
+        "step_um": 5.0
+      }
+    },
+    "BLUE": {
+      "exposure_ms": 311.36893203883494,
+      "gain_db": 18.87378640776699,
+      "led_power": 308,
+      "enabled": false,
+      "z_offset_um": 0.0,
+      "zstack": {
+        "enabled": false,
+        "range_um": 50.0,
+        "step_um": 5.0
+      }
+    },
+    "GREEN": {
+      "exposure_ms": 100.0,
+      "gain_db": 0.0,
+      "led_power": 506,
+      "enabled": false,
+      "z_offset_um": 0.0,
+      "zstack": {
+        "enabled": false,
+        "range_um": 50.0,
+        "step_um": 5.0
+      }
+    },
+    "RED": {
+      "exposure_ms": 39.8,
+      "gain_db": 0.0,
+      "led_power": 600,
+      "enabled": false,
+      "z_offset_um": 0.0,
+      "zstack": {
+        "enabled": false,
+        "range_um": 50.0,
+        "step_um": 5.0
+      }
+    }
+  },
+  "af_config": {
+    "z_bottom_um": 6708.97,
+    "z_top_um": 6538.93,
+    "step_um": 5.0,
+    "channel": "BF"
+  },
+  "surface": {
+    "anchor_xy": [
+      61765.19323312001,
+      41858.9571860892
+    ],
+    "anchor_channel": "BF",
+    "ref_z": 6479.06,
+    "current_z": 6554.984988098199,
+    "points": [
+      [
+        19499.975194721435,
+        62499.97519472144,
+        59.97279518738014
+      ],
+      [
+        19499.975194721435,
+        62499.97519472144,
+        59.97279518738014
+      ],
+      [
+        19499.975194721435,
+        17499.975194721435,
+        36.67010632544407
+      ]
+    ]
+  },
+  "positions": [],
+  "cycles": "1",
+  "interval_min": "5",
+  "af_each_cycle": true,
+  "af_channel": "BF",
+  "use_surface": true,
+  "use_z_offsets": true,
+  "travel_clearance_um": 500.0,
+  "output_dir": "C:\\Program Files (x86)\\LumaViewPro-main\\captures"
+}

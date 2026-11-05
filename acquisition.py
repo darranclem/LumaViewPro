@@ -668,28 +668,66 @@ def tile_positions_grid(center_x: float, center_y: float,
     return out
 
 
+STAGE_X_MAX_UM = 120000.0
+STAGE_Y_MAX_UM = 80000.0
+
+
+def in_stage_bounds(x_um: float, y_um: float) -> bool:
+    return 0.0 <= x_um <= STAGE_X_MAX_UM and 0.0 <= y_um <= STAGE_Y_MAX_UM
+
+
 def tile_positions_spiral(center_x: float, center_y: float,
                           fov_x_um: float, fov_y_um: float,
                           n_rings: int,
                           overlap_pct: float = 10.0) -> list[tuple[float, float]]:
     """Center-out square spiral of tile centers (ring 0 = center tile)."""
+    out = [(center_x, center_y)]
+    gen = spiral_positions_unbounded(center_x, center_y, fov_x_um, fov_y_um,
+                                     overlap_pct)
+    next(gen)  # skip center (already added)
+    sx = fov_x_um * (1.0 - overlap_pct / 100.0)
+    per_ring = lambda r: 8 * r
+    want = sum(per_ring(r) for r in range(1, n_rings + 1))
+    for _ in range(want):
+        try:
+            out.append(next(gen))
+        except StopIteration:
+            break
+    return out
+
+
+def spiral_positions_unbounded(center_x: float, center_y: float,
+                               fov_x_um: float, fov_y_um: float,
+                               overlap_pct: float = 10.0):
+    """Endless center-out square spiral generator.
+
+    Yields only positions inside the stage travel; raises StopIteration
+    once an entire ring falls outside the physical limits (the scan has
+    reached the edges in every direction).
+    """
     sx = fov_x_um * (1.0 - overlap_pct / 100.0)
     sy = fov_y_um * (1.0 - overlap_pct / 100.0)
-    out = [(center_x, center_y)]
-    for ring in range(1, n_rings + 1):
-        # Top edge, left->right
-        for c in range(-ring, ring + 1):
-            out.append((center_x + c * sx, center_y - ring * sy))
-        # Right edge, top->bottom (excl corners)
-        for r in range(-ring + 1, ring):
-            out.append((center_x + ring * sx, center_y + r * sy))
-        # Bottom edge, right->left
-        for c in range(ring, -ring - 1, -1):
-            out.append((center_x + c * sx, center_y + ring * sy))
-        # Left edge, bottom->top (excl corners)
-        for r in range(ring - 1, -ring, -1):
-            out.append((center_x - ring * sx, center_y + r * sy))
-    return out
+    if in_stage_bounds(center_x, center_y):
+        yield (center_x, center_y)
+    ring = 1
+    while True:
+        pts = []
+        for c in range(-ring, ring + 1):                       # top edge
+            pts.append((center_x + c * sx, center_y - ring * sy))
+        for r in range(-ring + 1, ring):                        # right edge
+            pts.append((center_x + ring * sx, center_y + r * sy))
+        for c in range(ring, -ring - 1, -1):                    # bottom edge
+            pts.append((center_x + c * sx, center_y + ring * sy))
+        for r in range(ring - 1, -ring, -1):                    # left edge
+            pts.append((center_x - ring * sx, center_y + r * sy))
+        emitted = 0
+        for p in pts:
+            if in_stage_bounds(*p):
+                emitted += 1
+                yield p
+        if emitted == 0:
+            return   # whole ring out of bounds: physical edge reached
+        ring += 1
 
 
 def stitch_tiles(tiles: list[np.ndarray],
@@ -758,7 +796,7 @@ def save_image(path: str, img: np.ndarray) -> None:
 
 
 def run_tile_scan(hw: ScopeHW,
-                  positions: list[tuple[float, float]],
+                  positions,
                   channel_settings: dict[str, ChannelSettings],
                   surface: FocusSurface | None,
                   shading: ShadingCorrector | None,
@@ -768,12 +806,15 @@ def run_tile_scan(hw: ScopeHW,
                   status_cb=None,
                   settle_s: float = 0.2,
                   stitch: bool = True,
-                  use_channel_z_offsets: bool = True) -> dict[str, str]:
+                  use_channel_z_offsets: bool = True,
+                  total: int | None = None,
+                  on_tile=None) -> dict[str, str]:
     """Acquire every enabled channel at each tile position, then stitch.
 
-    Per tile: move XY, look up the focus surface Z (if defined), then for
-    each enabled channel apply its chromatic z offset, LED, exposure and
-    gain, grab, shading-correct, and save. Returns {channel: stitched_path}.
+    ``positions`` may be a list or an endless generator (spiral-until-edge);
+    out-of-bounds positions are skipped. ``on_tile(channel, frame, x, y)``
+    is called per captured tile for live mosaic preview. Returns
+    {channel: stitched_path}.
     """
     def _status(msg):
         if status_cb:
@@ -782,16 +823,21 @@ def run_tile_scan(hw: ScopeHW,
     enabled = [ch for ch in CHANNELS
                if ch in channel_settings and channel_settings[ch].enabled]
     if not enabled:
-        _status('Tile scan: no channels enabled')
+        _status('Tile scan: no channels enabled ("Use in protocol")')
         return {}
     collected: dict[str, list[np.ndarray]] = {ch: [] for ch in enabled}
     used_positions: list[tuple[float, float]] = []
+    n_txt = str(total) if total else '...'
 
-    for i, (x, y) in enumerate(positions):
+    i = -1
+    for (x, y) in positions:
+        i += 1
         if cancel.is_set():
-            _status('Tile scan canceled')
+            _status('Tile scan stopped')
             break
-        _status(f'Tile {i + 1}/{len(positions)}: moving to '
+        if not in_stage_bounds(x, y):
+            continue
+        _status(f'Tile {i + 1}/{n_txt}: moving to '
                 f'({x / 1000:.2f}, {y / 1000:.2f}) mm')
         hw.move_xy(x, y)
         base_z = surface.z_at(x, y) if surface is not None else None
@@ -812,10 +858,15 @@ def run_tile_scan(hw: ScopeHW,
                 frame = shading.apply(frame, ch)
             save_image(os.path.join(out_dir, f'tile_{i:04d}_{ch}.tiff'), frame)
             collected[ch].append(frame)
+            if on_tile is not None:
+                try:
+                    on_tile(ch, frame, x, y)
+                except Exception:
+                    pass
     hw.leds_off()
 
     stitched_paths: dict[str, str] = {}
-    if stitch and not cancel.is_set():
+    if stitch:
         for ch in enabled:
             tiles = collected[ch]
             if len(tiles) == len(used_positions) and tiles:
@@ -825,7 +876,7 @@ def run_tile_scan(hw: ScopeHW,
                     p = os.path.join(out_dir, f'stitched_{ch}.tiff')
                     save_image(p, mosaic)
                     stitched_paths[ch] = p
-    _status(f'Tile scan finished -> {out_dir}')
+    _status(f'Tile scan finished ({len(used_positions)} tiles) -> {out_dir}')
     return stitched_paths
 
 

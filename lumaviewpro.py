@@ -83,6 +83,10 @@ from acquisition import (CHANNELS, LED_CHANNEL_MAP, ChannelSettings,
 Factory.register('ZoomPanCameraWidget', cls=plate_navigator.ZoomPanCameraWidget)
 Factory.register('WellPlateMapWidget', cls=plate_navigator.WellPlateMapWidget)
 Factory.register('InteractiveScaledPlateCanvas', cls=plate_navigator.InteractiveScaledPlateCanvas)
+Factory.register('Collapsible', cls=plate_navigator.Collapsible)
+
+LAYOUTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           'data', 'layouts')
 
 
 # Display LUTs: (R, G, B) tint applied to the mono camera image per channel.
@@ -152,6 +156,7 @@ class LumaViewProApp(App):
     protocol_name = StringProperty('protocol1')
     protocol_files = ListProperty([])
     protocol_dir = StringProperty(PROTOCOLS_DIR)
+    layout_files = ListProperty(['(none)'])
 
     # -------------------------------------------------------------- setup
 
@@ -171,6 +176,8 @@ class LumaViewProApp(App):
         self.frame_count = 0
         self.last_log_time = 0.0
         self.last_cam_err = 'None'
+        self._mosaic = None
+        self._mosaic_meta = None
 
         # Stage/plate mapping calibration
         self.a1_stage_um: tuple[float, float] | None = None
@@ -233,6 +240,7 @@ class LumaViewProApp(App):
         self._refresh_cal_info()
         self._refresh_positions()
         self._refresh_protocol_files()
+        self._refresh_layout_files()
         self._sync_channel_fields()
         self._sync_af_fields()
         Clock.schedule_once(lambda dt: self._start_init_thread(), 0.1)
@@ -393,6 +401,11 @@ class LumaViewProApp(App):
                                 f'mean {frame.mean():.1f}')
         viewport = self.root.ids.get('main_camera_viewport') if self.root else None
         if viewport:
+            # During a tile scan show the growing mosaic instead of live frames.
+            if self.worker_busy and self._mosaic is not None:
+                viewport.autoscale = False
+                viewport.update_frame_texture(self._mosaic, significant_bits=8)
+                return
             tint = CHANNEL_LUTS.get(ch, (1.0, 1.0, 1.0))
             viewport.autoscale = self.autoscale_on
             viewport.update_frame_texture(frame, tint=tint,
@@ -1696,25 +1709,148 @@ class LumaViewProApp(App):
         rows, cols, overlap = self._tile_params()
         fov_x, fov_y = self._fov_um()
         cx, cy = self.stage_x_um, self.stage_y_um
+        stitch = True
+        total = None
         if pattern == 'spiral':
-            rings = max(rows, cols) // 2
-            positions = acq.tile_positions_spiral(cx, cy, fov_x, fov_y,
-                                                  n_rings=max(rings, 1),
-                                                  overlap_pct=overlap)
+            # Endless spiral: runs until STOP or the stage's physical edges.
+            positions = acq.spiral_positions_unbounded(cx, cy, fov_x, fov_y,
+                                                       overlap_pct=overlap)
+            stitch = False   # unbounded: tiles saved per-position instead
         else:
             positions = acq.tile_positions_grid(cx, cy, fov_x, fov_y,
                                                 rows, cols, overlap_pct=overlap)
+            total = len(positions)
         out_dir = acq.timestamp_dir(self._out_base(), f'tiles_{pattern}')
         use_surface = self.use_surface_on and self.surface.current_z is not None
+        self._mosaic_reset()
         def _job():
             acq.run_tile_scan(self.hw, positions, self.channel_settings,
                               self.surface if use_surface else None,
                               self.shading if self.shading_on else None,
                               self.effective_um_per_px(), out_dir,
                               self.worker.cancel, status_cb=self._set_status,
-                              use_channel_z_offsets=self.use_z_offsets_on)
+                              use_channel_z_offsets=self.use_z_offsets_on,
+                              total=total, stitch=stitch,
+                              on_tile=self._mosaic_add)
             Clock.schedule_once(lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
         self._bg(_job, busy_job=True)
+
+    # ---------------------------------------------- live mosaic preview
+
+    def _mosaic_reset(self):
+        self._mosaic = None
+        self._mosaic_meta = None
+
+    def _mosaic_add(self, ch: str, frame, x_um: float, y_um: float):
+        """Overlay a captured tile into the on-the-fly mosaic preview
+        (shown in the viewport while the scan runs). Worker-thread safe:
+        the canvas reference is swapped atomically."""
+        try:
+            h, w = frame.shape[:2]
+            f = max(w // 160, 1)
+            small = frame[::f, ::f]
+            if small.dtype != np.uint8:
+                shift = max(self.significant_bits - 8, 0)
+                small = (small >> shift).astype(np.uint8)
+            tint = CHANNEL_LUTS.get(ch, (1.0, 1.0, 1.0))
+            chans = []
+            for t in tint[:3]:
+                if t >= 0.999:
+                    chans.append(small)
+                elif t <= 0.001:
+                    chans.append(np.zeros_like(small))
+                else:
+                    chans.append((small.astype(np.float32) * t).astype(np.uint8))
+            rgb = np.stack(chans, axis=-1)
+            th, tw = rgb.shape[:2]
+            pv_um_per_px = self.effective_um_per_px() * f
+            meta = self._mosaic_meta
+            if meta is None:
+                size = 1024
+                canvas = np.zeros((size, size, 3), np.uint8)
+                meta = {'ox_um': x_um, 'oy_um': y_um, 'scale': pv_um_per_px,
+                        'cx': size // 2, 'cy': size // 2}
+                self._mosaic_meta = meta
+                self._mosaic = canvas
+            canvas = self._mosaic
+            px = int((x_um - meta['ox_um']) / meta['scale']) + meta['cx'] - tw // 2
+            py = int((y_um - meta['oy_um']) / meta['scale']) + meta['cy'] - th // 2
+            # Expand the canvas (up to 4096 px) when a tile falls outside.
+            while (px < 0 or py < 0 or px + tw > canvas.shape[1] or
+                   py + th > canvas.shape[0]) and canvas.shape[0] < 4096:
+                old = canvas
+                oh, ow = old.shape[:2]
+                canvas = np.zeros((oh * 2, ow * 2, 3), np.uint8)
+                canvas[oh // 2: oh // 2 + oh, ow // 2: ow // 2 + ow] = old
+                meta['cx'] += ow // 2
+                meta['cy'] += oh // 2
+                px = int((x_um - meta['ox_um']) / meta['scale']) + meta['cx'] - tw // 2
+                py = int((y_um - meta['oy_um']) / meta['scale']) + meta['cy'] - th // 2
+            if (0 <= px and 0 <= py and px + tw <= canvas.shape[1] and
+                    py + th <= canvas.shape[0]):
+                canvas[py:py + th, px:px + tw] = rgb   # simple overlay
+            self._mosaic = canvas
+        except Exception:
+            pass
+
+    # ----------------------------------------------------- saved layouts
+
+    def _refresh_layout_files(self):
+        try:
+            os.makedirs(LAYOUTS_DIR, exist_ok=True)
+            names = [f[:-5] for f in os.listdir(LAYOUTS_DIR)
+                     if f.endswith('.json')]
+        except Exception:
+            names = []
+        self.layout_files = names or ['(none)']
+
+    def _collapsibles(self):
+        import plate_navigator as pn
+        return [w for w in self.root.walk()
+                if isinstance(w, pn.Collapsible)] if self.root else []
+
+    def save_layout(self, name: str):
+        """Save panel widths and which sections are open as a named layout."""
+        name = (name or '').strip() or 'default'
+        ids = self.root.ids
+        data = {
+            'left_w': ids.left_split.width if ids.get('left_split') else 250,
+            'right_w': ids.right_split.width if ids.get('right_split') else 300,
+            'sections': {c.title: c.open for c in self._collapsibles()},
+        }
+        try:
+            import json
+            os.makedirs(LAYOUTS_DIR, exist_ok=True)
+            with open(os.path.join(LAYOUTS_DIR, f'{name}.json'), 'w',
+                      encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+            self._refresh_layout_files()
+            self._set_status(f'Layout "{name}" saved')
+        except Exception as e:
+            self._set_status(f'Layout save failed: {e}')
+
+    def load_layout(self, name: str):
+        name = (name or '').strip()
+        if not name or name == '(none)':
+            return
+        try:
+            import json
+            with open(os.path.join(LAYOUTS_DIR, f'{name}.json'), 'r',
+                      encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            self._set_status(f'Layout load failed: {e}')
+            return
+        ids = self.root.ids
+        if ids.get('left_split'):
+            ids.left_split.width = float(data.get('left_w', 250))
+        if ids.get('right_split'):
+            ids.right_split.width = float(data.get('right_w', 300))
+        sections = data.get('sections', {})
+        for c in self._collapsibles():
+            if c.title in sections:
+                c.open = bool(sections[c.title])
+        self._set_status(f'Layout "{name}" loaded')
 
     def run_zstack(self, all_channels: bool = False):
         if not (self.stage_connected and self.camera_connected):

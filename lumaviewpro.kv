@@ -3,6 +3,7 @@
 #:set PANEL (0.161, 0.165, 0.180, 1)
 #:set PANEL2 (0.196, 0.200, 0.216, 1)
 #:set ACCENT (0.0, 0.62, 0.84, 1)
+#:set RED (0.75, 0.20, 0.17, 1)
 #:set TXT (0.88, 0.89, 0.90, 1)
 #:set TXT_DIM (0.60, 0.62, 0.65, 1)
 
@@ -19,23 +20,13 @@
     background_color: ACCENT
 
 <StopButton@FlatButton>:
-    background_color: (0.75, 0.20, 0.17, 1)
+    background_color: RED
 
 <PanelLabel@Label>:
     color: TXT_DIM
     font_size: '11sp'
     size_hint_y: None
     height: '18dp'
-    halign: 'left'
-    valign: 'middle'
-    text_size: self.size
-
-<HeaderLabel@Label>:
-    color: ACCENT
-    bold: True
-    font_size: '12sp'
-    size_hint_y: None
-    height: '22dp'
     halign: 'left'
     valign: 'middle'
     text_size: self.size
@@ -66,6 +57,36 @@
     height: '26dp'
     spacing: '4dp'
 
+<Collapsible>:
+    orientation: 'vertical'
+    size_hint_y: None
+    height: self.minimum_height
+    spacing: '3dp'
+    Button:
+        background_normal: ''
+        background_down: ''
+        background_color: (0.10, 0.28, 0.38, 1) if root.open else (0.14, 0.15, 0.17, 1)
+        color: (0.3, 0.85, 1.0, 1) if root.open else TXT_DIM
+        bold: True
+        font_size: '12sp'
+        size_hint_y: None
+        height: '26dp'
+        halign: 'left'
+        valign: 'middle'
+        text_size: self.width - dp(10), self.height
+        padding: dp(6), 0
+        text: ('[-]  ' if root.open else '[+] ') + root.title
+        on_press: root.open = not root.open
+    BoxLayout:
+        id: body
+        orientation: 'vertical'
+        spacing: '4dp'
+        padding: '4dp', '2dp'
+        size_hint_y: None
+        height: self.minimum_height if root.open else 0
+        opacity: 1 if root.open else 0
+        disabled: not root.open
+
 LumaViewProMainLayout:
     orientation: 'vertical'
     canvas.before:
@@ -93,7 +114,7 @@ LumaViewProMainLayout:
             bold: True
             font_size: '15sp'
             size_hint_x: None
-            width: '190dp'
+            width: '180dp'
         Label:
             text: 'Depth:'
             color: TXT_DIM
@@ -108,15 +129,15 @@ LumaViewProMainLayout:
             values: app.bit_depth_options
             on_text: app.set_bit_depth(self.text)
         Label:
-            text: 'Binning:'
+            text: 'Bin:'
             color: TXT_DIM
             font_size: '12sp'
             size_hint_x: None
-            width: '50dp'
+            width: '28dp'
         DarkSpinner:
             id: binning_spinner
             size_hint_x: None
-            width: '52dp'
+            width: '48dp'
             text: app.binning
             values: ['1', '2', '3', '4']
             on_text: app.binning = self.text; app.set_binning(self.text)
@@ -133,15 +154,9 @@ LumaViewProMainLayout:
             background_color: ACCENT if app.autoscale_on else PANEL2
             on_press: app.autoscale_on = not app.autoscale_on
         FlatButton:
-            text: 'Shading: ' + ('ON' if app.shading_on else 'off')
-            size_hint_x: None
-            width: '92dp'
-            background_color: ACCENT if app.shading_on else PANEL2
-            on_press: app.toggle_shading(not app.shading_on)
-        FlatButton:
             text: 'Snap'
             size_hint_x: None
-            width: '58dp'
+            width: '54dp'
             on_press: app.snap_image()
         Widget:
         StopButton:
@@ -154,400 +169,432 @@ LumaViewProMainLayout:
     # ============================== MAIN AREA ==============================
     BoxLayout:
         orientation: 'horizontal'
-        spacing: '4dp'
+        spacing: '0dp'
         padding: '4dp'
 
-        # ---------------- LEFT: channels + acquisition ----------------
-        ScrollView:
+        # ---------------- LEFT: controls (resizable) ----------------
+        Splitter:
+            id: left_split
+            sizable_from: 'right'
             size_hint_x: None
-            width: '250dp'
-            do_scroll_x: False
-            bar_width: '4dp'
-            BoxLayout:
-                orientation: 'vertical'
-                size_hint_y: None
-                height: self.minimum_height
-                spacing: '4dp'
-                padding: '6dp'
-                canvas.before:
-                    Color:
-                        rgba: PANEL
-                    Rectangle:
-                        pos: self.pos
-                        size: self.size
-
-                HeaderLabel:
-                    text: 'LIVE CHANNEL'
-                FlatButton:
-                    text: 'Next channel  >>'
-                    on_press: app.cycle_channel()
-                GridLayout:
-                    cols: 4
-                    spacing: '3dp'
+            width: '260dp'
+            min_size: '160dp'
+            max_size: '560dp'
+            strip_size: '6dp'
+            ScrollView:
+                do_scroll_x: False
+                bar_width: '4dp'
+                BoxLayout:
+                    orientation: 'vertical'
                     size_hint_y: None
-                    height: '62dp'
-                    FlatButton:
-                        text: 'BF'
-                        background_color: ACCENT if app.live_channel == 'BF' else PANEL2
-                        on_press: app.set_live('BF')
-                    FlatButton:
-                        text: 'PC'
-                        background_color: ACCENT if app.live_channel == 'PC' else PANEL2
-                        on_press: app.set_live('PC')
-                    FlatButton:
-                        text: 'DF'
-                        background_color: ACCENT if app.live_channel == 'DF' else PANEL2
-                        on_press: app.set_live('DF')
-                    FlatButton:
-                        text: 'OFF'
-                        background_color: (0.75, 0.20, 0.17, 1) if app.live_channel == 'OFF' else PANEL2
-                        on_press: app.set_live('OFF')
-                    FlatButton:
-                        text: 'Blue'
-                        color: (0.3, 0.95, 1.0, 1)
-                        background_color: ACCENT if app.live_channel == 'BLUE' else PANEL2
-                        on_press: app.set_live('BLUE')
-                    FlatButton:
-                        text: 'Green'
-                        color: (0.35, 0.95, 0.35, 1)
-                        background_color: ACCENT if app.live_channel == 'GREEN' else PANEL2
-                        on_press: app.set_live('GREEN')
-                    FlatButton:
-                        text: 'Red'
-                        color: (1.0, 0.4, 0.3, 1)
-                        background_color: ACCENT if app.live_channel == 'RED' else PANEL2
-                        on_press: app.set_live('RED')
-                    Widget:
+                    height: self.minimum_height
+                    spacing: '4dp'
+                    padding: '4dp'
+                    canvas.before:
+                        Color:
+                            rgba: PANEL
+                        Rectangle:
+                            pos: self.pos
+                            size: self.size
 
-                HeaderLabel:
-                    text: 'CHANNEL SETTINGS'
-                FieldRow:
-                    PanelLabel:
-                        text: 'Channel'
-                        size_hint_x: 0.45
-                    DarkSpinner:
-                        id: channel_spinner
-                        text: app.selected_channel
-                        values: ['BF', 'PC', 'DF', 'BLUE', 'GREEN', 'RED']
-                        on_text: app.select_channel(self.text)
-                FieldRow:
-                    PanelLabel:
-                        text: 'Exposure (ms)'
-                        size_hint_x: 0.55
-                    SmallInput:
-                        id: exposure_input
-                        text: '20'
-                Slider:
-                    id: exposure_slider
-                    min: 1
-                    max: 1000
-                    value: 20
-                    size_hint_y: None
-                    height: '24dp'
-                    cursor_size: '14dp', '14dp'
-                    on_value: app.slider_changed('exposure', self.value)
-                FieldRow:
-                    PanelLabel:
-                        text: 'Gain (dB)'
-                        size_hint_x: 0.55
-                    SmallInput:
-                        id: gain_input
-                        text: '0'
-                Slider:
-                    id: gain_slider
-                    min: 0
-                    max: 48
-                    value: 0
-                    size_hint_y: None
-                    height: '24dp'
-                    cursor_size: '14dp', '14dp'
-                    on_value: app.slider_changed('gain', self.value)
-                FieldRow:
-                    PanelLabel:
-                        text: 'LED power (mA)'
-                        size_hint_x: 0.55
-                    SmallInput:
-                        id: led_input
-                        text: '50'
-                Slider:
-                    id: led_slider
-                    min: 0
-                    max: 600
-                    value: 50
-                    size_hint_y: None
-                    height: '24dp'
-                    cursor_size: '14dp', '14dp'
-                    on_value: app.slider_changed('led', self.value)
-                FieldRow:
-                    PanelLabel:
-                        text: 'Colour Z offset (um)'
-                        size_hint_x: 0.55
-                    SmallInput:
-                        id: zoffset_input
-                        text: '0'
-                FieldRow:
-                    PanelLabel:
-                        text: 'Use in protocol'
-                        size_hint_x: 0.75
-                    CheckBox:
-                        id: channel_enabled_chk
-                        active: False
-                        size_hint_x: 0.25
-                FieldRow:
-                    PanelLabel:
-                        text: 'AF channel (only one)'
-                        size_hint_x: 0.75
-                    CheckBox:
-                        id: af_channel_chk
-                        size_hint_x: 0.25
-                        on_active: app.set_af_channel(self.active)
-                AccentButton:
-                    text: 'Apply channel settings'
-                    on_press: app.apply_channel_fields()
+                    Collapsible:
+                        title: 'LAYOUT'
+                        FieldRow:
+                            SmallInput:
+                                id: layout_name_input
+                                text: 'default'
+                            FlatButton:
+                                text: 'Save'
+                                size_hint_x: None
+                                width: '52dp'
+                                on_press: app.save_layout(layout_name_input.text)
+                        FieldRow:
+                            DarkSpinner:
+                                id: layout_spinner
+                                text: '(none)'
+                                values: app.layout_files
+                            FlatButton:
+                                text: 'Load'
+                                size_hint_x: None
+                                width: '52dp'
+                                on_press: app.load_layout(layout_spinner.text)
 
-                HeaderLabel:
-                    text: 'CORRECTIONS (all optional)'
-                FlatButton:
-                    text: 'Focus surface: ' + ('ON' if app.use_surface_on else 'off')
-                    background_color: ACCENT if app.use_surface_on else PANEL2
-                    on_press: app.use_surface_on = not app.use_surface_on
-                FlatButton:
-                    text: 'Colour Z offsets: ' + ('ON' if app.use_z_offsets_on else 'off')
-                    background_color: ACCENT if app.use_z_offsets_on else PANEL2
-                    on_press: app.use_z_offsets_on = not app.use_z_offsets_on
-                FlatButton:
-                    text: 'Shading: ' + ('ON' if app.shading_on else 'off')
-                    background_color: ACCENT if app.shading_on else PANEL2
-                    on_press: app.toggle_shading(not app.shading_on)
+                    Collapsible:
+                        title: 'LIVE CHANNEL'
+                        open: True
+                        FlatButton:
+                            text: 'Next channel  >>'
+                            on_press: app.cycle_channel()
+                        GridLayout:
+                            cols: 4
+                            spacing: '3dp'
+                            size_hint_y: None
+                            height: '62dp'
+                            FlatButton:
+                                text: 'BF'
+                                background_color: ACCENT if app.live_channel == 'BF' else PANEL2
+                                on_press: app.set_live('BF')
+                            FlatButton:
+                                text: 'PC'
+                                background_color: ACCENT if app.live_channel == 'PC' else PANEL2
+                                on_press: app.set_live('PC')
+                            FlatButton:
+                                text: 'DF'
+                                background_color: ACCENT if app.live_channel == 'DF' else PANEL2
+                                on_press: app.set_live('DF')
+                            FlatButton:
+                                text: 'OFF'
+                                background_color: RED if app.live_channel == 'OFF' else PANEL2
+                                on_press: app.set_live('OFF')
+                            FlatButton:
+                                text: 'Blue'
+                                color: (0.3, 0.95, 1.0, 1)
+                                background_color: ACCENT if app.live_channel == 'BLUE' else PANEL2
+                                on_press: app.set_live('BLUE')
+                            FlatButton:
+                                text: 'Green'
+                                color: (0.35, 0.95, 0.35, 1)
+                                background_color: ACCENT if app.live_channel == 'GREEN' else PANEL2
+                                on_press: app.set_live('GREEN')
+                            FlatButton:
+                                text: 'Red'
+                                color: (1.0, 0.4, 0.3, 1)
+                                background_color: ACCENT if app.live_channel == 'RED' else PANEL2
+                                on_press: app.set_live('RED')
+                            Widget:
 
-                HeaderLabel:
-                    text: 'Z-STACK (per channel)'
-                FieldRow:
-                    PanelLabel:
-                        text: 'Stack this channel'
-                        size_hint_x: 0.75
-                    CheckBox:
-                        id: zstack_enabled_chk
-                        size_hint_x: 0.25
-                FieldRow:
-                    PanelLabel:
-                        text: 'Range (um)'
-                        size_hint_x: 0.55
-                    SmallInput:
-                        id: zstack_range_input
-                        text: '50'
-                FieldRow:
-                    PanelLabel:
-                        text: 'Step (um)'
-                        size_hint_x: 0.55
-                    SmallInput:
-                        id: zstack_step_input
-                        text: '5'
-                FieldRow:
-                    FlatButton:
-                        text: 'Stack marked'
-                        on_press: app.run_zstack(all_channels=False)
-                    FlatButton:
-                        text: 'Stack all'
-                        on_press: app.run_zstack(all_channels=True)
+                    Collapsible:
+                        title: 'CHANNEL SETTINGS'
+                        open: True
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Channel'
+                                size_hint_x: 0.45
+                            DarkSpinner:
+                                id: channel_spinner
+                                text: app.selected_channel
+                                values: ['BF', 'PC', 'DF', 'BLUE', 'GREEN', 'RED']
+                                on_text: app.select_channel(self.text)
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Exposure (ms)'
+                                size_hint_x: 0.55
+                            SmallInput:
+                                id: exposure_input
+                                text: '20'
+                        Slider:
+                            id: exposure_slider
+                            min: 1
+                            max: 1000
+                            value: 20
+                            size_hint_y: None
+                            height: '24dp'
+                            cursor_size: '14dp', '14dp'
+                            on_value: app.slider_changed('exposure', self.value)
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Gain (dB)'
+                                size_hint_x: 0.55
+                            SmallInput:
+                                id: gain_input
+                                text: '0'
+                        Slider:
+                            id: gain_slider
+                            min: 0
+                            max: 48
+                            value: 0
+                            size_hint_y: None
+                            height: '24dp'
+                            cursor_size: '14dp', '14dp'
+                            on_value: app.slider_changed('gain', self.value)
+                        FieldRow:
+                            PanelLabel:
+                                text: 'LED power (mA)'
+                                size_hint_x: 0.55
+                            SmallInput:
+                                id: led_input
+                                text: '50'
+                        Slider:
+                            id: led_slider
+                            min: 0
+                            max: 600
+                            value: 50
+                            size_hint_y: None
+                            height: '24dp'
+                            cursor_size: '14dp', '14dp'
+                            on_value: app.slider_changed('led', self.value)
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Colour Z offset (um)'
+                                size_hint_x: 0.55
+                            SmallInput:
+                                id: zoffset_input
+                                text: '0'
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Use in protocol'
+                                size_hint_x: 0.75
+                            CheckBox:
+                                id: channel_enabled_chk
+                                active: False
+                                size_hint_x: 0.25
+                        FieldRow:
+                            PanelLabel:
+                                text: 'AF channel (only one)'
+                                size_hint_x: 0.75
+                            CheckBox:
+                                id: af_channel_chk
+                                size_hint_x: 0.25
+                                on_active: app.set_af_channel(self.active)
+                        AccentButton:
+                            text: 'Apply channel settings'
+                            on_press: app.apply_channel_fields()
 
-                HeaderLabel:
-                    text: 'AUTOFOCUS'
-                PanelLabel:
-                    text: 'Like a z-stack: focus below -> set Bottom, above -> set Top'
-                FieldRow:
-                    PanelLabel:
-                        text: 'Bottom (um)'
-                        size_hint_x: 0.45
-                    SmallInput:
-                        id: af_bottom_input
-                        text: '0'
-                    FlatButton:
-                        text: 'here'
-                        size_hint_x: None
-                        width: '44dp'
-                        on_press: app.af_set_bottom_here()
-                FieldRow:
-                    PanelLabel:
-                        text: 'Top (um)'
-                        size_hint_x: 0.45
-                    SmallInput:
-                        id: af_top_input
-                        text: '200'
-                    FlatButton:
-                        text: 'here'
-                        size_hint_x: None
-                        width: '44dp'
-                        on_press: app.af_set_top_here()
-                FieldRow:
-                    PanelLabel:
-                        text: 'Interval (um)'
-                        size_hint_x: 0.45
-                    SmallInput:
-                        id: af_step_input
-                        text: '10'
-                PanelLabel:
-                    text: app.af_range_text(af_bottom_input.text, af_top_input.text)
-                FlatButton:
-                    text: 'High stability AF: ' + ('ON' if app.high_stability_on else 'off')
-                    background_color: ACCENT if app.high_stability_on else PANEL2
-                    on_press: app.high_stability_on = not app.high_stability_on
-                FieldRow:
-                    FlatButton:
-                        text: 'Anchor = here'
-                        on_press: app.af_set_anchor_here()
-                    FlatButton:
-                        text: 'Go to anchor'
-                        on_press: app.af_goto_anchor()
-                FlatButton:
-                    text: 'Test AF on this field of view'
-                    on_press: app.run_af_test()
-                AccentButton:
-                    text: 'Run AF cycle (updates surface)'
-                    on_press: app.run_af_cycle()
+                    Collapsible:
+                        title: 'CORRECTIONS (optional)'
+                        FlatButton:
+                            text: 'Focus surface: ' + ('ON' if app.use_surface_on else 'off')
+                            background_color: ACCENT if app.use_surface_on else PANEL2
+                            on_press: app.use_surface_on = not app.use_surface_on
+                        FlatButton:
+                            text: 'Colour Z offsets: ' + ('ON' if app.use_z_offsets_on else 'off')
+                            background_color: ACCENT if app.use_z_offsets_on else PANEL2
+                            on_press: app.use_z_offsets_on = not app.use_z_offsets_on
+                        FlatButton:
+                            text: 'Shading: ' + ('ON' if app.shading_on else 'off')
+                            background_color: ACCENT if app.shading_on else PANEL2
+                            on_press: app.toggle_shading(not app.shading_on)
+                        FlatButton:
+                            text: 'Capture shading ref (selected ch)'
+                            on_press: app.capture_shading_reference()
 
-                HeaderLabel:
-                    text: 'FOCUS SURFACE'
-                FieldRow:
-                    FlatButton:
-                        text: '+ point here'
-                        on_press: app.surface_add_point_here()
-                    FlatButton:
-                        text: 'Clear'
-                        on_press: app.surface_clear_points()
-                FlatButton:
-                    text: 'Z -> surface here'
-                    on_press: app.surface_goto_here_z()
+                    Collapsible:
+                        title: 'AUTOFOCUS'
+                        PanelLabel:
+                            text: 'Like a z-stack: set Bottom below, Top above'
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Bottom (um)'
+                                size_hint_x: 0.45
+                            SmallInput:
+                                id: af_bottom_input
+                                text: '0'
+                            FlatButton:
+                                text: 'here'
+                                size_hint_x: None
+                                width: '44dp'
+                                on_press: app.af_set_bottom_here()
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Top (um)'
+                                size_hint_x: 0.45
+                            SmallInput:
+                                id: af_top_input
+                                text: '200'
+                            FlatButton:
+                                text: 'here'
+                                size_hint_x: None
+                                width: '44dp'
+                                on_press: app.af_set_top_here()
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Interval (um)'
+                                size_hint_x: 0.45
+                            SmallInput:
+                                id: af_step_input
+                                text: '10'
+                        PanelLabel:
+                            text: app.af_range_text(af_bottom_input.text, af_top_input.text)
+                        FlatButton:
+                            text: 'High stability AF: ' + ('ON' if app.high_stability_on else 'off')
+                            background_color: ACCENT if app.high_stability_on else PANEL2
+                            on_press: app.high_stability_on = not app.high_stability_on
+                        FieldRow:
+                            FlatButton:
+                                text: 'Anchor = here'
+                                on_press: app.af_set_anchor_here()
+                            FlatButton:
+                                text: 'Go to anchor'
+                                on_press: app.af_goto_anchor()
+                        FlatButton:
+                            text: 'Test AF on this field of view'
+                            on_press: app.run_af_test()
+                        AccentButton:
+                            text: 'Run AF cycle (updates surface)'
+                            on_press: app.run_af_cycle()
 
-                HeaderLabel:
-                    text: 'SHADING CORRECTION'
-                FlatButton:
-                    text: 'Capture reference (selected ch)'
-                    on_press: app.capture_shading_reference()
+                    Collapsible:
+                        title: 'FOCUS SURFACE'
+                        FieldRow:
+                            FlatButton:
+                                text: '+ point here'
+                                on_press: app.surface_add_point_here()
+                            FlatButton:
+                                text: 'Clear'
+                                on_press: app.surface_clear_points()
+                        FlatButton:
+                            text: 'Z -> surface here'
+                            on_press: app.surface_goto_here_z()
+                        PanelLabel:
+                            text: app.surface_info
+                            height: '36dp'
+                            text_size: self.width, None
 
-                HeaderLabel:
-                    text: 'TILE SCAN'
-                FieldRow:
-                    PanelLabel:
-                        text: 'Rows'
-                        size_hint_x: 0.3
-                    SmallInput:
-                        id: tile_rows_input
-                        text: '3'
-                    PanelLabel:
-                        text: 'Cols'
-                        size_hint_x: 0.3
-                    SmallInput:
-                        id: tile_cols_input
-                        text: '3'
-                FieldRow:
-                    PanelLabel:
-                        text: 'Overlap (%)'
-                        size_hint_x: 0.55
-                    SmallInput:
-                        id: tile_overlap_input
-                        text: '10'
-                FieldRow:
-                    AccentButton:
-                        text: 'STOP scan' if app.worker_busy else 'Grid scan'
-                        background_color: (0.75, 0.20, 0.17, 1) if app.worker_busy else ACCENT
-                        on_press: app.toggle_tile_scan('grid')
-                    AccentButton:
-                        text: 'STOP scan' if app.worker_busy else 'Spiral scan'
-                        background_color: (0.75, 0.20, 0.17, 1) if app.worker_busy else ACCENT
-                        on_press: app.toggle_tile_scan('spiral')
+                    Collapsible:
+                        title: 'Z-STACK (per channel)'
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Stack this channel'
+                                size_hint_x: 0.75
+                            CheckBox:
+                                id: zstack_enabled_chk
+                                size_hint_x: 0.25
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Range (um)'
+                                size_hint_x: 0.55
+                            SmallInput:
+                                id: zstack_range_input
+                                text: '50'
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Step (um)'
+                                size_hint_x: 0.55
+                            SmallInput:
+                                id: zstack_step_input
+                                text: '5'
+                        FieldRow:
+                            FlatButton:
+                                text: 'Stack marked'
+                                on_press: app.run_zstack(all_channels=False)
+                            FlatButton:
+                                text: 'Stack all'
+                                on_press: app.run_zstack(all_channels=True)
 
-                HeaderLabel:
-                    text: 'PROTOCOL DATA / TIMELAPSE'
-                PanelLabel:
-                    text: 'Output directory'
-                SmallInput:
-                    id: output_dir_input
-                    text: app.output_dir
-                    on_text_validate: app.set_output_dir(self.text)
-                FieldRow:
-                    FlatButton:
-                        text: 'Set directory'
-                        on_press: app.set_output_dir(output_dir_input.text)
-                    FlatButton:
-                        text: 'Open folder'
-                        on_press: app.open_output_dir()
-                FieldRow:
-                    PanelLabel:
-                        text: 'Cycles'
-                        size_hint_x: 0.3
-                    SmallInput:
-                        id: protocol_cycles_input
-                        text: '1'
-                    PanelLabel:
-                        text: 'Every (min)'
-                        size_hint_x: 0.38
-                    SmallInput:
-                        id: protocol_interval_input
-                        text: '5'
-                FlatButton:
-                    text: 'AF each cycle: ' + ('ON' if app.af_each_cycle_on else 'off')
-                    background_color: ACCENT if app.af_each_cycle_on else PANEL2
-                    on_press: app.af_each_cycle_on = not app.af_each_cycle_on
-                AccentButton:
-                    text: 'Run protocol (timelapse)'
-                    on_press: app.run_protocol()
+                    Collapsible:
+                        title: 'TILE SCAN'
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Rows'
+                                size_hint_x: 0.3
+                            SmallInput:
+                                id: tile_rows_input
+                                text: '3'
+                            PanelLabel:
+                                text: 'Cols'
+                                size_hint_x: 0.3
+                            SmallInput:
+                                id: tile_cols_input
+                                text: '3'
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Overlap (%)'
+                                size_hint_x: 0.55
+                            SmallInput:
+                                id: tile_overlap_input
+                                text: '10'
+                        PanelLabel:
+                            text: 'Spiral runs until stopped or the stage edge'
+                        FieldRow:
+                            AccentButton:
+                                text: 'STOP scan' if app.worker_busy else 'Grid scan'
+                                background_color: RED if app.worker_busy else ACCENT
+                                on_press: app.toggle_tile_scan('grid')
+                            AccentButton:
+                                text: 'STOP scan' if app.worker_busy else 'Spiral scan'
+                                background_color: RED if app.worker_busy else ACCENT
+                                on_press: app.toggle_tile_scan('spiral')
 
-                HeaderLabel:
-                    text: 'SAVED PROTOCOLS'
-                PanelLabel:
-                    text: 'Autosave directory'
-                SmallInput:
-                    id: protocol_dir_input
-                    text: app.protocol_dir
-                    on_text_validate: app.set_protocol_dir(self.text)
-                FlatButton:
-                    text: 'Set autosave directory'
-                    on_press: app.set_protocol_dir(protocol_dir_input.text)
-                FieldRow:
-                    PanelLabel:
-                        text: 'Name'
-                        size_hint_x: 0.3
-                    SmallInput:
-                        id: protocol_name_input
-                        text: app.protocol_name
-                FieldRow:
-                    AccentButton:
-                        text: 'Save protocol'
-                        on_press: app.save_protocol(protocol_name_input.text)
-                FieldRow:
-                    DarkSpinner:
-                        id: protocol_file_spinner
-                        text: '(choose)'
-                        values: app.protocol_files
-                    FlatButton:
-                        text: 'Load'
-                        size_hint_x: None
-                        width: '52dp'
-                        on_press: app.load_protocol(protocol_file_spinner.text)
-                PanelLabel:
-                    text: 'After loading: calibrate plate, review positions, run'
+                    Collapsible:
+                        title: 'PROTOCOL / TIMELAPSE'
+                        PanelLabel:
+                            text: 'Output directory'
+                        SmallInput:
+                            id: output_dir_input
+                            text: app.output_dir
+                            on_text_validate: app.set_output_dir(self.text)
+                        FieldRow:
+                            FlatButton:
+                                text: 'Set directory'
+                                on_press: app.set_output_dir(output_dir_input.text)
+                            FlatButton:
+                                text: 'Open folder'
+                                on_press: app.open_output_dir()
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Cycles'
+                                size_hint_x: 0.3
+                            SmallInput:
+                                id: protocol_cycles_input
+                                text: '1'
+                            PanelLabel:
+                                text: 'Every (min)'
+                                size_hint_x: 0.38
+                            SmallInput:
+                                id: protocol_interval_input
+                                text: '5'
+                        FlatButton:
+                            text: 'AF each cycle: ' + ('ON' if app.af_each_cycle_on else 'off')
+                            background_color: ACCENT if app.af_each_cycle_on else PANEL2
+                            on_press: app.af_each_cycle_on = not app.af_each_cycle_on
+                        AccentButton:
+                            text: 'Run protocol (timelapse)'
+                            on_press: app.run_protocol()
 
-                HeaderLabel:
-                    text: 'IMAGE SCALE'
-                AccentButton:
-                    text: 'Auto-calibrate centering (moves 0.1mm)'
-                    on_press: app.calibrate_image_motion()
-                FieldRow:
-                    PanelLabel:
-                        text: 'um / pixel (bin 1)'
-                        size_hint_x: 0.55
-                    SmallInput:
-                        id: um_per_px_input
-                        text: str(app.base_um_per_px)
-                        on_text_validate: app.set_um_per_px(self.text)
-                FieldRow:
-                    FlatButton:
-                        text: 'Flip img X'
-                        on_press: app.toggle_invert('img_x')
-                    FlatButton:
-                        text: 'Flip img Y'
-                        on_press: app.toggle_invert('img_y')
+                    Collapsible:
+                        title: 'SAVED PROTOCOLS'
+                        PanelLabel:
+                            text: 'Autosave directory'
+                        SmallInput:
+                            id: protocol_dir_input
+                            text: app.protocol_dir
+                            on_text_validate: app.set_protocol_dir(self.text)
+                        FlatButton:
+                            text: 'Set autosave directory'
+                            on_press: app.set_protocol_dir(protocol_dir_input.text)
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Name'
+                                size_hint_x: 0.3
+                            SmallInput:
+                                id: protocol_name_input
+                                text: app.protocol_name
+                        AccentButton:
+                            text: 'Save protocol'
+                            on_press: app.save_protocol(protocol_name_input.text)
+                        FieldRow:
+                            DarkSpinner:
+                                id: protocol_file_spinner
+                                text: '(choose)'
+                                values: app.protocol_files
+                            FlatButton:
+                                text: 'Load'
+                                size_hint_x: None
+                                width: '52dp'
+                                on_press: app.load_protocol(protocol_file_spinner.text)
+                        PanelLabel:
+                            text: 'After load: calibrate plate, review positions'
+
+                    Collapsible:
+                        title: 'IMAGE SCALE / CENTERING'
+                        AccentButton:
+                            text: 'Auto-calibrate centering (moves 0.1mm)'
+                            on_press: app.calibrate_image_motion()
+                        FieldRow:
+                            PanelLabel:
+                                text: 'um / pixel (bin 1)'
+                                size_hint_x: 0.55
+                            SmallInput:
+                                id: um_per_px_input
+                                text: str(app.base_um_per_px)
+                                on_text_validate: app.set_um_per_px(self.text)
+                        FieldRow:
+                            FlatButton:
+                                text: 'Flip img X'
+                                on_press: app.toggle_invert('img_x')
+                            FlatButton:
+                                text: 'Flip img Y'
+                                on_press: app.toggle_invert('img_y')
 
         # ------------------------- CENTER: image -------------------------
         BoxLayout:
@@ -636,313 +683,297 @@ LumaViewProMainLayout:
                     valign: 'middle'
                     text_size: self.size
 
-        # --------------- RIGHT: plate navigator + stage ---------------
-        ScrollView:
+        # --------------- RIGHT: navigator + stage (resizable) ---------------
+        Splitter:
+            id: right_split
+            sizable_from: 'left'
             size_hint_x: None
-            width: '300dp'
-            do_scroll_x: False
-            bar_width: '4dp'
-            BoxLayout:
-                orientation: 'vertical'
-                size_hint_y: None
-                height: self.minimum_height
-                spacing: '4dp'
-                padding: '6dp'
-                canvas.before:
-                    Color:
-                        rgba: PANEL
-                    Rectangle:
-                        pos: self.pos
-                        size: self.size
-
-                HeaderLabel:
-                    text: 'LABWARE'
-                DarkSpinner:
-                    id: labware_spinner
-                    text: app.labware_name
-                    values: app.labware_options
-                    on_text: app.select_labware(self.text)
-                FieldRow:
-                    FlatButton:
-                        text: 'Duplicate'
-                        on_press: app.duplicate_labware()
-                    FlatButton:
-                        text: 'Edit / New'
-                        on_press: app.open_labware_editor()
-                    FlatButton:
-                        text: 'Delete'
-                        on_press: app.delete_labware()
-
-                HeaderLabel:
-                    text: 'PLATE NAVIGATOR'
-                WellPlateMapWidget:
-                    id: plate_map
-                    size_hint_y: None
-                    height: '200dp'
-                FieldRow:
-                    PanelLabel:
-                        text: 'Selected well: ' + app.selected_well_str
-                        size_hint_x: 0.6
-                    FlatButton:
-                        text: 'Set A1 = here'
-                        on_press: app.set_a1_here()
-                PanelLabel:
-                    text: 'Double-click a well to move the stage there'
-
-                HeaderLabel:
-                    text: 'PLATE CALIBRATION'
-                PanelLabel:
-                    text: app.cal_info
+            width: '320dp'
+            min_size: '220dp'
+            max_size: '700dp'
+            strip_size: '6dp'
+            ScrollView:
+                do_scroll_x: False
+                bar_width: '4dp'
                 BoxLayout:
                     orientation: 'vertical'
                     size_hint_y: None
-                    height: '0dp' if app.cal_active else '30dp'
-                    opacity: 0 if app.cal_active else 1
-                    AccentButton:
-                        text: 'Calibrate plate...'
-                        disabled: app.cal_active
-                        on_press: app.cal_start()
-                BoxLayout:
-                    orientation: 'vertical'
-                    spacing: '3dp'
-                    size_hint_y: None
-                    height: '126dp' if app.cal_active else '0dp'
-                    opacity: 1 if app.cal_active else 0
-                    Label:
-                        text: app.cal_label
-                        color: (1.0, 0.45, 0.35, 1)
-                        bold: True
-                        font_size: '12sp'
-                        size_hint_y: None
-                        height: '20dp'
-                    PanelLabel:
-                        text: 'Center the FOV on the red target, then Mark'
-                    AccentButton:
-                        text: 'MARK (uses current XY)'
-                        disabled: not app.cal_active
-                        on_press: app.cal_mark()
-                    FieldRow:
-                        FlatButton:
-                            text: '< Prev'
-                            disabled: not app.cal_active
-                            on_press: app.cal_prev()
-                        FlatButton:
-                            text: 'Next >'
-                            disabled: not app.cal_active
-                            on_press: app.cal_next()
-                    FieldRow:
-                        FlatButton:
-                            text: 'Finish'
-                            disabled: not app.cal_active
-                            on_press: app.cal_finish()
-                        StopButton:
-                            text: 'Cancel'
-                            disabled: not app.cal_active
-                            on_press: app.cal_cancel()
-                FlatButton:
-                    text: 'Save measured geometry as labware copy'
-                    on_press: app.cal_save_measured_labware()
-                FieldRow:
-                    FlatButton:
-                        text: 'Flip plate X'
-                        on_press: app.toggle_invert('plate_x')
-                    FlatButton:
-                        text: 'Flip plate Y'
-                        on_press: app.toggle_invert('plate_y')
+                    height: self.minimum_height
+                    spacing: '4dp'
+                    padding: '4dp'
+                    canvas.before:
+                        Color:
+                            rgba: PANEL
+                        Rectangle:
+                            pos: self.pos
+                            size: self.size
 
-                HeaderLabel:
-                    text: 'PROTOCOL POSITIONS'
-                PanelLabel:
-                    text: app.positions_info
-                FieldRow:
-                    FlatButton:
-                        text: '+ here'
-                        on_press: app.position_add_here()
-                    FlatButton:
-                        text: 'Remove last'
-                        on_press: app.position_remove_last()
-                    FlatButton:
-                        text: 'Clear'
-                        on_press: app.position_clear()
-                FieldRow:
-                    PanelLabel:
-                        text: 'Travel Z drop (um)'
-                        size_hint_x: 0.55
-                    SmallInput:
-                        id: travel_clearance_input
-                        text: str(int(app.travel_clearance_um)) if hasattr(app, 'travel_clearance_um') else '500'
-                        on_text_validate: app.travel_clearance_um = float(self.text or 500)
-                BoxLayout:
-                    orientation: 'vertical'
-                    size_hint_y: None
-                    height: '0dp' if app.pos_review_active else '30dp'
-                    opacity: 0 if app.pos_review_active else 1
-                    AccentButton:
-                        text: 'Review positions...'
-                        disabled: app.pos_review_active
-                        on_press: app.pos_review_start()
-                BoxLayout:
-                    orientation: 'vertical'
-                    spacing: '3dp'
-                    size_hint_y: None
-                    height: '118dp' if app.pos_review_active else '0dp'
-                    opacity: 1 if app.pos_review_active else 0
-                    Label:
-                        text: app.pos_review_label
-                        color: (1.0, 0.85, 0.1, 1)
-                        bold: True
-                        font_size: '12sp'
-                        size_hint_y: None
-                        height: '20dp'
-                    PanelLabel:
-                        text: 'Fine-tune focus, then set and move on'
-                    AccentButton:
-                        text: 'Set focus = here'
-                        disabled: not app.pos_review_active
-                        on_press: app.pos_review_set_focus()
-                    FieldRow:
+                    Collapsible:
+                        title: 'LABWARE'
+                        DarkSpinner:
+                            id: labware_spinner
+                            text: app.labware_name
+                            values: app.labware_options
+                            on_text: app.select_labware(self.text)
+                        FieldRow:
+                            FlatButton:
+                                text: 'Duplicate'
+                                on_press: app.duplicate_labware()
+                            FlatButton:
+                                text: 'Edit / New'
+                                on_press: app.open_labware_editor()
+                            FlatButton:
+                                text: 'Delete'
+                                on_press: app.delete_labware()
+
+                    Collapsible:
+                        title: 'PLATE NAVIGATOR'
+                        open: True
+                        WellPlateMapWidget:
+                            id: plate_map
+                            size_hint_y: None
+                            height: self.width * 0.68
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Selected well: ' + app.selected_well_str
+                                size_hint_x: 0.6
+                            FlatButton:
+                                text: 'Set A1 = here'
+                                on_press: app.set_a1_here()
+                        PanelLabel:
+                            text: 'Double-click a well to move the stage there'
+
+                    Collapsible:
+                        title: 'PLATE CALIBRATION'
+                        PanelLabel:
+                            text: app.cal_info
+                            height: '30dp'
+                            text_size: self.width, None
+                        AccentButton:
+                            text: 'Calibrate plate...'
+                            disabled: app.cal_active
+                            opacity: 0 if app.cal_active else 1
+                            size_hint_y: None
+                            height: '0dp' if app.cal_active else '28dp'
+                            on_press: app.cal_start()
+                        BoxLayout:
+                            orientation: 'vertical'
+                            spacing: '3dp'
+                            size_hint_y: None
+                            height: '126dp' if app.cal_active else '0dp'
+                            opacity: 1 if app.cal_active else 0
+                            disabled: not app.cal_active
+                            Label:
+                                text: app.cal_label
+                                color: (1.0, 0.45, 0.35, 1)
+                                bold: True
+                                font_size: '12sp'
+                                size_hint_y: None
+                                height: '20dp'
+                            PanelLabel:
+                                text: 'Center FOV on the red target, then Mark'
+                            AccentButton:
+                                text: 'MARK (uses current XY)'
+                                on_press: app.cal_mark()
+                            FieldRow:
+                                FlatButton:
+                                    text: '< Prev'
+                                    on_press: app.cal_prev()
+                                FlatButton:
+                                    text: 'Next >'
+                                    on_press: app.cal_next()
+                            FieldRow:
+                                FlatButton:
+                                    text: 'Finish'
+                                    on_press: app.cal_finish()
+                                StopButton:
+                                    text: 'Cancel'
+                                    on_press: app.cal_cancel()
                         FlatButton:
-                            text: '< Prev'
+                            text: 'Save measured geometry as labware copy'
+                            on_press: app.cal_save_measured_labware()
+                        FieldRow:
+                            FlatButton:
+                                text: 'Flip plate X'
+                                on_press: app.toggle_invert('plate_x')
+                            FlatButton:
+                                text: 'Flip plate Y'
+                                on_press: app.toggle_invert('plate_y')
+
+                    Collapsible:
+                        title: 'PROTOCOL POSITIONS'
+                        PanelLabel:
+                            text: app.positions_info
+                            height: '30dp'
+                            text_size: self.width, None
+                        FieldRow:
+                            FlatButton:
+                                text: '+ here'
+                                on_press: app.position_add_here()
+                            FlatButton:
+                                text: 'Remove last'
+                                on_press: app.position_remove_last()
+                            FlatButton:
+                                text: 'Clear'
+                                on_press: app.position_clear()
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Travel Z drop (um)'
+                                size_hint_x: 0.55
+                            SmallInput:
+                                id: travel_clearance_input
+                                text: '500'
+                                on_text_validate: app.travel_clearance_um = float(self.text or 500)
+                        AccentButton:
+                            text: 'Review positions...'
+                            disabled: app.pos_review_active
+                            opacity: 0 if app.pos_review_active else 1
+                            size_hint_y: None
+                            height: '0dp' if app.pos_review_active else '28dp'
+                            on_press: app.pos_review_start()
+                        BoxLayout:
+                            orientation: 'vertical'
+                            spacing: '3dp'
+                            size_hint_y: None
+                            height: '118dp' if app.pos_review_active else '0dp'
+                            opacity: 1 if app.pos_review_active else 0
                             disabled: not app.pos_review_active
-                            on_press: app.pos_review_prev()
-                        FlatButton:
-                            text: 'Next >'
-                            disabled: not app.pos_review_active
-                            on_press: app.pos_review_next()
-                    FlatButton:
-                        text: 'Done'
-                        disabled: not app.pos_review_active
-                        on_press: app.pos_review_done()
+                            Label:
+                                text: app.pos_review_label
+                                color: (1.0, 0.85, 0.1, 1)
+                                bold: True
+                                font_size: '12sp'
+                                size_hint_y: None
+                                height: '20dp'
+                            PanelLabel:
+                                text: 'Fine-tune focus, then set and move on'
+                            AccentButton:
+                                text: 'Set focus = here'
+                                on_press: app.pos_review_set_focus()
+                            FieldRow:
+                                FlatButton:
+                                    text: '< Prev'
+                                    on_press: app.pos_review_prev()
+                                FlatButton:
+                                    text: 'Next >'
+                                    on_press: app.pos_review_next()
+                            FlatButton:
+                                text: 'Done'
+                                on_press: app.pos_review_done()
 
-                HeaderLabel:
-                    text: 'STAGE'
-                Label:
-                    text: app.stage_coord_str
-                    color: TXT
-                    font_size: '13sp'
-                    bold: True
-                    size_hint_y: None
-                    height: '22dp'
-                GridLayout:
-                    cols: 6
-                    spacing: '2dp'
-                    size_hint_y: None
-                    height: '24dp'
-                    FlatButton:
-                        text: '10'
-                        height: '24dp'
-                        background_color: ACCENT if app.xy_step_um == 10 else PANEL2
-                        on_press: app.xy_step_um = 10
-                    FlatButton:
-                        text: '50'
-                        height: '24dp'
-                        background_color: ACCENT if app.xy_step_um == 50 else PANEL2
-                        on_press: app.xy_step_um = 50
-                    FlatButton:
-                        text: '100'
-                        height: '24dp'
-                        background_color: ACCENT if app.xy_step_um == 100 else PANEL2
-                        on_press: app.xy_step_um = 100
-                    FlatButton:
-                        text: '500'
-                        height: '24dp'
-                        background_color: ACCENT if app.xy_step_um == 500 else PANEL2
-                        on_press: app.xy_step_um = 500
-                    FlatButton:
-                        text: '1k'
-                        height: '24dp'
-                        background_color: ACCENT if app.xy_step_um == 1000 else PANEL2
-                        on_press: app.xy_step_um = 1000
-                    FlatButton:
-                        text: '5k'
-                        height: '24dp'
-                        background_color: ACCENT if app.xy_step_um == 5000 else PANEL2
-                        on_press: app.xy_step_um = 5000
-                PanelLabel:
-                    text: 'XY step (um) - arrow keys also jog, Shift = 10x'
-                GridLayout:
-                    cols: 3
-                    spacing: '3dp'
-                    size_hint_y: None
-                    height: '96dp'
-                    Widget:
-                    FlatButton:
-                        text: 'Y +'
-                        on_press: app.jog('Y', app.xy_step_um)
-                    Widget:
-                    FlatButton:
-                        text: 'X -'
-                        on_press: app.jog('X', -app.xy_step_um)
-                    FlatButton:
-                        text: 'Center'
-                        on_press: app.goto_center()
-                    FlatButton:
-                        text: 'X +'
-                        on_press: app.jog('X', app.xy_step_um)
-                    Widget:
-                    FlatButton:
-                        text: 'Y -'
-                        on_press: app.jog('Y', -app.xy_step_um)
-                    Widget:
-                GridLayout:
-                    cols: 4
-                    spacing: '3dp'
-                    size_hint_y: None
-                    height: '62dp'
-                    FlatButton:
-                        text: 'Z +100'
-                        on_press: app.jog('Z', 100)
-                    FlatButton:
-                        text: 'Z +10'
-                        on_press: app.jog('Z', 10)
-                    FlatButton:
-                        text: 'Z -10'
-                        on_press: app.jog('Z', -10)
-                    FlatButton:
-                        text: 'Z -100'
-                        on_press: app.jog('Z', -100)
-                    FlatButton:
-                        text: 'XY -5k'
-                        on_press: app.jog_xy(-5000, -5000)
-                    FlatButton:
-                        text: 'Z +1k'
-                        on_press: app.jog('Z', 1000)
-                    FlatButton:
-                        text: 'Z -1k'
-                        on_press: app.jog('Z', -1000)
-                    FlatButton:
-                        text: 'Re-home'
-                        on_press: app.rehome()
-
-                HeaderLabel:
-                    text: 'Z FOCUS'
-                PanelLabel:
-                    text: 'Vertical slider is beside the image; wheel = fine'
-                FieldRow:
-                    PanelLabel:
-                        text: 'Go to Z (um)'
-                        size_hint_x: 0.45
-                    SmallInput:
-                        id: z_goto_input
-                        text: '0'
-                        on_text_validate: app.z_goto(self.text)
-                    FlatButton:
-                        text: 'Go'
-                        size_hint_x: None
-                        width: '40dp'
-                        on_press: app.z_goto(z_goto_input.text)
-
-                HeaderLabel:
-                    text: 'FOCUS SURFACE STATUS'
-                Label:
-                    text: app.surface_info
-                    color: TXT_DIM
-                    font_size: '10sp'
-                    size_hint_y: None
-                    height: '40dp'
-                    text_size: self.width, None
-                    halign: 'left'
-                    valign: 'top'
+                    Collapsible:
+                        title: 'STAGE'
+                        open: True
+                        Label:
+                            text: app.stage_coord_str
+                            color: TXT
+                            font_size: '13sp'
+                            bold: True
+                            size_hint_y: None
+                            height: '22dp'
+                        GridLayout:
+                            cols: 6
+                            spacing: '2dp'
+                            size_hint_y: None
+                            height: '24dp'
+                            FlatButton:
+                                text: '10'
+                                height: '24dp'
+                                background_color: ACCENT if app.xy_step_um == 10 else PANEL2
+                                on_press: app.xy_step_um = 10
+                            FlatButton:
+                                text: '50'
+                                height: '24dp'
+                                background_color: ACCENT if app.xy_step_um == 50 else PANEL2
+                                on_press: app.xy_step_um = 50
+                            FlatButton:
+                                text: '100'
+                                height: '24dp'
+                                background_color: ACCENT if app.xy_step_um == 100 else PANEL2
+                                on_press: app.xy_step_um = 100
+                            FlatButton:
+                                text: '500'
+                                height: '24dp'
+                                background_color: ACCENT if app.xy_step_um == 500 else PANEL2
+                                on_press: app.xy_step_um = 500
+                            FlatButton:
+                                text: '1k'
+                                height: '24dp'
+                                background_color: ACCENT if app.xy_step_um == 1000 else PANEL2
+                                on_press: app.xy_step_um = 1000
+                            FlatButton:
+                                text: '5k'
+                                height: '24dp'
+                                background_color: ACCENT if app.xy_step_um == 5000 else PANEL2
+                                on_press: app.xy_step_um = 5000
+                        PanelLabel:
+                            text: 'XY step (um) - arrow keys jog too, Shift = 10x'
+                        GridLayout:
+                            cols: 3
+                            spacing: '3dp'
+                            size_hint_y: None
+                            height: '96dp'
+                            Widget:
+                            FlatButton:
+                                text: 'Y +'
+                                on_press: app.jog('Y', app.xy_step_um)
+                            Widget:
+                            FlatButton:
+                                text: 'X -'
+                                on_press: app.jog('X', -app.xy_step_um)
+                            FlatButton:
+                                text: 'Center'
+                                on_press: app.goto_center()
+                            FlatButton:
+                                text: 'X +'
+                                on_press: app.jog('X', app.xy_step_um)
+                            Widget:
+                            FlatButton:
+                                text: 'Y -'
+                                on_press: app.jog('Y', -app.xy_step_um)
+                            Widget:
+                        GridLayout:
+                            cols: 4
+                            spacing: '3dp'
+                            size_hint_y: None
+                            height: '62dp'
+                            FlatButton:
+                                text: 'Z +100'
+                                on_press: app.jog('Z', 100)
+                            FlatButton:
+                                text: 'Z +10'
+                                on_press: app.jog('Z', 10)
+                            FlatButton:
+                                text: 'Z -10'
+                                on_press: app.jog('Z', -10)
+                            FlatButton:
+                                text: 'Z -100'
+                                on_press: app.jog('Z', -100)
+                            FlatButton:
+                                text: 'XY -5k'
+                                on_press: app.jog_xy(-5000, -5000)
+                            FlatButton:
+                                text: 'Z +1k'
+                                on_press: app.jog('Z', 1000)
+                            FlatButton:
+                                text: 'Z -1k'
+                                on_press: app.jog('Z', -1000)
+                            FlatButton:
+                                text: 'Re-home'
+                                on_press: app.rehome()
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Go to Z (um)'
+                                size_hint_x: 0.45
+                            SmallInput:
+                                id: z_goto_input
+                                text: '0'
+                                on_text_validate: app.z_goto(self.text)
+                            FlatButton:
+                                text: 'Go'
+                                size_hint_x: None
+                                width: '40dp'
+                                on_press: app.z_goto(z_goto_input.text)
 
     # ============================= STATUS BAR =============================
     BoxLayout:

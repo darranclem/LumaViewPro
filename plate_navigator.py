@@ -4,10 +4,24 @@ import numpy as np
 from kivy.app import App
 from kivy.graphics import Color, Line, Rectangle, Ellipse
 from kivy.graphics.texture import Texture
-from kivy.properties import BooleanProperty
+from kivy.properties import BooleanProperty, StringProperty
+from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.image import Image
 from kivy.uix.widget import Widget
 from kivy.uix.popup import Popup
+
+
+class Collapsible(BoxLayout):
+    """Accordion-style section: header button toggles the body open/shut.
+    Child widgets declared inside it in kv are redirected into the body."""
+
+    title = StringProperty('')
+    open = BooleanProperty(False)
+
+    def add_widget(self, widget, *args, **kwargs):
+        if self.ids and 'body' in self.ids:
+            return self.ids.body.add_widget(widget, *args, **kwargs)
+        return super().add_widget(widget, *args, **kwargs)
 
 
 class WellPlateFormat:
