@@ -505,6 +505,9 @@ LumaViewProMainLayout:
 
                 HeaderLabel:
                     text: 'IMAGE SCALE'
+                AccentButton:
+                    text: 'Auto-calibrate centering (moves 0.1mm)'
+                    on_press: app.calibrate_image_motion()
                 FieldRow:
                     PanelLabel:
                         text: 'um / pixel (bin 1)'

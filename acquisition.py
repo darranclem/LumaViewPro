@@ -822,6 +822,27 @@ def run_z_stack(hw: ScopeHW,
     _status(f'Z-stack finished -> {out_dir}')
 
 
+def measure_image_shift(img_a: np.ndarray, img_b: np.ndarray,
+                        downsample_to: int = 512):
+    """Translation of img_b relative to img_a in full-res pixels via phase
+    correlation. Returns (dx_px, dy_px, response) or None. Image coords:
+    +x right, +y down."""
+    if cv2 is None or img_a is None or img_b is None:
+        return None
+    if img_a.shape != img_b.shape or img_a.size == 0:
+        return None
+    f = max(img_a.shape[0] // downsample_to, 1)
+    a = img_a[::f, ::f].astype(np.float32)
+    b = img_b[::f, ::f].astype(np.float32)
+    a -= a.mean()
+    b -= b.mean()
+    try:
+        (sx, sy), resp = cv2.phaseCorrelate(a, b)
+    except Exception:
+        return None
+    return sx * f, sy * f, float(resp)
+
+
 def channel_settings_to_dict(cs: dict[str, ChannelSettings]) -> dict:
     return {k: asdict(v) for k, v in cs.items()}
 

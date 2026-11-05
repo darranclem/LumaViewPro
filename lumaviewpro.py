@@ -176,6 +176,9 @@ class LumaViewProApp(App):
         self.base_um_per_px = DEFAULT_UM_PER_PX
         self.img_sign_x = 1.0      # double-click-to-center direction trims
         self.img_sign_y = 1.0
+        # Measured pixel->stage mapping: {'A': 2x2 (px shift per stage um),
+        # 'binning': int}. Set by auto-calibration; None = use um/px+signs.
+        self.img_cal: dict | None = None
 
         self.stage_x_um = 0.0
         self.stage_y_um = 0.0
@@ -1266,15 +1269,97 @@ class LumaViewProApp(App):
             self._set_status(f'At {name}')
         self._bg(_move)
 
-    def on_image_double_click(self, dx_px: float, dy_px: float):
-        """Double-click on the live image: center the clicked point.
-        Single vector move so the path is straight, not X-then-Y."""
-        if not self.stage_connected:
+    def _img_cal_matrix(self):
+        """Current px-shift-per-stage-um 2x2 (binning compensated), or None."""
+        if not self.img_cal or not self.img_cal.get('A'):
+            return None
+        A = np.asarray(self.img_cal['A'], dtype=np.float64)
+        cal_bin = max(int(self.img_cal.get('binning', 1)), 1)
+        try:
+            cur_bin = max(int(self.binning), 1)
+        except Exception:
+            cur_bin = 1
+        return A * (cal_bin / cur_bin)
+
+    def calibrate_image_motion(self):
+        """Solve the exact pixel->stage mapping (scale, direction, rotation)
+        by moving the stage ~100 um in X then Y and measuring the image
+        shift with phase correlation. Needs a lit, feature-rich field."""
+        if not (self.stage_connected and self.camera_connected):
+            self._set_status('Image calibration needs stage + camera')
             return
+        ch = self.live_channel if self.live_channel in CHANNELS else self.selected_channel
+        D = 100.0
+        def _job():
+            self.hw.set_channel(ch, self._cs(ch))
+            time.sleep(0.3)
+            f0 = self.hw.grab_fresh(2.0)
+            self.hw.move_xy_rel(D, 0)
+            time.sleep(0.1)
+            f1 = self.hw.grab_fresh(2.0)
+            self.hw.move_xy_rel(0, D)
+            time.sleep(0.1)
+            f2 = self.hw.grab_fresh(2.0)
+            self.hw.move_xy_rel(-D, -D)   # return to start
+            sx = acq.measure_image_shift(f0, f1)
+            sy = acq.measure_image_shift(f1, f2)
+            if (sx is None or sy is None or sx[2] < 0.1 or sy[2] < 0.1 or
+                    (abs(sx[0]) + abs(sx[1])) < 2 or (abs(sy[0]) + abs(sy[1])) < 2):
+                self._set_status('Image calibration FAILED - need a lit field '
+                                 'with visible features (try focusing first)')
+                return
+            A = [[sx[0] / D, sy[0] / D], [sx[1] / D, sy[1] / D]]
+            try:
+                cur_bin = max(int(self.binning), 1)
+            except Exception:
+                cur_bin = 1
+            self.img_cal = {'A': A, 'binning': cur_bin}
+            scale = 1.0 / float(np.linalg.norm(np.asarray(A)[:, 0]))
+            self._persist()
+            self._set_status(f'Image motion calibrated: {scale:.3f} um/px, '
+                             f'conf {min(sx[2], sy[2]):.2f}')
+        self._bg(_job, busy_job=True)
+
+    def on_image_double_click(self, dx_px: float, dy_px: float):
+        """Double-click on the live image: bring the clicked point to the
+        center. Uses the measured pixel->stage calibration when available
+        and verifies with a corrective trim move (closed loop)."""
+        if not self.stage_connected or self.worker_busy:
+            return
+        A = self._img_cal_matrix()
+        if A is not None:
+            target_px = np.array([-dx_px, -dy_px])   # required content shift
+            try:
+                stage = np.linalg.solve(A, target_px)
+            except np.linalg.LinAlgError:
+                A = None
+            if A is not None:
+                self._set_status(f'Centering: dx={stage[0]:.0f}, '
+                                 f'dy={stage[1]:.0f} um (calibrated)')
+                def _move():
+                    f0 = self.hw.grab_fresh(1.0)
+                    self.hw.move_xy_rel(float(stage[0]), float(stage[1]))
+                    time.sleep(0.1)
+                    f1 = self.hw.grab_fresh(1.0)
+                    s = acq.measure_image_shift(f0, f1)
+                    if s is not None and s[2] > 0.15:
+                        resid = target_px - np.array([s[0], s[1]])
+                        if np.linalg.norm(resid) > 8:   # trim once
+                            try:
+                                trim = np.linalg.solve(A, resid)
+                                if np.linalg.norm(trim) < np.linalg.norm(stage):
+                                    self.hw.move_xy_rel(float(trim[0]),
+                                                        float(trim[1]))
+                            except np.linalg.LinAlgError:
+                                pass
+                self._bg(_move)
+                return
+        # Fallback: manual um/px + sign trims
         scale = self.effective_um_per_px()
         dx_um = dx_px * scale * self.img_sign_x
         dy_um = dy_px * scale * self.img_sign_y
-        self._set_status(f'Centering: dx={dx_um:.0f} um, dy={dy_um:.0f} um')
+        self._set_status(f'Centering: dx={dx_um:.0f} um, dy={dy_um:.0f} um '
+                         f'(uncalibrated - use Auto-calibrate for accuracy)')
         self._bg(self.hw.move_xy_rel, dx_um, dy_um)
 
     def toggle_invert(self, which: str):
@@ -1684,6 +1769,7 @@ class LumaViewProApp(App):
             'output_dir': self.output_dir,
             'protocol_positions': self.protocol_positions,
             'travel_clearance_um': self.travel_clearance_um,
+            'img_cal': self.img_cal,
         }
         try:
             acq.save_settings(payload)
@@ -1729,6 +1815,7 @@ class LumaViewProApp(App):
             self.protocol_positions = [dict(p) for p
                                        in d.get('protocol_positions', [])]
             self.travel_clearance_um = float(d.get('travel_clearance_um', 500.0))
+            self.img_cal = d.get('img_cal')
         except Exception:
             pass
         self.shading.load_all()
