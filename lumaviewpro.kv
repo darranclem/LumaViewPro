@@ -388,6 +388,10 @@ LumaViewProMainLayout:
                         text: '10'
                 PanelLabel:
                     text: app.af_range_text(af_bottom_input.text, af_top_input.text)
+                FlatButton:
+                    text: 'High stability AF: ' + ('ON' if app.high_stability_on else 'off')
+                    background_color: ACCENT if app.high_stability_on else PANEL2
+                    on_press: app.high_stability_on = not app.high_stability_on
                 FieldRow:
                     FlatButton:
                         text: 'Anchor = here'
@@ -601,12 +605,25 @@ LumaViewProMainLayout:
                         color: TXT
                         font_size: '10sp'
                         halign: 'center'
-            Label:
+            BoxLayout:
                 size_hint_y: None
                 height: '18dp'
-                text: app.frame_stats + '   |   Dbl-click: center. Wheel: focus 10um (Shift 2 / Ctrl 100).'
-                color: TXT_DIM
-                font_size: '10sp'
+                spacing: '6dp'
+                FlatButton:
+                    text: ('CROSSHAIR ON' if app.crosshair_on else 'crosshair off')
+                    size_hint_x: None
+                    width: '110dp'
+                    height: '18dp'
+                    font_size: '10sp'
+                    background_color: ACCENT if app.crosshair_on else PANEL2
+                    on_press: app.crosshair_on = not app.crosshair_on
+                Label:
+                    text: app.frame_stats + '   |   Dbl-click: center. Wheel: focus 10um (Shift 2 / Ctrl 100).'
+                    color: TXT_DIM
+                    font_size: '10sp'
+                    halign: 'left'
+                    valign: 'middle'
+                    text_size: self.size
 
         # --------------- RIGHT: plate navigator + stage ---------------
         ScrollView:

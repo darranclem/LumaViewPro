@@ -315,21 +315,63 @@ class ScopeHW:
 
 # ---------------------------------------------------------------- focus
 
-def focus_metric(img: np.ndarray) -> float:
-    """Contrast metric: variance of the Laplacian on the center crop
-    (higher = sharper). Center-cropped and downsampled for speed."""
+FLUOR_CHANNELS = {'BLUE', 'GREEN', 'RED'}
+
+
+def _prep_focus_img(img: np.ndarray) -> np.ndarray:
+    """Center crop + downsample + denoise for focus scoring."""
+    h, w = img.shape[:2]
+    s = img[h // 4: 3 * h // 4, w // 4: 3 * w // 4]
+    if s.shape[0] > 512:
+        f = s.shape[0] // 512 + 1
+        s = s[::f, ::f]
+    s = s.astype(np.float32)
+    if cv2 is not None:
+        s = cv2.GaussianBlur(s, (5, 5), 0)   # kill shot noise before gradients
+    return s
+
+
+def focus_metric(img: np.ndarray, mode: str = 'transmitted') -> float:
+    """Sharpness score (higher = sharper).
+
+    transmitted: Tenengrad (mean squared Sobel magnitude) - strong for
+    BF/PC/DF detail. fluor: normalized variance (var/mean) - robust to the
+    shot noise and intensity changes of fluorescence imaging. Both operate
+    on a denoised center crop.
+    """
     if img is None or img.size == 0:
         return 0.0
-    h, w = img.shape[:2]
-    small = img[h // 4: 3 * h // 4, w // 4: 3 * w // 4]
-    if small.shape[0] > 512:
-        f = small.shape[0] // 512 + 1
-        small = small[::f, ::f]
-    small = small.astype(np.float32)
-    if cv2 is not None:
-        return float(cv2.Laplacian(small, cv2.CV_32F).var())
-    gy, gx = np.gradient(small)
-    return float((gx ** 2 + gy ** 2).mean())
+    s = _prep_focus_img(img)
+    if cv2 is None:
+        gy, gx = np.gradient(s)
+        return float((gx * gx + gy * gy).mean())
+    if mode == 'fluor':
+        m = float(s.mean())
+        return float(s.var() / (m + 1e-3))
+    sx = cv2.Sobel(s, cv2.CV_32F, 1, 0)
+    sy = cv2.Sobel(s, cv2.CV_32F, 0, 1)
+    return float((sx * sx + sy * sy).mean())
+
+
+def make_focus_template(img: np.ndarray) -> np.ndarray | None:
+    """Reference descriptor of a user-approved in-focus view."""
+    if img is None or img.size == 0:
+        return None
+    return _prep_focus_img(img)
+
+
+def template_score(img: np.ndarray, tpl: np.ndarray) -> float:
+    """Normalized cross-correlation (-1..1) against the stored in-focus
+    reference - peaks exactly where the image looks like the marked focus."""
+    s = _prep_focus_img(img)
+    if cv2 is not None and s.shape != tpl.shape:
+        s = cv2.resize(s, (tpl.shape[1], tpl.shape[0]))
+    elif s.shape != tpl.shape:
+        return 0.0
+    a = s - s.mean()
+    b = tpl - tpl.mean()
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b)) + 1e-9
+    return float((a * b).sum() / denom)
 
 
 @dataclass
@@ -341,14 +383,14 @@ class AutofocusConfig:
     settle_s: float = 0.05
 
 
-def _af_measure(hw, z, settle_s, pos_cb):
+def _af_measure(hw, z, settle_s, pos_cb, scorer):
     hw.move_z(z)
     if pos_cb:
         pos_cb(z)
     if settle_s > 0:
         time.sleep(settle_s)
     frame = hw.grab_fresh(2.0)
-    return focus_metric(frame) if frame is not None else 0.0
+    return scorer(frame) if frame is not None else 0.0
 
 
 def _parabolic_peak(zs, scores, i, lo, hi, step):
@@ -365,17 +407,24 @@ def autofocus_sweep(hw: ScopeHW, cfg: AutofocusConfig,
                     settings: ChannelSettings,
                     cancel: threading.Event | None = None,
                     status_cb=None,
-                    pos_cb=None) -> tuple[float | None, bool]:
+                    pos_cb=None,
+                    template: np.ndarray | None = None,
+                    high_stability: bool = False) -> tuple[float | None, bool]:
     """Two-pass autofocus over [bottom, top] (z-stack style range).
 
-    Coarse pass at ``step_um``, then a fine pass (step/5) around the coarse
-    peak, finished with a parabolic fit - fast and sub-step accurate. All
-    moves approach via the driver's backlash handling.
+    Coarse pass at ``step_um`` using a channel-appropriate sharpness
+    metric (Tenengrad for transmitted, normalized variance for
+    fluorescence), then a fine pass (step/5) around the peak with a
+    parabolic fit - fast and sub-step accurate.
 
-    Returns (z, ok): on reliable focus, ``z`` is the best position (stage
-    moved there) and ``ok`` True. If the contrast profile is too flat to
-    trust (empty field, LED off...), the stage parks at the RANGE MIDDLE
-    and (middle, False) is returned.
+    High stability: when ``template`` (a stored in-focus reference) is
+    provided and ``high_stability`` is True, the fine pass maximizes the
+    normalized cross-correlation against that reference instead - it
+    returns to the focus THE USER marked, not just a generically sharp
+    plane. Slightly slower, highly repeatable.
+
+    Returns (z, ok). On an unusable contrast profile the stage parks at
+    the RANGE MIDDLE and (middle, False) is returned.
     """
     lo = min(cfg.z_bottom_um, cfg.z_top_um)
     hi = max(cfg.z_bottom_um, cfg.z_top_um)
@@ -384,6 +433,12 @@ def autofocus_sweep(hw: ScopeHW, cfg: AutofocusConfig,
     if hi - lo < 1e-6:
         hw.move_z(mid)
         return mid, False
+    mode = 'fluor' if cfg.channel in FLUOR_CHANNELS else 'transmitted'
+    coarse_scorer = lambda f: focus_metric(f, mode)
+    if high_stability and template is not None:
+        fine_scorer = lambda f: template_score(f, template)
+    else:
+        fine_scorer = coarse_scorer
     hw.set_channel(cfg.channel, settings)
     time.sleep(0.15)   # LED + exposure settle before the first metric
 
@@ -396,14 +451,14 @@ def autofocus_sweep(hw: ScopeHW, cfg: AutofocusConfig,
     while z <= hi + 1e-6:
         if canceled():
             return None, False
-        s = _af_measure(hw, z, cfg.settle_s, pos_cb)
+        s = _af_measure(hw, z, cfg.settle_s, pos_cb, coarse_scorer)
         zs.append(z)
         scores.append(s)
         if status_cb:
-            status_cb(f'AF coarse: z={z:.1f} um  metric={s:.1f}')
+            status_cb(f'AF coarse: z={z:.1f} um  metric={s:.2f}')
         z += step
     smax, smin = max(scores), min(scores)
-    if smax <= 1e-9 or (smax - smin) / smax < 0.08:
+    if smax <= 1e-9 or (smax - smin) / abs(smax) < 0.05:
         if status_cb:
             status_cb('AF: no usable contrast - parking at range middle')
         hw.move_z(mid)
@@ -424,13 +479,14 @@ def autofocus_sweep(hw: ScopeHW, cfg: AutofocusConfig,
     while z <= fhi + 1e-6:
         if canceled():
             return None, False
-        s = _af_measure(hw, z, cfg.settle_s, pos_cb)
+        s = _af_measure(hw, z, cfg.settle_s, pos_cb, fine_scorer)
         fzs.append(z)
         fscores.append(s)
         if status_cb:
-            status_cb(f'AF fine: z={z:.1f} um  metric={s:.1f}')
+            tag = 'AF fine (hi-stab)' if fine_scorer is not coarse_scorer else 'AF fine'
+            status_cb(f'{tag}: z={z:.1f} um  score={s:.3f}')
         z += fstep
-    if not fscores or max(fscores) <= 1e-9:
+    if not fscores or max(fscores) <= -1.0:
         hw.move_z(mid)
         return mid, False
     j = int(np.argmax(fscores))

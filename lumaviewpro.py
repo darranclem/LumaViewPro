@@ -127,6 +127,7 @@ class LumaViewProApp(App):
     binning = StringProperty('1')
     crosshair_on = BooleanProperty(False)
     autoscale_on = BooleanProperty(True)
+    high_stability_on = BooleanProperty(False)
     initializing = BooleanProperty(False)
     frame_stats = StringProperty('No frames yet')
     shading_on = BooleanProperty(False)
@@ -180,6 +181,15 @@ class LumaViewProApp(App):
         # Measured pixel->stage mapping: {'A': 2x2 (px shift per stage um),
         # 'binning': int}. Set by auto-calibration; None = use um/px+signs.
         self.img_cal: dict | None = None
+        # In-focus reference template for high-stability AF.
+        self.af_template = None
+        try:
+            p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'data', 'af_template.npy')
+            if os.path.exists(p):
+                self.af_template = np.load(p)
+        except Exception:
+            pass
 
         self.stage_x_um = 0.0
         self.stage_y_um = 0.0
@@ -1308,6 +1318,33 @@ class LumaViewProApp(App):
             cur_bin = 1
         return A * (cal_bin / cur_bin)
 
+    def _image_cal_sync(self, ch: str) -> bool:
+        """Blocking pixel->stage calibration (two 100 um probe moves)."""
+        D = 100.0
+        self.hw.set_channel(ch, self._cs(ch))
+        time.sleep(0.3)
+        f0 = self.hw.grab_fresh(2.0)
+        self.hw.move_xy_rel(D, 0)
+        time.sleep(0.1)
+        f1 = self.hw.grab_fresh(2.0)
+        self.hw.move_xy_rel(0, D)
+        time.sleep(0.1)
+        f2 = self.hw.grab_fresh(2.0)
+        self.hw.move_xy_rel(-D, -D)   # return to start
+        sx = acq.measure_image_shift(f0, f1)
+        sy = acq.measure_image_shift(f1, f2)
+        if (sx is None or sy is None or sx[2] < 0.1 or sy[2] < 0.1 or
+                (abs(sx[0]) + abs(sx[1])) < 2 or (abs(sy[0]) + abs(sy[1])) < 2):
+            return False
+        A = [[sx[0] / D, sy[0] / D], [sx[1] / D, sy[1] / D]]
+        try:
+            cur_bin = max(int(self.binning), 1)
+        except Exception:
+            cur_bin = 1
+        self.img_cal = {'A': A, 'binning': cur_bin}
+        self._persist()
+        return True
+
     def calibrate_image_motion(self):
         """Solve the exact pixel->stage mapping (scale, direction, rotation)
         by moving the stage ~100 um in X then Y and measuring the image
@@ -1316,78 +1353,62 @@ class LumaViewProApp(App):
             self._set_status('Image calibration needs stage + camera')
             return
         ch = self.live_channel if self.live_channel in CHANNELS else self.selected_channel
-        D = 100.0
         def _job():
-            self.hw.set_channel(ch, self._cs(ch))
-            time.sleep(0.3)
-            f0 = self.hw.grab_fresh(2.0)
-            self.hw.move_xy_rel(D, 0)
-            time.sleep(0.1)
-            f1 = self.hw.grab_fresh(2.0)
-            self.hw.move_xy_rel(0, D)
-            time.sleep(0.1)
-            f2 = self.hw.grab_fresh(2.0)
-            self.hw.move_xy_rel(-D, -D)   # return to start
-            sx = acq.measure_image_shift(f0, f1)
-            sy = acq.measure_image_shift(f1, f2)
-            if (sx is None or sy is None or sx[2] < 0.1 or sy[2] < 0.1 or
-                    (abs(sx[0]) + abs(sx[1])) < 2 or (abs(sy[0]) + abs(sy[1])) < 2):
+            if self._image_cal_sync(ch):
+                A = np.asarray(self.img_cal['A'])
+                scale = 1.0 / float(np.linalg.norm(A[:, 0]))
+                self._set_status(f'Image motion calibrated: {scale:.3f} um/px')
+            else:
                 self._set_status('Image calibration FAILED - need a lit field '
                                  'with visible features (try focusing first)')
-                return
-            A = [[sx[0] / D, sy[0] / D], [sx[1] / D, sy[1] / D]]
-            try:
-                cur_bin = max(int(self.binning), 1)
-            except Exception:
-                cur_bin = 1
-            self.img_cal = {'A': A, 'binning': cur_bin}
-            scale = 1.0 / float(np.linalg.norm(np.asarray(A)[:, 0]))
-            self._persist()
-            self._set_status(f'Image motion calibrated: {scale:.3f} um/px, '
-                             f'conf {min(sx[2], sy[2]):.2f}')
         self._bg(_job, busy_job=True)
 
     def on_image_double_click(self, dx_px: float, dy_px: float):
         """Double-click on the live image: bring the clicked point to the
-        center. Uses the measured pixel->stage calibration when available
-        and verifies with a corrective trim move (closed loop)."""
+        center. Auto-calibrates the pixel->stage mapping on first use, then
+        closes the loop: measures the actual image shift and applies up to
+        three corrective trims until the click lands centered."""
         if not self.stage_connected or self.worker_busy:
             return
-        A = self._img_cal_matrix()
-        if A is not None:
-            target_px = np.array([-dx_px, -dy_px])   # required content shift
+        ch = self.live_channel if self.live_channel in CHANNELS else self.selected_channel
+        target_px = np.array([-dx_px, -dy_px])   # required content shift
+
+        def _job():
+            if self._img_cal_matrix() is None:
+                self._set_status('First double-click: calibrating image '
+                                 'motion (0.1 mm probe moves)...')
+                if not self._image_cal_sync(ch):
+                    self._set_status('Centering calibration FAILED - light a '
+                                     'featured field and try again')
+                    return
+            A = self._img_cal_matrix()
             try:
                 stage = np.linalg.solve(A, target_px)
             except np.linalg.LinAlgError:
-                A = None
-            if A is not None:
-                self._set_status(f'Centering: dx={stage[0]:.0f}, '
-                                 f'dy={stage[1]:.0f} um (calibrated)')
-                def _move():
-                    f0 = self.hw.grab_fresh(1.0)
-                    self.hw.move_xy_rel(float(stage[0]), float(stage[1]))
-                    time.sleep(0.1)
-                    f1 = self.hw.grab_fresh(1.0)
-                    s = acq.measure_image_shift(f0, f1)
-                    if s is not None and s[2] > 0.15:
-                        resid = target_px - np.array([s[0], s[1]])
-                        if np.linalg.norm(resid) > 8:   # trim once
-                            try:
-                                trim = np.linalg.solve(A, resid)
-                                if np.linalg.norm(trim) < np.linalg.norm(stage):
-                                    self.hw.move_xy_rel(float(trim[0]),
-                                                        float(trim[1]))
-                            except np.linalg.LinAlgError:
-                                pass
-                self._bg(_move)
+                self._set_status('Centering: calibration degenerate - recalibrate')
                 return
-        # Fallback: manual um/px + sign trims
-        scale = self.effective_um_per_px()
-        dx_um = dx_px * scale * self.img_sign_x
-        dy_um = dy_px * scale * self.img_sign_y
-        self._set_status(f'Centering: dx={dx_um:.0f} um, dy={dy_um:.0f} um '
-                         f'(uncalibrated - use Auto-calibrate for accuracy)')
-        self._bg(self.hw.move_xy_rel, dx_um, dy_um)
+            self._set_status(f'Centering: dx={stage[0]:.0f}, dy={stage[1]:.0f} um')
+            remaining = target_px.copy()
+            move = stage
+            for i in range(3):
+                f0 = self.hw.grab_fresh(1.0)
+                self.hw.move_xy_rel(float(move[0]), float(move[1]))
+                time.sleep(0.12)
+                f1 = self.hw.grab_fresh(1.0)
+                s = acq.measure_image_shift(f0, f1)
+                if s is None or s[2] < 0.1:
+                    break   # can't verify (dark/featureless) - open loop done
+                remaining = remaining - np.array([s[0], s[1]])
+                if np.linalg.norm(remaining) <= 4:
+                    break
+                try:
+                    move = np.linalg.solve(A, remaining)
+                except np.linalg.LinAlgError:
+                    break
+                if np.linalg.norm(move) > np.linalg.norm(stage) * 1.5:
+                    break   # diverging - stop rather than wander
+            self._set_status('Centered')
+        self._bg(_job)
 
     def toggle_invert(self, which: str):
         if which == 'plate_x':
@@ -1441,16 +1462,41 @@ class LumaViewProApp(App):
         except (TypeError, ValueError):
             return 'Range thickness: ?'
 
+    def _save_af_template(self):
+        try:
+            p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'data', 'af_template.npy')
+            if self.af_template is not None:
+                np.save(p, self.af_template)
+        except Exception:
+            pass
+
     def af_set_anchor_here(self):
         """The autofocus point used to re-reference every cycle (uses the
-        designated AF channel)."""
+        designated AF channel). Also captures an in-focus reference image
+        of this view for high-stability AF - you marked it in focus for a
+        reason, so AF can return to exactly this appearance."""
         self.af_config.channel = self.af_channel
         self.surface.set_anchor(self.stage_x_um, self.stage_y_um,
                                 self.af_channel)
         self._persist()
         self._refresh_surface_info()
-        self._set_status(f'AF anchor set at X={self.stage_x_um / 1000:.2f}, '
-                         f'Y={self.stage_y_um / 1000:.2f} mm ({self.af_channel})')
+        ch = self.af_channel
+        def _capture():
+            self.hw.set_channel(ch, self._cs(ch))
+            time.sleep(0.3)
+            frame = self.hw.grab_fresh(2.0)
+            tpl = acq.make_focus_template(frame)
+            if tpl is not None:
+                self.af_template = tpl
+                self._save_af_template()
+                Clock.schedule_once(
+                    lambda dt: setattr(self, 'live_channel', ch), 0)
+                self._set_status(f'AF anchor + focus reference captured '
+                                 f'({ch})')
+            else:
+                self._set_status('AF anchor set (no reference frame)')
+        self._bg(_capture)
 
     def af_goto_anchor(self):
         if self.surface.anchor_xy is None:
@@ -1479,7 +1525,9 @@ class LumaViewProApp(App):
             best, ok = acq.autofocus_sweep(self.hw, cfg, self._cs(ch),
                                            cancel=self.worker.cancel,
                                            status_cb=self._set_status,
-                                           pos_cb=_pos)
+                                           pos_cb=_pos,
+                                           template=self.af_template,
+                                           high_stability=self.high_stability_on)
             # Keep the AF channel lit so the image stream stays visible.
             Clock.schedule_once(lambda dt: setattr(self, 'live_channel', ch), 0)
             dt_s = time.time() - t0
@@ -1514,7 +1562,9 @@ class LumaViewProApp(App):
             best, ok = acq.autofocus_sweep(self.hw, cfg, self._cs(ch),
                                            cancel=self.worker.cancel,
                                            status_cb=self._set_status,
-                                           pos_cb=_pos)
+                                           pos_cb=_pos,
+                                           template=self.af_template,
+                                           high_stability=self.high_stability_on)
             # Keep the AF channel lit so the image stream stays visible.
             Clock.schedule_once(lambda dt: setattr(self, 'live_channel', ch), 0)
             if best is None:
@@ -1715,7 +1765,9 @@ class LumaViewProApp(App):
                         channel=self.surface.anchor_channel)
                     best, af_ok = acq.autofocus_sweep(
                         self.hw, cfg, self._cs(self.surface.anchor_channel),
-                        cancel=cancel, status_cb=self._set_status)
+                        cancel=cancel, status_cb=self._set_status,
+                        template=self.af_template,
+                        high_stability=self.high_stability_on)
                     if best is not None and af_ok:
                         if self.surface.ref_z is None:
                             self.surface.set_reference_z(best)
@@ -1807,6 +1859,7 @@ class LumaViewProApp(App):
             'travel_clearance_um': self.travel_clearance_um,
             'img_cal': self.img_cal,
             'af_channel': self.af_channel,
+            'high_stability_on': self.high_stability_on,
         }
         try:
             acq.save_settings(payload)
@@ -1854,6 +1907,7 @@ class LumaViewProApp(App):
             self.travel_clearance_um = float(d.get('travel_clearance_um', 500.0))
             self.img_cal = d.get('img_cal')
             self.af_channel = d.get('af_channel', 'BF')
+            self.high_stability_on = bool(d.get('high_stability_on', False))
         except Exception:
             pass
         self.shading.load_all()
