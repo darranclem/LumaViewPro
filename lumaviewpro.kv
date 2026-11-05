@@ -449,11 +449,13 @@ LumaViewProMainLayout:
                         text: '10'
                 FieldRow:
                     AccentButton:
-                        text: 'Grid scan'
-                        on_press: app.run_tile_scan('grid')
+                        text: 'STOP scan' if app.worker_busy else 'Grid scan'
+                        background_color: (0.75, 0.20, 0.17, 1) if app.worker_busy else ACCENT
+                        on_press: app.toggle_tile_scan('grid')
                     AccentButton:
-                        text: 'Spiral scan'
-                        on_press: app.run_tile_scan('spiral')
+                        text: 'STOP scan' if app.worker_busy else 'Spiral scan'
+                        background_color: (0.75, 0.20, 0.17, 1) if app.worker_busy else ACCENT
+                        on_press: app.toggle_tile_scan('spiral')
 
                 HeaderLabel:
                     text: 'PROTOCOL DATA / TIMELAPSE'
@@ -493,6 +495,15 @@ LumaViewProMainLayout:
 
                 HeaderLabel:
                     text: 'SAVED PROTOCOLS'
+                PanelLabel:
+                    text: 'Autosave directory'
+                SmallInput:
+                    id: protocol_dir_input
+                    text: app.protocol_dir
+                    on_text_validate: app.set_protocol_dir(self.text)
+                FlatButton:
+                    text: 'Set autosave directory'
+                    on_press: app.set_protocol_dir(protocol_dir_input.text)
                 FieldRow:
                     PanelLabel:
                         text: 'Name'

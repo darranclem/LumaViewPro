@@ -151,6 +151,7 @@ class LumaViewProApp(App):
     pos_review_label = StringProperty('')
     protocol_name = StringProperty('protocol1')
     protocol_files = ListProperty([])
+    protocol_dir = StringProperty(PROTOCOLS_DIR)
 
     # -------------------------------------------------------------- setup
 
@@ -1154,22 +1155,22 @@ class LumaViewProApp(App):
 
     def _refresh_protocol_files(self):
         try:
-            os.makedirs(PROTOCOLS_DIR, exist_ok=True)
-            names = [f[:-5] for f in os.listdir(PROTOCOLS_DIR)
+            os.makedirs(self.protocol_dir, exist_ok=True)
+            names = [f[:-5] for f in os.listdir(self.protocol_dir)
                      if f.endswith('.json')]
         except Exception:
             names = []
         self.protocol_files = names or ['(none saved)']
 
-    def save_protocol(self, name: str):
-        """Save the full protocol definition: labware, channel settings,
-        AF configuration, focus surface, positions and timelapse settings.
-        Plate calibration is intentionally NOT included - redo that (plus
-        the position focus review) when the plate is remounted."""
-        name = (name or '').strip() or 'protocol1'
-        self.apply_channel_fields_quiet()
-        self.af_apply_fields()
-        payload = {
+    def set_protocol_dir(self, text: str):
+        self.protocol_dir = text.strip() or PROTOCOLS_DIR
+        self._refresh_protocol_files()
+        self._persist()
+        self._set_status(f'Protocol autosave directory: {self.protocol_dir}')
+
+    def _protocol_payload(self, name: str) -> dict:
+        ids = self.root.ids if self.root else {}
+        return {
             'format': 'lvp-protocol-1',
             'name': name,
             'labware_name': self.labware_name,
@@ -1182,8 +1183,8 @@ class LumaViewProApp(App):
             },
             'surface': self.surface.to_dict(),
             'positions': self.protocol_positions,
-            'cycles': self.root.ids.protocol_cycles_input.text,
-            'interval_min': self.root.ids.protocol_interval_input.text,
+            'cycles': ids.protocol_cycles_input.text if ids else '1',
+            'interval_min': ids.protocol_interval_input.text if ids else '5',
             'af_each_cycle': self.af_each_cycle_on,
             'af_channel': self.af_channel,
             'use_surface': self.use_surface_on,
@@ -1191,17 +1192,39 @@ class LumaViewProApp(App):
             'travel_clearance_um': self.travel_clearance_um,
             'output_dir': self.output_dir,
         }
+
+    def _write_protocol(self, name: str) -> bool:
+        import json
         try:
-            os.makedirs(PROTOCOLS_DIR, exist_ok=True)
-            import json
-            with open(os.path.join(PROTOCOLS_DIR, f'{name}.json'), 'w',
+            os.makedirs(self.protocol_dir, exist_ok=True)
+            with open(os.path.join(self.protocol_dir, f'{name}.json'), 'w',
                       encoding='utf-8') as f:
-                json.dump(payload, f, indent=2)
+                json.dump(self._protocol_payload(name), f, indent=2)
+            return True
+        except Exception:
+            return False
+
+    def _autosave_protocol(self):
+        """Continuous snapshot of the current protocol state."""
+        try:
+            self._write_protocol('_autosave')
+        except Exception:
+            pass
+
+    def save_protocol(self, name: str):
+        """Save the full protocol definition: labware, channel settings,
+        AF configuration, focus surface, positions and timelapse settings.
+        Plate calibration is intentionally NOT included - redo that (plus
+        the position focus review) when the plate is remounted."""
+        name = (name or '').strip() or 'protocol1'
+        self.apply_channel_fields_quiet()
+        self.af_apply_fields()
+        if self._write_protocol(name):
             self.protocol_name = name
             self._refresh_protocol_files()
-            self._set_status(f'Protocol "{name}" saved')
-        except Exception as e:
-            self._set_status(f'Protocol save failed: {e}')
+            self._set_status(f'Protocol "{name}" saved to {self.protocol_dir}')
+        else:
+            self._set_status('Protocol save FAILED (directory writable?)')
 
     def load_protocol(self, name: str):
         """Load a saved protocol. Afterwards only the plate calibration and
@@ -1211,7 +1234,7 @@ class LumaViewProApp(App):
             return
         try:
             import json
-            with open(os.path.join(PROTOCOLS_DIR, f'{name}.json'), 'r',
+            with open(os.path.join(self.protocol_dir, f'{name}.json'), 'r',
                       encoding='utf-8') as f:
                 d = json.load(f)
         except Exception as e:
@@ -1658,6 +1681,14 @@ class LumaViewProApp(App):
             w = h = 1900
         return w * scale, h * scale
 
+    def toggle_tile_scan(self, pattern: str = 'grid'):
+        """Click-on/click-off: starts the tile scan, or cancels the running
+        acquisition when pressed again."""
+        if self.worker_busy:
+            self.cancel_job()
+            return
+        self.run_tile_scan(pattern)
+
     def run_tile_scan(self, pattern: str = 'grid'):
         if not (self.stage_connected and self.camera_connected):
             self._set_status('Tile scan needs stage + camera')
@@ -1860,11 +1891,14 @@ class LumaViewProApp(App):
             'img_cal': self.img_cal,
             'af_channel': self.af_channel,
             'high_stability_on': self.high_stability_on,
+            'protocol_dir': self.protocol_dir,
+            'protocol_optin_v2': True,
         }
         try:
             acq.save_settings(payload)
         except Exception:
             pass
+        self._autosave_protocol()
 
     def _load_persisted(self):
         d = acq.load_settings()
@@ -1908,6 +1942,12 @@ class LumaViewProApp(App):
             self.img_cal = d.get('img_cal')
             self.af_channel = d.get('af_channel', 'BF')
             self.high_stability_on = bool(d.get('high_stability_on', False))
+            self.protocol_dir = d.get('protocol_dir') or PROTOCOLS_DIR
+            # One-time migration: protocol membership became opt-in; clear
+            # any enables carried over from older settings files.
+            if not d.get('protocol_optin_v2'):
+                for cs in self.channel_settings.values():
+                    cs.enabled = False
         except Exception:
             pass
         self.shading.load_all()
