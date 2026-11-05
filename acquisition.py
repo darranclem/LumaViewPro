@@ -163,21 +163,23 @@ class ScopeHW:
             self.active_channel = channel
 
     def grab_fresh(self, timeout_s: float = 3.0) -> np.ndarray | None:
-        """Block for a genuinely new frame; returns a copy or None."""
+        """Block for a genuinely new frame; returns a copy or None.
+        The camera grab happens OUTSIDE the hardware lock so position
+        polling and UI reads stay responsive during sweeps."""
         with self.lock:
             cam = self.camera
-            if cam is None or not getattr(cam, 'active', False):
-                return None
-            try:
-                ok, _ = cam.grab_new_capture(timeout_s)
-            except Exception:
-                return None
-            if not ok:
-                return None
-            arr = getattr(cam, 'array', None)
-            if isinstance(arr, np.ndarray) and arr.size > 0:
-                return arr.copy()
+        if cam is None or not getattr(cam, 'active', False):
             return None
+        try:
+            ok, _ = cam.grab_new_capture(timeout_s)
+        except Exception:
+            return None
+        if not ok:
+            return None
+        arr = getattr(cam, 'array', None)
+        if isinstance(arr, np.ndarray) and arr.size > 0:
+            return arr.copy()
+        return None
 
     def grab_settled(self, settle_s: float = 0.0,
                      timeout_s: float = 3.0) -> np.ndarray | None:
@@ -314,13 +316,14 @@ class ScopeHW:
 # ---------------------------------------------------------------- focus
 
 def focus_metric(img: np.ndarray) -> float:
-    """Contrast metric: variance of the Laplacian (higher = sharper)."""
+    """Contrast metric: variance of the Laplacian on the center crop
+    (higher = sharper). Center-cropped and downsampled for speed."""
     if img is None or img.size == 0:
         return 0.0
-    small = img
-    # Downsample very large frames for speed; sharpness ranking survives.
-    if small.shape[0] > 1024:
-        f = small.shape[0] // 1024 + 1
+    h, w = img.shape[:2]
+    small = img[h // 4: 3 * h // 4, w // 4: 3 * w // 4]
+    if small.shape[0] > 512:
+        f = small.shape[0] // 512 + 1
         small = small[::f, ::f]
     small = small.astype(np.float32)
     if cv2 is not None:
@@ -335,48 +338,109 @@ class AutofocusConfig:
     z_top_um: float = 200.0
     step_um: float = 10.0
     channel: str = 'BF'
-    settle_s: float = 0.1
+    settle_s: float = 0.05
 
 
-def autofocus_sweep(hw: ScopeHW, cfg: AutofocusConfig,
-                    settings: ChannelSettings,
-                    cancel: threading.Event | None = None,
-                    status_cb=None) -> float | None:
-    """Sweep Z from bottom to top at ``step_um``; return best-focus Z (um).
+def _af_measure(hw, z, settle_s, pos_cb):
+    hw.move_z(z)
+    if pos_cb:
+        pos_cb(z)
+    if settle_s > 0:
+        time.sleep(settle_s)
+    frame = hw.grab_fresh(2.0)
+    return focus_metric(frame) if frame is not None else 0.0
 
-    Approaches from below throughout (single direction + driver backlash
-    handling) and refines the peak with a parabolic fit over the metric.
-    """
-    lo = min(cfg.z_bottom_um, cfg.z_top_um)
-    hi = max(cfg.z_bottom_um, cfg.z_top_um)
-    step = max(abs(cfg.step_um), 0.1)
-    hw.set_channel(cfg.channel, settings)
-    zs, scores = [], []
-    z = lo
-    while z <= hi + 1e-6:
-        if cancel is not None and cancel.is_set():
-            return None
-        hw.move_z(z)
-        frame = hw.grab_settled(settle_s=cfg.settle_s)
-        score = focus_metric(frame) if frame is not None else 0.0
-        zs.append(z)
-        scores.append(score)
-        if status_cb:
-            status_cb(f'AF: z={z:.1f}um metric={score:.1f}')
-        z += step
-    if not scores or max(scores) <= 0:
-        return None
-    i = int(np.argmax(scores))
+
+def _parabolic_peak(zs, scores, i, lo, hi, step):
     best = zs[i]
-    # Parabolic refinement using the neighbors of the peak.
     if 0 < i < len(zs) - 1:
         y0, y1, y2 = scores[i - 1], scores[i], scores[i + 1]
         denom = (y0 - 2 * y1 + y2)
         if abs(denom) > 1e-9:
             best = zs[i] + 0.5 * step * (y0 - y2) / denom
-            best = min(max(best, lo), hi)
+    return min(max(best, lo), hi)
+
+
+def autofocus_sweep(hw: ScopeHW, cfg: AutofocusConfig,
+                    settings: ChannelSettings,
+                    cancel: threading.Event | None = None,
+                    status_cb=None,
+                    pos_cb=None) -> tuple[float | None, bool]:
+    """Two-pass autofocus over [bottom, top] (z-stack style range).
+
+    Coarse pass at ``step_um``, then a fine pass (step/5) around the coarse
+    peak, finished with a parabolic fit - fast and sub-step accurate. All
+    moves approach via the driver's backlash handling.
+
+    Returns (z, ok): on reliable focus, ``z`` is the best position (stage
+    moved there) and ``ok`` True. If the contrast profile is too flat to
+    trust (empty field, LED off...), the stage parks at the RANGE MIDDLE
+    and (middle, False) is returned.
+    """
+    lo = min(cfg.z_bottom_um, cfg.z_top_um)
+    hi = max(cfg.z_bottom_um, cfg.z_top_um)
+    mid = (lo + hi) / 2.0
+    step = max(abs(cfg.step_um), 0.5)
+    if hi - lo < 1e-6:
+        hw.move_z(mid)
+        return mid, False
+    hw.set_channel(cfg.channel, settings)
+    time.sleep(0.15)   # LED + exposure settle before the first metric
+
+    def canceled():
+        return cancel is not None and cancel.is_set()
+
+    # ---- coarse pass (bottom -> top)
+    zs, scores = [], []
+    z = lo
+    while z <= hi + 1e-6:
+        if canceled():
+            return None, False
+        s = _af_measure(hw, z, cfg.settle_s, pos_cb)
+        zs.append(z)
+        scores.append(s)
+        if status_cb:
+            status_cb(f'AF coarse: z={z:.1f} um  metric={s:.1f}')
+        z += step
+    smax, smin = max(scores), min(scores)
+    if smax <= 1e-9 or (smax - smin) / smax < 0.08:
+        if status_cb:
+            status_cb('AF: no usable contrast - parking at range middle')
+        hw.move_z(mid)
+        if pos_cb:
+            pos_cb(mid)
+        return mid, False
+    i = int(np.argmax(scores))
+    z_coarse = zs[i]
+
+    # ---- fine pass around the coarse peak
+    fstep = max(step / 5.0, 0.4)
+    flo = max(z_coarse - step, lo)
+    fhi = min(z_coarse + step, hi)
+    # Approach from below again for repeatable mechanics.
+    hw.move_z(max(flo - 5.0, 0.0))
+    fzs, fscores = [], []
+    z = flo
+    while z <= fhi + 1e-6:
+        if canceled():
+            return None, False
+        s = _af_measure(hw, z, cfg.settle_s, pos_cb)
+        fzs.append(z)
+        fscores.append(s)
+        if status_cb:
+            status_cb(f'AF fine: z={z:.1f} um  metric={s:.1f}')
+        z += fstep
+    if not fscores or max(fscores) <= 1e-9:
+        hw.move_z(mid)
+        return mid, False
+    j = int(np.argmax(fscores))
+    best = _parabolic_peak(fzs, fscores, j, lo, hi, fstep)
     hw.move_z(best)
-    return float(best)
+    if pos_cb:
+        pos_cb(best)
+    if status_cb:
+        status_cb(f'AF best focus: z={best:.2f} um')
+    return float(best), True
 
 
 class FocusSurface:

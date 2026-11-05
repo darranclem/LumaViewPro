@@ -1333,13 +1333,20 @@ class LumaViewProApp(App):
                                   z_top_um=self.af_config.z_top_um,
                                   step_um=self.af_config.step_um,
                                   channel=ch)
-            best = acq.autofocus_sweep(self.hw, cfg, self._cs(ch),
-                                       cancel=self.worker.cancel,
-                                       status_cb=self._set_status)
+            def _pos(z):
+                Clock.schedule_once(lambda dt: setattr(self, 'stage_z_um', z), 0)
+            best, ok = acq.autofocus_sweep(self.hw, cfg, self._cs(ch),
+                                           cancel=self.worker.cancel,
+                                           status_cb=self._set_status,
+                                           pos_cb=_pos)
             self.hw.leds_off()
             Clock.schedule_once(lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
             if best is None:
-                self._set_status('Autofocus failed / canceled')
+                self._set_status('Autofocus canceled')
+                return
+            if not ok:
+                self._set_status(f'AF: LOW CONTRAST - parked mid-range at '
+                                 f'z={best:.1f} um (surface NOT updated)')
                 return
             if self.surface.ref_z is None:
                 self.surface.set_reference_z(best)
@@ -1347,7 +1354,7 @@ class LumaViewProApp(App):
                 self.surface.update_cycle(best)
             self._persist()
             Clock.schedule_once(lambda dt: self._refresh_surface_info(), 0)
-            self._set_status(f'AF done: z={best:.1f} um '
+            self._set_status(f'AF done: best focus z={best:.2f} um '
                              f'(drift {self.surface.drift_um:+.1f} um)')
         self._bg(_job, busy_job=True)
 
@@ -1530,10 +1537,10 @@ class LumaViewProApp(App):
                         z_top_um=self.af_config.z_top_um,
                         step_um=self.af_config.step_um,
                         channel=self.surface.anchor_channel)
-                    best = acq.autofocus_sweep(
+                    best, af_ok = acq.autofocus_sweep(
                         self.hw, cfg, self._cs(self.surface.anchor_channel),
                         cancel=cancel, status_cb=self._set_status)
-                    if best is not None:
+                    if best is not None and af_ok:
                         if self.surface.ref_z is None:
                             self.surface.set_reference_z(best)
                         else:
