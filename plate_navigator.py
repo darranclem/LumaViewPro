@@ -13,15 +13,38 @@ from kivy.uix.popup import Popup
 
 class Collapsible(BoxLayout):
     """Accordion-style section: header button toggles the body open/shut.
-    Child widgets declared inside it in kv are redirected into the body."""
+    Child widgets declared inside it in kv are redirected into the body.
+    The body is physically removed from the tree when collapsed (hidden
+    widgets would otherwise still overlap and swallow touches)."""
 
     title = StringProperty('')
     open = BooleanProperty(False)
+    show_header = BooleanProperty(True)
+
+    def __init__(self, **kwargs):
+        self._body = None
+        super().__init__(**kwargs)
 
     def add_widget(self, widget, *args, **kwargs):
-        if self.ids and 'body' in self.ids:
-            return self.ids.body.add_widget(widget, *args, **kwargs)
+        body = self._body or (self.ids.get('body') if self.ids else None)
+        if body is not None and widget is not body:
+            return body.add_widget(widget, *args, **kwargs)
         return super().add_widget(widget, *args, **kwargs)
+
+    def on_kv_post(self, base_widget):
+        self._body = self.ids.get('body')
+        if self._body is not None and not self.open and self._body.parent is self:
+            super().remove_widget(self._body)
+        return super().on_kv_post(base_widget)
+
+    def on_open(self, instance, value):
+        body = self._body
+        if body is None:
+            return
+        if value and body.parent is None:
+            super().add_widget(body)
+        elif not value and body.parent is self:
+            super().remove_widget(body)
 
 
 class WellPlateFormat:

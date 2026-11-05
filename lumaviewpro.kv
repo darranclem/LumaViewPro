@@ -70,7 +70,8 @@
         bold: True
         font_size: '12sp'
         size_hint_y: None
-        height: '26dp'
+        height: '26dp' if root.show_header else '0dp'
+        opacity: 1 if root.show_header else 0
         halign: 'left'
         valign: 'middle'
         text_size: self.width - dp(10), self.height
@@ -83,9 +84,7 @@
         spacing: '4dp'
         padding: '4dp', '2dp'
         size_hint_y: None
-        height: self.minimum_height if root.open else 0
-        opacity: 1 if root.open else 0
-        disabled: not root.open
+        height: self.minimum_height
 
 LumaViewProMainLayout:
     orientation: 'vertical'
@@ -756,13 +755,9 @@ LumaViewProMainLayout:
                             size_hint_y: None
                             height: '0dp' if app.cal_active else '28dp'
                             on_press: app.cal_start()
-                        BoxLayout:
-                            orientation: 'vertical'
-                            spacing: '3dp'
-                            size_hint_y: None
-                            height: '126dp' if app.cal_active else '0dp'
-                            opacity: 1 if app.cal_active else 0
-                            disabled: not app.cal_active
+                        Collapsible:
+                            show_header: False
+                            open: app.cal_active
                             Label:
                                 text: app.cal_label
                                 color: (1.0, 0.45, 0.35, 1)
@@ -831,13 +826,9 @@ LumaViewProMainLayout:
                             size_hint_y: None
                             height: '0dp' if app.pos_review_active else '28dp'
                             on_press: app.pos_review_start()
-                        BoxLayout:
-                            orientation: 'vertical'
-                            spacing: '3dp'
-                            size_hint_y: None
-                            height: '118dp' if app.pos_review_active else '0dp'
-                            opacity: 1 if app.pos_review_active else 0
-                            disabled: not app.pos_review_active
+                        Collapsible:
+                            show_header: False
+                            open: app.pos_review_active
                             Label:
                                 text: app.pos_review_label
                                 color: (1.0, 0.85, 0.1, 1)

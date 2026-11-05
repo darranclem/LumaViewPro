@@ -1816,7 +1816,8 @@ class LumaViewProApp(App):
         data = {
             'left_w': ids.left_split.width if ids.get('left_split') else 250,
             'right_w': ids.right_split.width if ids.get('right_split') else 300,
-            'sections': {c.title: c.open for c in self._collapsibles()},
+            'sections': {c.title: c.open for c in self._collapsibles()
+                         if c.title},
         }
         try:
             import json
@@ -1848,7 +1849,7 @@ class LumaViewProApp(App):
             ids.right_split.width = float(data.get('right_w', 300))
         sections = data.get('sections', {})
         for c in self._collapsibles():
-            if c.title in sections:
+            if c.title and c.title in sections:
                 c.open = bool(sections[c.title])
         self._set_status(f'Layout "{name}" loaded')
 
