@@ -205,6 +205,8 @@ class LumaViewProApp(App):
         pass  # root comes from lumaviewpro.kv
 
     def on_start(self):
+        from kivy.core.window import Window
+        Window.maximize()
         self.root_widget = self.root
         viewport = self.root.ids.get('main_camera_viewport')
         if viewport:
@@ -1431,6 +1433,14 @@ class LumaViewProApp(App):
                                          self.af_config.step_um)
         self._persist()
 
+    @staticmethod
+    def af_range_text(bottom_txt: str, top_txt: str) -> str:
+        try:
+            rng = abs(float(top_txt) - float(bottom_txt))
+            return f'Range thickness: {rng:.1f} um'
+        except (TypeError, ValueError):
+            return 'Range thickness: ?'
+
     def af_set_anchor_here(self):
         """The autofocus point used to re-reference every cycle (uses the
         designated AF channel)."""
@@ -1470,8 +1480,8 @@ class LumaViewProApp(App):
                                            cancel=self.worker.cancel,
                                            status_cb=self._set_status,
                                            pos_cb=_pos)
-            self.hw.leds_off()
-            Clock.schedule_once(lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
+            # Keep the AF channel lit so the image stream stays visible.
+            Clock.schedule_once(lambda dt: setattr(self, 'live_channel', ch), 0)
             dt_s = time.time() - t0
             if best is None:
                 self._set_status('AF test canceled')
@@ -1505,8 +1515,8 @@ class LumaViewProApp(App):
                                            cancel=self.worker.cancel,
                                            status_cb=self._set_status,
                                            pos_cb=_pos)
-            self.hw.leds_off()
-            Clock.schedule_once(lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
+            # Keep the AF channel lit so the image stream stays visible.
+            Clock.schedule_once(lambda dt: setattr(self, 'live_channel', ch), 0)
             if best is None:
                 self._set_status('Autofocus canceled')
                 return

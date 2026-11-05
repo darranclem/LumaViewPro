@@ -386,6 +386,8 @@ LumaViewProMainLayout:
                     SmallInput:
                         id: af_step_input
                         text: '10'
+                PanelLabel:
+                    text: app.af_range_text(af_bottom_input.text, af_top_input.text)
                 FieldRow:
                     FlatButton:
                         text: 'Anchor = here'
