@@ -29,9 +29,10 @@ The custom app is a handful of top-level files; most work happens here:
 
 ## Tests
 
-- pytest is not installed in `.venv` yet. Install with `.venv\Scripts\python -m pip install pytest pytest-xdist` (xdist is required: `pyproject.toml` passes `--dist loadgroup`).
-- `tests/` holds over 800 upstream test files. Do not run the whole suite; run the specific files for the code you changed, e.g.
-  `.venv\Scripts\python -m pytest tests/test_af_global_vcurve_fit.py`
+- Needs `pytest` and `pytest-xdist` in `.venv` (`pyproject.toml` passes `--dist loadgroup`); `pyflakes` is used for linting. Install with `.venv\Scripts\python -m pip install pytest pytest-xdist pyflakes`.
+- `tests/` holds over 800 upstream test files. Do not run the whole suite; run the specific files for the code you changed.
+- Pass `--noconftest`: the upstream `tests/conftest.py` imports `modules.scope_session`, which currently fails (`modules/protocol.py` imports `FilePath`, which `modules/api_surface.py` no longer defines). Example:
+  `.venv\Scripts\python -m pytest --noconftest tests/test_af_global_vcurve_fit.py`
 - Tests for this fork's own code: `test_af_global_vcurve_fit.py`, `test_image_controls.py`, `test_labware_designer.py`, `test_shading_zstack.py`.
 
 ## Git
