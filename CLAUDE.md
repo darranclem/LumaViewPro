@@ -42,7 +42,7 @@ The custom app is a handful of top-level files; most work happens here:
 - `tests/` holds over 800 upstream test files. Do not run the whole suite; run the specific files for the code you changed.
 - Pass `--noconftest`: the upstream `tests/conftest.py` imports `modules.scope_session`, which currently fails (`modules/protocol.py` imports `FilePath`, which `modules/api_surface.py` no longer defines). Example:
   `.venv\Scripts\python -m pytest --noconftest tests/test_af_global_vcurve_fit.py`
-- Tests for this fork's own code: `test_af_global_vcurve_fit.py`, `test_image_controls.py`, `test_labware_designer.py`, `test_shading_zstack.py`.
+- Tests for this fork's own code: `test_af_global_vcurve_fit.py`, `test_image_controls.py`, `test_labware_designer.py`, `test_shading_zstack.py`, `test_plate_well_selection.py`.
 
 ## Git
 

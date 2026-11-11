@@ -113,6 +113,7 @@ Factory.register('ZoomPanCameraWidget', cls=plate_navigator.ZoomPanCameraWidget)
 Factory.register('WellPlateMapWidget', cls=plate_navigator.WellPlateMapWidget)
 Factory.register('InteractiveScaledPlateCanvas', cls=plate_navigator.InteractiveScaledPlateCanvas)
 Factory.register('Collapsible', cls=plate_navigator.Collapsible)
+Factory.register('DragAwareScrollView', cls=plate_navigator.DragAwareScrollView)
 
 LAYOUTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            'data', 'layouts')
@@ -277,6 +278,7 @@ class LumaViewProApp(App):
         if plate:
             plate.on_well_double_click = self.on_well_double_click
             plate.on_well_selected = self.on_well_selected
+            plate.on_wells_toggle = self.on_wells_toggled
             plate.set_labware(self.current_labware)
         self.labware_options = self.labware_lib.names()
         self.labware_name = self.current_labware.name
@@ -545,6 +547,7 @@ class LumaViewProApp(App):
                 getattr(self.plate_cal.labware, 'name', '') != lw.name:
             self.plate_cal = None
             self._refresh_cal_info()
+        self._refresh_positions()
         self._persist()
 
     def duplicate_labware(self):
@@ -1273,7 +1276,8 @@ class LumaViewProApp(App):
         if z_um is not None:
             self.hw.move_z(max(z_um, 0.0))
 
-    def _pos_well_name(self, x_um: float, y_um: float) -> str | None:
+    def _pos_well(self, x_um: float, y_um: float) -> tuple[int, int] | None:
+        """(row, col) of the well a stage position falls in, or None."""
         rel = self.stage_to_plate_rel(x_um, y_um)
         if rel is None:
             return None
@@ -1285,8 +1289,47 @@ class LumaViewProApp(App):
         if 0 <= row < lw.rows and 0 <= col < lw.cols:
             wx, wy = col * sx, row * sy
             if abs(rel[0] - wx) < sx * 0.5 and abs(rel[1] - wy) < sy * 0.5:
-                return lw.get_well_name(row, col)
+                return row, col
         return None
+
+    def _pos_well_name(self, x_um: float, y_um: float) -> str | None:
+        well = self._pos_well(x_um, y_um)
+        return None if well is None else             self.current_labware.get_well_name(*well)
+
+    def on_wells_toggled(self, wells: list[tuple[int, int]], turn_on: bool):
+        """Plate navigator click / rectangle: wells that are "on" are the
+        wells holding a protocol position. Turning a well on adds a position
+        at its center; turning it off removes every position inside it."""
+        if self.pos_review_active:
+            self._set_status('Finish the position review before editing wells')
+            return
+        lw = self.current_labware
+        drift = self.surface.drift_um
+
+        def _make(well):
+            row, col = well
+            x_um, y_um = self.plate_rel_to_stage(
+                col * (lw.spacing_x_mm or 0.0),
+                row * (lw.spacing_y_mm or 0.0))
+            z_um = self.surface.z_at(x_um, y_um)
+            if z_um is None:
+                z_um = self.stage_z_um
+            return {'name': lw.get_well_name(row, col),
+                    'x_um': x_um, 'y_um': y_um, 'z_um': z_um - drift}
+
+        self.protocol_positions, n = plate_navigator.toggle_well_positions(
+            self.protocol_positions, wells, turn_on,
+            lambda p: self._pos_well(p['x_um'], p['y_um']), _make)
+        if not n:
+            return
+        verb = 'added' if turn_on else 'removed'
+        self._persist()
+        self._refresh_positions()
+        note = ''
+        if turn_on and self.plate_cal is None and self.a1_stage_um is None:
+            note = ' - plate not calibrated, positions are approximate'
+        self._set_status(f'{n} position{"s" if n != 1 else ""} {verb} '
+                         f'({len(self.protocol_positions)} total){note}')
 
     def _refresh_positions(self, highlight: int | None = None):
         n = len(self.protocol_positions)
@@ -1306,6 +1349,10 @@ class LumaViewProApp(App):
                 if rel is not None:
                     marks.append((lw.a1_offset_x_mm + rel[0],
                                   lw.a1_offset_y_mm + rel[1]))
+            plate.active_wells = {
+                w for w in (self._pos_well(p['x_um'], p['y_um'])
+                            for p in self.protocol_positions)
+                if w is not None}
             plate.set_position_markers(marks, highlight)
 
     def position_add_here(self):

@@ -1,14 +1,65 @@
 from __future__ import annotations
 import math
 import numpy as np
-from kivy.app import App
 from kivy.graphics import Color, Line, Rectangle, Ellipse
 from kivy.graphics.texture import Texture
 from kivy.properties import BooleanProperty, StringProperty
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.image import Image
+from kivy.uix.scrollview import ScrollView
 from kivy.uix.widget import Widget
-from kivy.uix.popup import Popup
+
+
+class DragAwareScrollView(ScrollView):
+    """ScrollView that hands a press straight to a child marked
+    ``captures_drag`` instead of treating the drag as a scroll (a quick
+    drag on the plate map would otherwise scroll the panel)."""
+
+    def on_touch_down(self, touch):
+        button = getattr(touch, 'button', None) or ''
+        if self.collide_point(*touch.pos) and not button.startswith('scroll'):
+            touch.push()
+            touch.apply_transform_2d(self.to_local)
+            try:
+                for w in self.walk(restrict=True):
+                    if (getattr(w, 'captures_drag', False)
+                            and w.collide_point(*touch.pos)):
+                        return w.on_touch_down(touch)
+            finally:
+                touch.pop()
+        return super().on_touch_down(touch)
+
+
+def serpentine(wells) -> list[tuple[int, int]]:
+    """Order wells row by row, alternating direction, so the stage
+    snakes through a group instead of flying back at each row end."""
+    rows: dict[int, list[int]] = {}
+    for r, c in set(wells):
+        rows.setdefault(r, []).append(c)
+    out = []
+    for i, r in enumerate(sorted(rows)):
+        cols = sorted(rows[r], reverse=bool(i % 2))
+        out.extend((r, c) for c in cols)
+    return out
+
+
+def toggle_well_positions(positions: list, wells, turn_on: bool,
+                          well_of, make) -> tuple[list, int]:
+    """Turn wells on or off in a list of positions.
+
+    ``well_of(position)`` gives the (row, col) a position lies in (or
+    None); ``make((row, col))`` builds a position at a well center.
+    Turning on appends one position per well that has none, in serpentine
+    order; turning off drops every position inside the given wells.
+    Positions outside any well are never touched. Returns the new list and
+    how many positions were added or removed."""
+    if turn_on:
+        have = {well_of(p) for p in positions}
+        new = [make(w) for w in serpentine(wells) if w not in have]
+        return positions + new, len(new)
+    gone = set(wells)
+    kept = [p for p in positions if well_of(p) not in gone]
+    return kept, len(positions) - len(kept)
 
 
 class Collapsible(BoxLayout):
@@ -264,11 +315,21 @@ class WellPlateMapWidget(Widget):
 
     Draws the current labware (round or square wells); shows the stage
     position as a marker and, during plate calibration, the guided target
-    position. Single click selects a well; double-click fires
+    position. Double-click fires
     ``on_well_double_click(row, col, plate_x_mm, plate_y_mm)`` where the
     plate coordinates are the well center relative to the A1 center
     (+x toward the last column, +y toward the last row).
+
+    Well on/off selection (only when ``on_wells_toggle`` is set): the
+    widget shows ``active_wells`` filled and asks the owner to change them
+    through ``on_wells_toggle(wells, turn_on)``; it never edits the set
+    itself. A click toggles one well. A drag draws a rectangle and applies
+    one action to every well whose center is inside it: the action a click
+    on the starting well would have had (start on an on well = turn off,
+    otherwise turn on); Shift forces on, Ctrl forces off.
     """
+
+    DRAG_THRESHOLD_PX = 6.0
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -281,7 +342,19 @@ class WellPlateMapWidget(Widget):
         self.highlight_marker: int | None = None
         self.on_well_double_click = None  # callable(row, col, x_mm, y_mm)
         self.on_well_selected = None      # callable(row, col, x_mm, y_mm)
+        self.active_wells: set[tuple[int, int]] = set()
+        self.on_wells_toggle = None       # callable(wells, turn_on)
+        self._drag: dict | None = None
+        self._last_toggle: tuple[tuple[int, int], bool] | None = None
         self.bind(pos=self.redraw, size=self.redraw)
+
+    @property
+    def captures_drag(self) -> bool:
+        return self.on_wells_toggle is not None
+
+    def set_active_wells(self, wells):
+        self.active_wells = set(wells)
+        self.redraw()
 
     # ----------------------------------------------------- labware access
 
@@ -312,6 +385,8 @@ class WellPlateMapWidget(Widget):
     def set_labware(self, labware):
         self.labware = labware
         self.selected_well = None
+        self.active_wells = set()
+        self._last_toggle = None
         self.redraw()
 
     # ------------------------------------------------------------ mapping
@@ -409,6 +484,11 @@ class WellPlateMapWidget(Widget):
                 for c in range(lw.cols):
                     mmx, mmy = self._well_center_mm(r, c)
                     sx, sy = self._mm_to_screen(mmx, mmy)
+                    if (r, c) in self.active_wells:
+                        Color(0.1, 0.75, 0.45, 0.55)
+                        fill = Rectangle if shape == 'square' else Ellipse
+                        fill(pos=(sx - well_rx, sy - well_ry),
+                             size=(2 * well_rx, 2 * well_ry))
                     if self.selected_well == (r, c):
                         Color(0.1, 0.8, 1.0, 1)
                     else:
@@ -449,25 +529,125 @@ class WellPlateMapWidget(Widget):
 
     # --------------------------------------------------------------- input
 
+    def _modifiers(self) -> set[str]:
+        try:
+            from kivy.core.window import Window
+            return set(Window.modifiers)
+        except Exception:
+            return set()
+
+    def _rel_mm(self, well: tuple[int, int]) -> tuple[float, float]:
+        """Well center relative to the A1 center."""
+        sx, sy = self._spacing()
+        return well[1] * sx, well[0] * sy
+
+    def wells_in_screen_rect(self, x0: float, y0: float, x1: float,
+                             y1: float) -> list[tuple[int, int]]:
+        """Wells whose center lies inside the screen rectangle."""
+        ax, ay = self._screen_to_mm(x0, y0)
+        bx, by = self._screen_to_mm(x1, y1)
+        lo_x, hi_x = min(ax, bx), max(ax, bx)
+        lo_y, hi_y = min(ay, by), max(ay, by)
+        lw = self._lw()
+        out = []
+        for r in range(lw.rows):
+            for c in range(lw.cols):
+                mx, my = self._well_center_mm(r, c)
+                if lo_x <= mx <= hi_x and lo_y <= my <= hi_y:
+                    out.append((r, c))
+        return out
+
+    def _draw_lasso(self):
+        self.canvas.after.clear()
+        d = self._drag
+        if not d or not d['moved']:
+            return
+        (x0, y0), (x1, y1) = d['start'], d['cur']
+        rgb = (1.0, 0.3, 0.25) if d['remove'] else (0.1, 0.8, 1.0)
+        with self.canvas.after:
+            Color(*rgb, 0.18)
+            Rectangle(pos=(min(x0, x1), min(y0, y1)),
+                      size=(abs(x1 - x0), abs(y1 - y0)))
+            Color(*rgb, 1)
+            Line(rectangle=(min(x0, x1), min(y0, y1),
+                            abs(x1 - x0), abs(y1 - y0)), width=1.2)
+
+    def _select(self, well: tuple[int, int]):
+        self.selected_well = well
+        self.redraw()
+        if self.on_well_selected:
+            self.on_well_selected(well[0], well[1], *self._rel_mm(well))
+
     def on_touch_down(self, touch):
         if not self.collide_point(*touch.pos):
             return super().on_touch_down(touch)
-        mm_x, mm_y = self._screen_to_mm(touch.x, touch.y)
-        well = self._nearest_well(mm_x, mm_y)
-        if well is None:
-            return True
-        row, col = well
-        sx, sy = self._spacing()
-        rel_x_mm = col * sx   # relative to A1 center
-        rel_y_mm = row * sy
-        self.selected_well = well
-        self.redraw()
+        if (getattr(touch, 'button', None) or '').startswith('scroll'):
+            return False
+        well = self._nearest_well(*self._screen_to_mm(touch.x, touch.y))
+
         if touch.is_double_tap:
+            if well is None:
+                return True
+            # The first click of the double-click toggled this well: put
+            # it back, a double-click only moves the stage.
+            if self._last_toggle and self._last_toggle[0] == well:
+                self.on_wells_toggle([well], not self._last_toggle[1])
+            self._last_toggle = None
+            self.selected_well = well
+            self.redraw()
             if self.on_well_double_click:
-                self.on_well_double_click(row, col, rel_x_mm, rel_y_mm)
+                self.on_well_double_click(well[0], well[1],
+                                          *self._rel_mm(well))
+            return True
+
+        if self.on_wells_toggle is None:
+            if well is not None:
+                self._select(well)
+            return True
+
+        mods = self._modifiers()
+        if 'shift' in mods:
+            remove = False
+        elif 'ctrl' in mods:
+            remove = True
         else:
-            if self.on_well_selected:
-                self.on_well_selected(row, col, rel_x_mm, rel_y_mm)
+            remove = well is not None and well in self.active_wells
+        self._drag = {'start': touch.pos, 'cur': touch.pos, 'well': well,
+                      'remove': remove, 'moved': False}
+        touch.grab(self)
+        return True
+
+    def on_touch_move(self, touch):
+        if touch.grab_current is not self or self._drag is None:
+            return super().on_touch_move(touch)
+        d = self._drag
+        d['cur'] = touch.pos
+        if not d['moved'] and math.hypot(
+                touch.x - d['start'][0],
+                touch.y - d['start'][1]) > self.DRAG_THRESHOLD_PX:
+            d['moved'] = True
+        self._draw_lasso()
+        return True
+
+    def on_touch_up(self, touch):
+        if touch.grab_current is not self:
+            return super().on_touch_up(touch)
+        touch.ungrab(self)
+        d, self._drag = self._drag, None
+        self.canvas.after.clear()
+        if d is None:
+            return True
+        if d['moved']:
+            wells = self.wells_in_screen_rect(*d['start'], *d['cur'])
+            self._last_toggle = None
+            if wells:
+                self.on_wells_toggle(wells, not d['remove'])
+        elif d['well'] is not None:
+            well = d['well']
+            self._select(well)
+            turn_on = not d['remove']
+            self._last_toggle = (well, turn_on)
+            self.on_wells_toggle([well], turn_on)
         return True
 
 

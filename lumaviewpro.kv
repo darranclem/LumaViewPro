@@ -789,7 +789,7 @@ LumaViewProMainLayout:
             min_size: '220dp'
             max_size: '700dp'
             strip_size: '6dp'
-            ScrollView:
+            DragAwareScrollView:
                 do_scroll_x: False
                 bar_width: '4dp'
                 BoxLayout:
@@ -846,7 +846,9 @@ LumaViewProMainLayout:
                                 text: 'Set A1 = here'
                                 on_press: app.set_a1_here()
                         PanelLabel:
-                            text: 'Double-click a well to move the stage there'
+                            text: 'Click a well to turn it on/off as a protocol position. Drag a box to switch a group (start on an on well to turn the group off; Shift = on, Ctrl = off). Double-click moves the stage there.'
+                            height: '58dp'
+                            valign: 'top'
 
                     Collapsible:
                         title: 'PLATE CALIBRATION'
