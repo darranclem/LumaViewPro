@@ -76,14 +76,21 @@ class Collapsible(BoxLayout):
         self._body = None
         super().__init__(**kwargs)
 
+    def _find_body(self):
+        # ids hold weak references: keep a strong one, or the body is
+        # garbage-collected while it is out of the tree (collapsed) and
+        # the section can never be opened again.
+        body = self.ids.get('body') if self.ids else None
+        return getattr(body, '__self__', body)
+
     def add_widget(self, widget, *args, **kwargs):
-        body = self._body or (self.ids.get('body') if self.ids else None)
+        body = self._body or self._find_body()
         if body is not None and widget is not body:
             return body.add_widget(widget, *args, **kwargs)
         return super().add_widget(widget, *args, **kwargs)
 
     def on_kv_post(self, base_widget):
-        self._body = self.ids.get('body')
+        self._body = self._find_body()
         if self._body is not None and not self.open and self._body.parent is self:
             super().remove_widget(self._body)
         return super().on_kv_post(base_widget)
@@ -500,12 +507,18 @@ class WellPlateMapWidget(Widget):
                         Line(ellipse=(sx - well_rx, sy - well_ry,
                                       2 * well_rx, 2 * well_ry), width=1.0)
             # Protocol position markers
+            # Many positions (tiles): small dots, so the pattern inside
+            # each well stays readable instead of merging into a blob.
+            dense = len(self.position_markers) > 150
             for i, pm in enumerate(self.position_markers):
                 sx, sy = self._mm_to_screen(*pm)
                 if i == self.highlight_marker:
                     Color(1.0, 0.85, 0.1, 1)
                     Line(points=[sx - 6, sy, sx, sy + 6, sx + 6, sy, sx, sy - 6,
                                  sx - 6, sy], width=1.6)
+                elif dense:
+                    Color(0.95, 0.75, 0.1, 0.9)
+                    Rectangle(pos=(sx - 1, sy - 1), size=(2, 2))
                 else:
                     Color(0.95, 0.75, 0.1, 0.9)
                     Line(points=[sx - 4, sy, sx, sy + 4, sx + 4, sy, sx, sy - 4,

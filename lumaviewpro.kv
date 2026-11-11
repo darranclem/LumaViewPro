@@ -31,6 +31,15 @@
     valign: 'middle'
     text_size: self.size
 
+<WrapLabel@Label>:
+    color: TXT_DIM
+    font_size: '11sp'
+    size_hint_y: None
+    halign: 'left'
+    valign: 'top'
+    text_size: self.width, None
+    height: self.texture_size[1] + dp(4)
+
 <SmallInput@TextInput>:
     multiline: False
     write_tab: False
@@ -631,7 +640,7 @@ LumaViewProMainLayout:
                                 id: protocol_interval_input
                                 text: '5'
                         FlatButton:
-                            text: 'AF each cycle: ' + ('ON' if app.af_each_cycle_on else 'off')
+                            text: ('AF every cycle' if app.af_every_n <= 1 else 'AF every %d cycles' % app.af_every_n) + (': ON' if app.af_each_cycle_on else ': off')
                             background_color: ACCENT if app.af_each_cycle_on else PANEL2
                             on_press: app.af_each_cycle_on = not app.af_each_cycle_on
                         AccentButton:
@@ -804,6 +813,380 @@ LumaViewProMainLayout:
                         Rectangle:
                             pos: self.pos
                             size: self.size
+
+                    Collapsible:
+                        title: 'EXPERIMENT SETUP WIZARD'
+                        open: True
+                        AccentButton:
+                            text: 'Set up an experiment...'
+                            disabled: app.wiz_active
+                            opacity: 0 if app.wiz_active else 1
+                            height: '0dp' if app.wiz_active else '28dp'
+                            on_press: app.wiz_start()
+                        Collapsible:
+                            show_header: False
+                            open: app.wiz_active
+                            Label:
+                                text: app.wiz_title
+                                color: (0.3, 0.85, 1.0, 1)
+                                bold: True
+                                font_size: '13sp'
+                                size_hint_y: None
+                                height: '22dp'
+                                halign: 'left'
+                                valign: 'middle'
+                                text_size: self.size
+                            WrapLabel:
+                                text: app.wiz_help
+                            WrapLabel:
+                                text: app.wiz_info
+                                color: (1.0, 0.85, 0.1, 1)
+
+                            # ---- 1 plate
+                            Collapsible:
+                                show_header: False
+                                open: app.wiz_key == 'plate'
+                                FlatButton:
+                                    text: 'No plate (free positions): ' + ('ON' if app.no_plate_on else 'off')
+                                    background_color: ACCENT if app.no_plate_on else PANEL2
+                                    on_press: app.wiz_toggle_no_plate()
+
+                            # ---- 2 calibrate
+                            Collapsible:
+                                show_header: False
+                                open: app.wiz_key == 'calibrate'
+                                AccentButton:
+                                    text: 'Start calibration'
+                                    disabled: app.cal_active
+                                    on_press: app.cal_start()
+                                Label:
+                                    text: app.cal_label
+                                    color: (1.0, 0.45, 0.35, 1)
+                                    bold: True
+                                    font_size: '12sp'
+                                    size_hint_y: None
+                                    height: '20dp'
+                                AccentButton:
+                                    text: 'MARK (rim is at the image center)'
+                                    disabled: not app.cal_active
+                                    on_press: app.cal_mark()
+                                FieldRow:
+                                    height: '28dp'
+                                    FlatButton:
+                                        text: '< Previous'
+                                        disabled: not app.cal_active
+                                        on_press: app.cal_prev()
+                                    FlatButton:
+                                        text: 'Next point >'
+                                        disabled: not app.cal_active
+                                        on_press: app.cal_next()
+                                    StopButton:
+                                        text: 'Cancel'
+                                        disabled: not app.cal_active
+                                        on_press: app.cal_cancel()
+                                FlatButton:
+                                    text: 'Save measured plate definition'
+                                    on_press: app.cal_save_measured_labware()
+
+                            # ---- 3 autofocus
+                            Collapsible:
+                                show_header: False
+                                open: app.wiz_key == 'autofocus'
+                                FieldRow:
+                                    height: '28dp'
+                                    PanelLabel:
+                                        text: 'Autofocus channel'
+                                        size_hint_x: 0.6
+                                    DarkSpinner:
+                                        text: app.af_channel
+                                        values: ['BF', 'PC', 'DF', 'BLUE', 'GREEN', 'RED']
+                                        on_text: app.wiz_set_af_channel(self.text)
+                                PanelLabel:
+                                    text: 'Coarse search: from / to / step (um)'
+                                FieldRow:
+                                    SmallInput:
+                                        id: wiz_coarse_bottom
+                                        text: '0'
+                                    SmallInput:
+                                        id: wiz_coarse_top
+                                        text: '14000'
+                                    SmallInput:
+                                        id: wiz_coarse_step
+                                        text: '100'
+                                FlatButton:
+                                    text: 'Find focus (coarse, whole range)'
+                                    disabled: app.worker_busy
+                                    on_press: app.wiz_find_focus()
+                                PanelLabel:
+                                    text: 'Fine autofocus: range +/- (um) / step (um)'
+                                FieldRow:
+                                    SmallInput:
+                                        id: wiz_fine_range
+                                        text: '100'
+                                    SmallInput:
+                                        id: wiz_fine_step
+                                        text: '5'
+                                    FlatButton:
+                                        text: 'Apply at this Z'
+                                        height: '26dp'
+                                        on_press: app.wiz_apply_fine()
+                                FieldRow:
+                                    height: '28dp'
+                                    AccentButton:
+                                        text: 'Set AF point here'
+                                        on_press: app.af_set_anchor_here()
+                                    AccentButton:
+                                        text: 'Run autofocus'
+                                        disabled: app.worker_busy
+                                        on_press: app.run_af_cycle()
+
+                            # ---- 4 wells
+                            Collapsible:
+                                show_header: False
+                                open: app.wiz_key == 'wells'
+                                FieldRow:
+                                    height: '28dp'
+                                    FlatButton:
+                                        text: 'Add position here' if app.no_plate_on else 'Select all wells'
+                                        on_press: app.wiz_add_position() if app.no_plate_on else app.wiz_select_all_wells()
+                                    FlatButton:
+                                        text: 'Clear'
+                                        on_press: app.wiz_clear_wells()
+
+                            # ---- 5 colours
+                            Collapsible:
+                                show_header: False
+                                open: app.wiz_key == 'channels'
+                                GridLayout:
+                                    cols: 3
+                                    spacing: '3dp'
+                                    size_hint_y: None
+                                    height: '59dp'
+                                    FlatButton:
+                                        text: 'BF'
+                                        background_color: ACCENT if app.wiz_channel_on('BF', app.wiz_rev) else PANEL2
+                                        on_press: app.wiz_toggle_channel('BF')
+                                    FlatButton:
+                                        text: 'PC'
+                                        background_color: ACCENT if app.wiz_channel_on('PC', app.wiz_rev) else PANEL2
+                                        on_press: app.wiz_toggle_channel('PC')
+                                    FlatButton:
+                                        text: 'DF'
+                                        background_color: ACCENT if app.wiz_channel_on('DF', app.wiz_rev) else PANEL2
+                                        on_press: app.wiz_toggle_channel('DF')
+                                    FlatButton:
+                                        text: 'BLUE'
+                                        background_color: ACCENT if app.wiz_channel_on('BLUE', app.wiz_rev) else PANEL2
+                                        on_press: app.wiz_toggle_channel('BLUE')
+                                    FlatButton:
+                                        text: 'GREEN'
+                                        background_color: ACCENT if app.wiz_channel_on('GREEN', app.wiz_rev) else PANEL2
+                                        on_press: app.wiz_toggle_channel('GREEN')
+                                    FlatButton:
+                                        text: 'RED'
+                                        background_color: ACCENT if app.wiz_channel_on('RED', app.wiz_rev) else PANEL2
+                                        on_press: app.wiz_toggle_channel('RED')
+                                PanelLabel:
+                                    text: 'Chromatic focus offset (selected channel: ' + app.selected_channel + ')'
+                                FieldRow:
+                                    height: '28dp'
+                                    FlatButton:
+                                        text: 'Reference = here (' + app.af_channel + ')'
+                                        on_press: app.wiz_offset_reference_here()
+                                    FlatButton:
+                                        text: 'Set offset for ' + app.selected_channel
+                                        on_press: app.wiz_set_offset_here()
+
+                            # ---- 6 sampling
+                            Collapsible:
+                                show_header: False
+                                open: app.wiz_key == 'sampling'
+                                DarkSpinner:
+                                    text: app.sampling_text(app.wiz_sampling)
+                                    values: app.sampling_labels
+                                    on_text: app.wiz_set_sampling(self.text)
+                                FieldRow:
+                                    disabled: app.wiz_sampling != 'tiles'
+                                    opacity: 1 if app.wiz_sampling == 'tiles' else 0.35
+                                    PanelLabel:
+                                        text: 'Tile rows'
+                                    SmallInput:
+                                        id: wiz_tile_rows
+                                        text: '3'
+                                    PanelLabel:
+                                        text: 'columns'
+                                    SmallInput:
+                                        id: wiz_tile_cols
+                                        text: '3'
+                                FieldRow:
+                                    disabled: app.wiz_sampling not in ('tiles', 'coverage')
+                                    opacity: 1 if app.wiz_sampling in ('tiles', 'coverage') else 0.35
+                                    PanelLabel:
+                                        text: 'Tile overlap (%)'
+                                        size_hint_x: 1.5
+                                    SmallInput:
+                                        id: wiz_overlap
+                                        text: '10'
+                                FieldRow:
+                                    disabled: app.wiz_sampling not in ('random', 'random_same')
+                                    opacity: 1 if app.wiz_sampling in ('random', 'random_same') else 0.35
+                                    PanelLabel:
+                                        text: 'Random points per well'
+                                        size_hint_x: 1.5
+                                    SmallInput:
+                                        id: wiz_random_n
+                                        text: '3'
+                                FieldRow:
+                                    disabled: app.wiz_sampling != 'coverage'
+                                    opacity: 1 if app.wiz_sampling == 'coverage' else 0.35
+                                    PanelLabel:
+                                        text: 'Well coverage (%)'
+                                        size_hint_x: 1.5
+                                    SmallInput:
+                                        id: wiz_coverage
+                                        text: '100'
+                                AccentButton:
+                                    text: 'Generate positions'
+                                    on_press: app.wiz_generate()
+
+                            # ---- 7 focus map
+                            Collapsible:
+                                show_header: False
+                                open: app.wiz_key == 'focusmap'
+                                DarkSpinner:
+                                    text: app.focus_text(app.wiz_focus_mode)
+                                    values: app.focus_labels
+                                    disabled: app.fmap_active
+                                    on_text: app.wiz_set_focus_mode(self.text)
+                                FieldRow:
+                                    disabled: app.wiz_focus_mode != 'multi'
+                                    opacity: 1 if app.wiz_focus_mode == 'multi' else 0.35
+                                    PanelLabel:
+                                        text: 'Focus points per well'
+                                        size_hint_x: 1.5
+                                    SmallInput:
+                                        id: wiz_fmap_n
+                                        text: '3'
+                                AccentButton:
+                                    text: 'Start (autofocus, then first point)'
+                                    disabled: app.fmap_active or app.worker_busy
+                                    on_press: app.wiz_fmap_start()
+                                Label:
+                                    text: app.fmap_label
+                                    color: (1.0, 0.45, 0.35, 1)
+                                    bold: True
+                                    font_size: '12sp'
+                                    size_hint_y: None
+                                    height: '20dp'
+                                FieldRow:
+                                    height: '28dp'
+                                    FlatButton:
+                                        text: 'AF here'
+                                        disabled: not app.fmap_active or app.worker_busy
+                                        on_press: app.wiz_af_here()
+                                    AccentButton:
+                                        text: 'Set focus = here, next'
+                                        size_hint_x: 1.6
+                                        disabled: not app.fmap_active
+                                        on_press: app.wiz_fmap_set()
+                                FieldRow:
+                                    height: '28dp'
+                                    FlatButton:
+                                        text: '< Prev'
+                                        disabled: not app.fmap_active
+                                        on_press: app.wiz_fmap_step(-1)
+                                    FlatButton:
+                                        text: 'Skip >'
+                                        disabled: not app.fmap_active
+                                        on_press: app.wiz_fmap_step(1)
+                                    FlatButton:
+                                        text: 'Finish'
+                                        disabled: not app.fmap_active
+                                        on_press: app.wiz_fmap_finish()
+                                    StopButton:
+                                        text: 'Cancel'
+                                        disabled: not app.fmap_active
+                                        on_press: app.wiz_fmap_cancel()
+
+                            # ---- 8 z-stacks and timelapse
+                            Collapsible:
+                                show_header: False
+                                open: app.wiz_key == 'acquire'
+                                FlatButton:
+                                    text: 'Z-stack at every position: ' + ('ON' if app.wiz_zstack_on else 'off')
+                                    background_color: ACCENT if app.wiz_zstack_on else PANEL2
+                                    on_press: app.wiz_zstack_on = not app.wiz_zstack_on
+                                FieldRow:
+                                    disabled: not app.wiz_zstack_on
+                                    opacity: 1 if app.wiz_zstack_on else 0.35
+                                    PanelLabel:
+                                        text: 'Range (um)'
+                                    SmallInput:
+                                        id: wiz_z_range
+                                        text: '50'
+                                    PanelLabel:
+                                        text: 'Step (um)'
+                                    SmallInput:
+                                        id: wiz_z_step
+                                        text: '5'
+                                FieldRow:
+                                    PanelLabel:
+                                        text: 'Timepoints'
+                                    SmallInput:
+                                        id: wiz_cycles
+                                        text: '1'
+                                    PanelLabel:
+                                        text: 'Every (min)'
+                                    SmallInput:
+                                        id: wiz_interval
+                                        text: '5'
+                                FlatButton:
+                                    text: 'Autofocus during the timelapse: ' + ('ON' if app.af_each_cycle_on else 'off')
+                                    background_color: ACCENT if app.af_each_cycle_on else PANEL2
+                                    on_press: app.af_each_cycle_on = not app.af_each_cycle_on
+                                FieldRow:
+                                    disabled: not app.af_each_cycle_on
+                                    opacity: 1 if app.af_each_cycle_on else 0.35
+                                    PanelLabel:
+                                        text: 'Autofocus every N timepoints'
+                                        size_hint_x: 2.2
+                                    SmallInput:
+                                        id: wiz_af_every
+                                        text: '1'
+
+                            # ---- 9 save
+                            Collapsible:
+                                show_header: False
+                                open: app.wiz_key == 'save'
+                                FieldRow:
+                                    PanelLabel:
+                                        text: 'Protocol name'
+                                    SmallInput:
+                                        id: wiz_name
+                                        text: app.protocol_name
+                                FieldRow:
+                                    height: '28dp'
+                                    AccentButton:
+                                        text: 'Save protocol'
+                                        on_press: app.wiz_save()
+                                    AccentButton:
+                                        text: 'Save and run'
+                                        disabled: app.worker_busy
+                                        on_press: app.wiz_run()
+
+                            FieldRow:
+                                height: '28dp'
+                                FlatButton:
+                                    text: '< Back'
+                                    disabled: app.wiz_step == 0
+                                    on_press: app.wiz_prev()
+                                AccentButton:
+                                    text: 'Next >'
+                                    disabled: app.wiz_key == 'save'
+                                    on_press: app.wiz_next()
+                                FlatButton:
+                                    text: 'Close'
+                                    on_press: app.wiz_close()
 
                     Collapsible:
                         title: 'PLATE NAVIGATOR'

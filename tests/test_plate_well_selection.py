@@ -208,3 +208,30 @@ def test_the_original_list_is_not_modified(turn_on):
     pos = [_make((0, 0))]
     pn.toggle_well_positions(pos, [(0, 0), (0, 1)], turn_on, _well_of, _make)
     assert pos == [_make((0, 0))]
+
+
+# ------------------------------------------------------- collapsible
+
+def test_a_collapsed_section_can_still_be_opened_after_garbage_collection():
+    import gc
+    from kivy.lang import Builder
+    from kivy.uix.label import Label
+
+    class _Section(pn.Collapsible):
+        pass
+
+    Builder.load_string('''
+<_Section>:
+    BoxLayout:
+        id: body
+''')
+    sec = _Section()                 # starts collapsed: body out of the tree
+    sec.add_widget(Label(text='inside'))
+    gc.collect()
+    sec.open = True
+    assert sec._body.parent is sec
+    assert [w.text for w in sec._body.children] == ['inside']
+    sec.open = False
+    gc.collect()
+    sec.open = True
+    assert sec._body.parent is sec

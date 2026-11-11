@@ -101,6 +101,8 @@ from kivy.factory import Factory
 
 import plate_navigator
 import acquisition as acq
+import experiment
+from experiment_wizard import ExperimentWizardMixin
 
 # LED current ceiling for the sliders/fields (mA).
 LED_MAX_MA = 600
@@ -147,7 +149,7 @@ class LumaViewProMainLayout(BoxLayout):
     pass
 
 
-class LumaViewProApp(App):
+class LumaViewProApp(ExperimentWizardMixin, App):
     title = 'LumaViewPro Navigator'
 
     status_msg = StringProperty('Starting...')
@@ -1354,6 +1356,8 @@ class LumaViewProApp(App):
                             for p in self.protocol_positions)
                 if w is not None}
             plate.set_position_markers(marks, highlight)
+        if self.wiz_active:
+            self._wiz_refresh_info()
 
     def position_add_here(self):
         """Add the current stage position (and focus) as a protocol
@@ -1489,6 +1493,8 @@ class LumaViewProApp(App):
             'af_method': self.af_method,
             'use_surface': self.use_surface_on,
             'use_z_offsets': self.use_z_offsets_on,
+            'no_plate': self.no_plate_on,
+            'af_every_n': int(self.af_every_n),
             'travel_clearance_um': self.travel_clearance_um,
             'output_dir': self.output_dir,
         }
@@ -1559,6 +1565,8 @@ class LumaViewProApp(App):
             self.surface.anchor_channel = self.af_channel
             self.use_surface_on = bool(d.get('use_surface', True))
             self.use_z_offsets_on = bool(d.get('use_z_offsets', True))
+            self.no_plate_on = bool(d.get('no_plate', False))
+            self.af_every_n = max(int(d.get('af_every_n', 1)), 1)
             self.travel_clearance_um = float(d.get('travel_clearance_um', 500.0))
             if d.get('output_dir'):
                 self.output_dir = d['output_dir']
@@ -2462,13 +2470,32 @@ class LumaViewProApp(App):
             return
         do_af = (self.af_each_cycle_on and
                  self.surface.anchor_xy is not None)
+        af_every = max(int(self.af_every_n), 1)
         self.af_apply_fields()
         positions = [dict(p) for p in self.protocol_positions]
         if not positions:
             positions = [{'name': 'POS', 'x_um': self.stage_x_um,
                           'y_um': self.stage_y_um,
                           'z_um': self.stage_z_um - self.surface.drift_um}]
+        # Every position gets a well (unless there is no plate definition
+        # or the labware is a single dish/slide) and a tile/position
+        # designation; both go into the file names.
+        positions = experiment.assign_designations(
+            positions,
+            (lambda p: self._pos_well_name(p['x_um'], p['y_um']))
+            if self._use_wells() else None)
         base_dir = acq.timestamp_dir(self._out_base(), 'protocol')
+        try:
+            import json
+            manifest = self._protocol_payload(self.protocol_name)
+            manifest['positions'] = positions
+            manifest['file_name_order'] = ['well', 'tile_or_position',
+                                           'z_plane', 'colour', 'timepoint']
+            with open(os.path.join(base_dir, 'experiment.json'), 'w',
+                      encoding='utf-8') as f:
+                json.dump(manifest, f, indent=2)
+        except Exception:
+            pass
         cancel = self.worker.cancel
 
         def _job():
@@ -2476,11 +2503,12 @@ class LumaViewProApp(App):
                 t0 = time.time()
                 if cancel.is_set():
                     break
-                cyc_dir = os.path.join(base_dir, f'cycle_{cyc:04d}')
-                os.makedirs(cyc_dir, exist_ok=True)
-                self._set_status(f'Protocol cycle {cyc + 1}/{cycles}...')
+                self._set_status(f'Protocol timepoint {cyc + 1}/{cycles}...')
 
-                if do_af:
+                # Autofocus at the one AF point (every af_every-th
+                # timepoint). Its result moves the whole focus surface up
+                # or down by the measured drift.
+                if do_af and cyc % af_every == 0:
                     ax, ay = self.surface.anchor_xy
                     self._safe_goto(ax, ay, None)
                     cfg = AutofocusConfig(
@@ -2514,32 +2542,38 @@ class LumaViewProApp(App):
                         base_z = self.surface.z_at(p['x_um'], p['y_um'])
                     if base_z is None:
                         base_z = p['z_um'] + drift
-                    self._set_status(f'Cycle {cyc + 1}: {p["name"]}...')
+                    self._set_status(f'Timepoint {cyc + 1}/{cycles}: '
+                                     f'{p["name"]}...')
                     self._safe_goto(p['x_um'], p['y_um'], base_z)
+                    out_dir = os.path.join(base_dir, p['well'] or 'positions')
+                    os.makedirs(out_dir, exist_ok=True)
+                    at_z = base_z
                     for ch in channels:
                         if cancel.is_set():
                             break
                         cs = self.channel_settings[ch]
-                        z_off = cs.z_offset_um if self.use_z_offsets_on else 0.0
-                        if abs(z_off) > 0.01:
-                            self.hw.move_z(base_z + z_off)
+                        # One plane (focus + the channel's chromatic
+                        # offset), or the channel's z-stack around it.
+                        planes = acq.zstack_planes(base_z, cs,
+                                                   self.use_z_offsets_on)
                         self.hw.set_channel(ch, cs)
-                        frame = self.hw.grab_settled(settle_s=0.2)
-                        if frame is not None:
+                        for zi, z in enumerate(planes, 1):
+                            if cancel.is_set():
+                                break
+                            z = max(float(z), 0.0)
+                            if abs(z - at_z) > 0.01:
+                                self.hw.move_z(z)
+                                at_z = z
+                            frame = self.hw.grab_settled(
+                                settle_s=0.2 if zi == 1 else 0.1)
+                            if frame is None:
+                                continue
                             if self.shading_on:
-                                frame = self.shading.apply(
-                                    frame, ch, base_z + z_off)
-                            acq.save_image(
-                                os.path.join(cyc_dir,
-                                             f'{p["name"]}_{ch}.tiff'), frame)
-                        if abs(z_off) > 0.01:
-                            self.hw.move_z(base_z)
-                        if cs.zstack.enabled and not cancel.is_set():
-                            acq.run_z_stack(
-                                self.hw, self.channel_settings, [ch], base_z,
-                                self.shading if self.shading_on else None,
-                                cyc_dir, cancel, status_cb=self._set_status,
-                                use_channel_z_offsets=self.use_z_offsets_on)
+                                frame = self.shading.apply(frame, ch, z)
+                            acq.save_image(os.path.join(
+                                out_dir, experiment.file_name(
+                                    p['well'], p['site'], zi, ch, cyc + 1)),
+                                frame)
                     self.hw.leds_off()
                 self._persist()
 
@@ -2593,6 +2627,8 @@ class LumaViewProApp(App):
             'shading_focus_z': self.shading_focus_z,
             'protocol_dir': self.protocol_dir,
             'protocol_optin_v2': True,
+            'no_plate_on': self.no_plate_on,
+            'af_every_n': int(self.af_every_n),
         }
         try:
             acq.save_settings(payload)
@@ -2634,6 +2670,8 @@ class LumaViewProApp(App):
                 self.plate_cal = pc
             self.use_surface_on = bool(d.get('use_surface_on', True))
             self.use_z_offsets_on = bool(d.get('use_z_offsets_on', True))
+            self.no_plate_on = bool(d.get('no_plate_on', False))
+            self.af_every_n = max(int(d.get('af_every_n', 1)), 1)
             self.af_each_cycle_on = bool(d.get('af_each_cycle_on', True))
             self.output_dir = d.get('output_dir') or CAPTURES_DIR
             self.protocol_positions = [dict(p) for p

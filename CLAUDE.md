@@ -7,6 +7,7 @@ Custom control application for an Etaluma Lumascope microscope, built on top of 
 - **Do not launch `lumaviewpro.py` on the microscope PC without asking.** It connects to the real stage, LEDs and camera and homes the stage at startup.
 - To exercise the app without hardware, use the simulator: `.venv\Scripts\python luma_sim.py` (mocks camera, stage and LED board).
 - `hw_debug.py` also talks to real hardware.
+- The user tests on the real microscope themselves; a simulator run is not required before handing over a change. The simulator's mocks are older than the app (stage and camera show as not connected), so it only checks that the UI builds. If you do run it, run it from a copy of the repo so it cannot overwrite `data/current.json`.
 
 ## Environment
 
@@ -23,6 +24,8 @@ The custom app is a handful of top-level files; most work happens here:
 - `acquisition.py`: hardware wrapper, autofocus, shading correction, scans, z-stacks
 - `plate_navigator.py` / `plate_navigator.kv`: well plate navigator widget
 - `labware_defs.py`, `labware.py`: plate definitions and custom labware
+- `experiment.py`: pure planning logic (imaging sites per well, focus map points, focus surface interpolation, file naming)
+- `experiment_wizard.py`: the experiment setup wizard, mixed into the app class; its panel is in `lumaviewpro.kv`
 - `image_utils.py`, `luma_sim.py`, `hw_debug.py`
 
 `modules/`, `drivers/`, `ui/`, `rest/`, `scripts/` and most of `tests/` come from upstream LumaViewPro. Avoid editing them unless the task is about them.
@@ -42,7 +45,7 @@ The custom app is a handful of top-level files; most work happens here:
 - `tests/` holds over 800 upstream test files. Do not run the whole suite; run the specific files for the code you changed.
 - Pass `--noconftest`: the upstream `tests/conftest.py` imports `modules.scope_session`, which currently fails (`modules/protocol.py` imports `FilePath`, which `modules/api_surface.py` no longer defines). Example:
   `.venv\Scripts\python -m pytest --noconftest tests/test_af_global_vcurve_fit.py`
-- Tests for this fork's own code: `test_af_global_vcurve_fit.py`, `test_image_controls.py`, `test_labware_designer.py`, `test_shading_zstack.py`, `test_plate_well_selection.py`.
+- Tests for this fork's own code: `test_af_global_vcurve_fit.py`, `test_image_controls.py`, `test_labware_designer.py`, `test_shading_zstack.py`, `test_plate_well_selection.py`, `test_experiment_plan.py`.
 
 ## Git
 

@@ -28,6 +28,8 @@ from dataclasses import dataclass, field, asdict
 
 import numpy as np
 
+import experiment
+
 try:
     import cv2
 except Exception:  # pragma: no cover - opencv is in requirements
@@ -868,22 +870,15 @@ class FocusSurface:
         self.points = []
 
     def z_at(self, x_um: float, y_um: float) -> float | None:
-        """Focus Z for (x, y) this cycle: plane fit over the surface points
-        (>= 3 points), nearest point (1-2 points), or anchor Z alone."""
+        """Focus Z for (x, y) this cycle: the anchor Z plus the focus-map
+        offset interpolated/extrapolated from the surface points (see
+        ``experiment.interpolate_offsets``), or the anchor Z alone when
+        there are no points."""
         base = self.current_z
         if base is None:
             return None
-        pts = self.points
-        if len(pts) >= 3:
-            arr = np.asarray(pts, dtype=np.float64)
-            A = np.column_stack([arr[:, 0], arr[:, 1], np.ones(len(arr))])
-            coef, *_ = np.linalg.lstsq(A, arr[:, 2], rcond=None)
-            off = coef[0] * x_um + coef[1] * y_um + coef[2]
-            return base + float(off)
-        if pts:
-            d = [math.hypot(x_um - p[0], y_um - p[1]) for p in pts]
-            return base + pts[int(np.argmin(d))][2]
-        return base
+        off = experiment.interpolate_offsets(self.points, x_um, y_um)
+        return base if off is None else base + off
 
     def to_dict(self) -> dict:
         return {
