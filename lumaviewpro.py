@@ -13,6 +13,31 @@ stopped).
 from __future__ import annotations
 import os
 import sys
+
+
+def _relaunch_in_project_venv():
+    """Re-run this script with the repo's .venv Python if it exists and we
+    were started with some other interpreter (e.g. a bare `python` that
+    has none of the dependencies installed)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    venv = os.path.join(here, '.venv')
+    exe = os.path.join(venv, 'Scripts' if os.name == 'nt' else 'bin',
+                       'python.exe' if os.name == 'nt' else 'python')
+    if (not os.path.isfile(exe)
+            or os.environ.get('LVP_VENV_RELAUNCHED')
+            or os.path.normcase(os.path.abspath(sys.prefix))
+            == os.path.normcase(os.path.abspath(venv))):
+        return
+    import subprocess
+    print(f'[LumaViewPro] Relaunching with project venv: {exe}')
+    env = dict(os.environ, LVP_VENV_RELAUNCHED='1')
+    sys.exit(subprocess.call([exe, os.path.abspath(__file__), *sys.argv[1:]],
+                             env=env))
+
+
+if __name__ == '__main__':
+    _relaunch_in_project_venv()
+
 import enum
 import time
 import threading
