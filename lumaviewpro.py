@@ -16,6 +16,7 @@ import sys
 import enum
 import time
 import threading
+import math
 
 if not hasattr(enum, 'StrEnum'):
     class StrEnum(str, enum.Enum):
@@ -75,6 +76,9 @@ from kivy.factory import Factory
 
 import plate_navigator
 import acquisition as acq
+
+# LED current ceiling for the sliders/fields (mA).
+LED_MAX_MA = 600
 import labware_defs
 from acquisition import (CHANNELS, LED_CHANNEL_MAP, ChannelSettings,
                          AutofocusConfig, ScopeHW, FocusSurface,
@@ -131,7 +135,16 @@ class LumaViewProApp(App):
     binning = StringProperty('1')
     crosshair_on = BooleanProperty(False)
     autoscale_on = BooleanProperty(True)
+    clip_overlay_on = BooleanProperty(True)
+    exp_min_ms = NumericProperty(0.02)
+    exp_max_ms = NumericProperty(1000.0)
+    gain_min_db = NumericProperty(0.0)
+    gain_max_db = NumericProperty(24.0)
+    sat_pct = NumericProperty(0.0)
+    camera_auto_warning = StringProperty('')
     high_stability_on = BooleanProperty(False)
+    af_method = StringProperty('two_pass')
+    shading_info = StringProperty('')
     initializing = BooleanProperty(False)
     frame_stats = StringProperty('No frames yet')
     shading_on = BooleanProperty(False)
@@ -139,6 +152,7 @@ class LumaViewProApp(App):
     worker_busy = BooleanProperty(False)
     labware_options = ListProperty(['96-well plate'])
     labware_name = StringProperty('96-well plate')
+    builtin_labware_names = ListProperty([])
     cal_active = BooleanProperty(False)
     cal_label = StringProperty('')
     cal_info = StringProperty('Plate not calibrated')
@@ -166,6 +180,7 @@ class LumaViewProApp(App):
         self.worker = AcquisitionWorker()
         self.surface = FocusSurface()
         self.shading = ShadingCorrector()
+        self.shading_focus_z: float | None = None
         self.channel_settings: dict[str, ChannelSettings] = acq.default_channel_settings()
         self.af_config = AutofocusConfig()
         self.camera_connected = False
@@ -205,6 +220,7 @@ class LumaViewProApp(App):
 
         # Labware + plate calibration
         self.labware_lib = labware_defs.LabwareLibrary()
+        self.builtin_labware_names = list(self.labware_lib.builtins)
         self.current_labware = self.labware_lib.get('96-well plate')
         self.plate_cal: PlateCalibration | None = None   # solved calibration
         self.cal_wizard: PlateCalibration | None = None  # in-progress wizard
@@ -243,6 +259,7 @@ class LumaViewProApp(App):
         self._refresh_layout_files()
         self._sync_channel_fields()
         self._sync_af_fields()
+        self._sync_shading_fields()
         Clock.schedule_once(lambda dt: self._start_init_thread(), 0.1)
         Clock.schedule_interval(self.update_live_feed, 1.0 / 30.0)
         threading.Thread(target=self._position_poller, daemon=True).start()
@@ -320,6 +337,8 @@ class LumaViewProApp(App):
                     self.significant_bits = cur_bits
                 except Exception:
                     pass
+                Clock.schedule_once(lambda dt: self._refresh_camera_limits(), 0)
+                self._check_camera_manual()
                 self._set_status('Camera connected')
             else:
                 self.last_cam_err = 'PylonCamera.connect() failed'
@@ -385,7 +404,7 @@ class LumaViewProApp(App):
         ch = self.live_channel if self.live_channel in CHANNELS else \
             (self.hw.active_channel or 'BF')
         if self.shading_on and self.shading.has_reference(ch):
-            frame = self.shading.apply(frame, ch)
+            frame = self.shading.apply(frame, ch, self.stage_z_um)
         self.latest_frame = frame
         self.frame_count += 1
         now = time.time()
@@ -395,10 +414,14 @@ class LumaViewProApp(App):
                   f'dtype={frame.dtype}, min={frame.min()}, max={frame.max()}, '
                   f'mean={frame.mean():.1f}', flush=True)
         if self.frame_count % 15 == 0:
+            sat = acq.saturated_fraction(frame, self.significant_bits) * 100.0
+            self.sat_pct = sat
+            full = acq.saturation_level(self.significant_bits)
             self.frame_stats = (f'Live #{self.frame_count}  {frame.shape[1]}x'
                                 f'{frame.shape[0]}  {self.significant_bits}-bit  '
-                                f'min {frame.min()}  max {frame.max()}  '
-                                f'mean {frame.mean():.1f}')
+                                f'min {frame.min()}  max {frame.max()}/{full}  '
+                                f'mean {frame.mean():.1f}  '
+                                f'SAT {sat:.2f}%{self.camera_auto_warning}')
         viewport = self.root.ids.get('main_camera_viewport') if self.root else None
         if viewport:
             # During a tile scan show the growing mosaic instead of live frames.
@@ -408,8 +431,10 @@ class LumaViewProApp(App):
                 return
             tint = CHANNEL_LUTS.get(ch, (1.0, 1.0, 1.0))
             viewport.autoscale = self.autoscale_on
-            viewport.update_frame_texture(frame, tint=tint,
-                                          significant_bits=self.significant_bits)
+            viewport.update_frame_texture(
+                frame, tint=tint, significant_bits=self.significant_bits,
+                clip_level=(acq.saturation_level(self.significant_bits)
+                            if self.clip_overlay_on else None))
 
     def _position_poller(self):
         while True:
@@ -476,10 +501,13 @@ class LumaViewProApp(App):
 
     # ----------------------------------------------------- labware library
 
-    def select_labware(self, name: str):
+    def select_labware(self, name: str, force: bool = False):
         lw = self.labware_lib.get(name)
         if lw is None:
             return
+        if not force and lw is self.current_labware and \
+                self.labware_name == lw.name:
+            return   # spinner echo of the current selection
         self.current_labware = lw
         self.labware_name = lw.name
         plate = self.root.ids.get('plate_map') if self.root else None
@@ -502,86 +530,189 @@ class LumaViewProApp(App):
 
     def delete_labware(self):
         name = self.labware_name
-        if self.labware_lib.get(name) is None or self.labware_lib.get(name).builtin:
+        lw = self.labware_lib.get(name)
+        if lw is None or lw.builtin:
             self._set_status('Built-in labware cannot be deleted')
             return
-        self.labware_lib.delete(name)
-        self.labware_options = self.labware_lib.names()
-        self.select_labware('96-well plate')
-        self._set_status(f'Deleted "{name}"')
+        from kivy.uix.button import Button
+        box = BoxLayout(orientation='vertical', spacing=6, padding=6)
+        box.add_widget(Label(text=f'Delete custom labware\n"{name}"?',
+                             halign='center'))
+        btns = BoxLayout(size_hint_y=None, height='36dp', spacing=6)
+        yes, no = Button(text='Delete'), Button(text='Cancel')
+        btns.add_widget(yes)
+        btns.add_widget(no)
+        box.add_widget(btns)
+        popup = Popup(title='Delete labware', content=box,
+                      size_hint=(None, None), size=('320dp', '160dp'))
 
-    def open_labware_editor(self):
-        """Edit the selected labware (built-ins are edited as a new copy)."""
+        def _do(*_):
+            popup.dismiss()
+            self.labware_lib.delete(name)
+            self.labware_options = self.labware_lib.names()
+            self.select_labware('96-well plate')
+            self._set_status(f'Deleted "{name}"')
+
+        yes.bind(on_press=_do)
+        no.bind(on_press=popup.dismiss)
+        popup.open()
+
+    def new_labware(self):
+        """Design a new labware from scratch (SBS footprint defaults)."""
+        blank = labware_defs.LabwareDef(
+            name=self.labware_lib.unique_name('My labware'),
+            rows=8, cols=12, spacing_x_mm=9.0, spacing_y_mm=9.0,
+            well_size_x_mm=6.4, well_size_y_mm=6.4, shape='round')
+        self.open_labware_editor(blank, is_new=True)
+
+    def open_labware_editor(self, src=None, is_new: bool = False):
+        """Labware designer with a live preview. Editing a built-in saves a
+        new custom copy; editing a custom updates (or renames) it."""
         from kivy.uix.gridlayout import GridLayout
         from kivy.uix.textinput import TextInput
         from kivy.uix.button import Button
         from kivy.uix.spinner import Spinner
 
-        src = self.current_labware
-        grid = GridLayout(cols=2, spacing=4, padding=8)
+        if src is None:
+            src = self.current_labware
+        # The custom being edited (may be renamed); None = save as new.
+        replacing = None if (is_new or src.builtin) else src.name
+        if src.builtin and not is_new:
+            suggested = self.labware_lib.unique_name(f'{src.name} (custom)')
+        else:
+            suggested = src.name
+
+        grid = GridLayout(cols=2, spacing=4, size_hint_y=None,
+                          row_default_height='28dp', row_force_default=True)
+        grid.bind(minimum_height=grid.setter('height'))
         fields = {}
-
-        def add_field(label, value):
+        spec = [
+            ('name', 'Name', suggested),
+            ('rows', 'Rows', src.rows),
+            ('cols', 'Columns', src.cols),
+            ('spacing_x_mm', 'Spacing X (mm)', src.spacing_x_mm),
+            ('spacing_y_mm', 'Spacing Y (mm)', src.spacing_y_mm),
+            ('well_size_x_mm', 'Well size X (mm)', src.well_size_x_mm),
+            ('well_size_y_mm', 'Well size Y (mm)', src.well_size_y_mm),
+            ('a1_offset_x_mm', 'A1 centre from left (mm)', src.a1_offset_x_mm),
+            ('a1_offset_y_mm', 'A1 centre from top (mm)', src.a1_offset_y_mm),
+            ('plate_length_mm', 'Plate length X (mm)', src.plate_length_mm),
+            ('plate_width_mm', 'Plate width Y (mm)', src.plate_width_mm),
+        ]
+        for key, label, value in spec:
             grid.add_widget(Label(text=label, font_size='12sp'))
-            ti = TextInput(text=str(value), multiline=False, font_size='12sp')
+            txt = f'{value:g}' if isinstance(value, float) else str(value)
+            ti = TextInput(text=txt, multiline=False, write_tab=False,
+                           font_size='12sp')
             grid.add_widget(ti)
-            fields[label] = ti
-
-        suggested = src.name if not src.builtin else f'{src.name} (custom)'
-        add_field('Name', suggested)
-        add_field('Rows', src.rows)
-        add_field('Columns', src.cols)
-        add_field('Spacing X (mm)', src.spacing_x_mm)
-        add_field('Spacing Y (mm)', src.spacing_y_mm)
-        add_field('Well size X (mm)', src.well_size_x_mm)
-        add_field('Well size Y (mm)', src.well_size_y_mm)
-        add_field('A1 offset X (mm)', src.a1_offset_x_mm)
-        add_field('A1 offset Y (mm)', src.a1_offset_y_mm)
-        add_field('Plate length (mm)', src.plate_length_mm)
-        add_field('Plate width (mm)', src.plate_width_mm)
+            fields[key] = ti
         grid.add_widget(Label(text='Well shape', font_size='12sp'))
         shape_spin = Spinner(text=src.shape, values=['round', 'square'],
                              font_size='12sp')
         grid.add_widget(shape_spin)
 
+        preview = plate_navigator.WellPlateMapWidget(size_hint_y=None,
+                                                     height='200dp')
+        info = Label(text='', font_size='11sp', size_hint_y=None,
+                     height='44dp', halign='left', valign='top')
+        info.bind(size=lambda w, s: setattr(w, 'text_size', s))
+
         box = BoxLayout(orientation='vertical', spacing=6, padding=6)
+        box.add_widget(preview)
         box.add_widget(grid)
+        box.add_widget(info)
         btns = BoxLayout(size_hint_y=None, height='36dp', spacing=6)
+        center_btn = Button(text='Centre grid on plate')
         save_btn = Button(text='Save')
         cancel_btn = Button(text='Cancel')
-        btns.add_widget(save_btn)
-        btns.add_widget(cancel_btn)
+        for b in (center_btn, save_btn, cancel_btn):
+            btns.add_widget(b)
         box.add_widget(btns)
-        popup = Popup(title='Labware designer', content=box,
-                      size_hint=(None, None), size=('420dp', '560dp'))
+        if is_new:
+            title = 'New labware'
+        elif src.builtin:
+            title = f'Labware designer - new copy of {src.name}'
+        else:
+            title = f'Labware designer - {src.name}'
+        popup = Popup(title=title, content=box, size_hint=(None, None),
+                      size=('460dp', '720dp'))
+        red, amber, green = (1.0, 0.45, 0.35, 1), (1.0, 0.8, 0.3, 1), \
+            (0.6, 0.9, 0.6, 1)
+
+        def _read():
+            """Current design from the fields, or (None, error text)."""
+            try:
+                vals = {k: fields[k].text.strip() for k, _, _ in spec}
+                d = labware_defs.LabwareDef(
+                    name=vals['name'],
+                    rows=int(float(vals['rows'])),
+                    cols=int(float(vals['cols'])),
+                    shape=shape_spin.text,
+                    **{k: float(vals[k]) for k, _, _ in spec
+                       if k.endswith('_mm')})
+            except ValueError:
+                return None, 'A field does not contain a valid number'
+            return d, None
+
+        def _problems(d):
+            errors, warnings = labware_defs.validate_labware(d)
+            name_err = self.labware_lib.check_name(d.name, replacing)
+            if name_err:
+                errors = [name_err] + [e for e in errors
+                                       if e != 'Name is empty']
+            return errors, warnings
+
+        def _refresh(*_):
+            d, err = _read()
+            if d is None:
+                info.text, info.color = err, red
+                save_btn.disabled = True
+                return
+            errors, warnings = _problems(d)
+            geometry_ok = not [e for e in errors if 'name' not in e.lower()
+                               and 'design' not in e]
+            if geometry_ok:
+                preview.set_labware(d)
+            save_btn.disabled = bool(errors)
+            if errors:
+                info.text, info.color = 'Cannot save: ' + '; '.join(errors), red
+            elif warnings:
+                info.text, info.color = 'Note: ' + '; '.join(warnings), amber
+            else:
+                info.text = (f'{d.rows} x {d.cols} = {d.rows * d.cols} '
+                             f'{d.shape} wells. Preview: plate seen from '
+                             f'above, A1 top-left.')
+                info.color = green
+
+        def _center(*_):
+            d, err = _read()
+            if d is None:
+                info.text, info.color = err, red
+                return
+            ax, ay = labware_defs.centered_a1_offsets(
+                d.rows, d.cols, d.spacing_x_mm, d.spacing_y_mm,
+                d.plate_length_mm, d.plate_width_mm)
+            fields['a1_offset_x_mm'].text = f'{ax:.3f}'.rstrip('0').rstrip('.')
+            fields['a1_offset_y_mm'].text = f'{ay:.3f}'.rstrip('0').rstrip('.')
 
         def _save(*_):
-            try:
-                d = labware_defs.LabwareDef(
-                    name=fields['Name'].text.strip() or suggested,
-                    rows=int(float(fields['Rows'].text)),
-                    cols=int(float(fields['Columns'].text)),
-                    spacing_x_mm=float(fields['Spacing X (mm)'].text),
-                    spacing_y_mm=float(fields['Spacing Y (mm)'].text),
-                    well_size_x_mm=float(fields['Well size X (mm)'].text),
-                    well_size_y_mm=float(fields['Well size Y (mm)'].text),
-                    shape=shape_spin.text,
-                    a1_offset_x_mm=float(fields['A1 offset X (mm)'].text),
-                    a1_offset_y_mm=float(fields['A1 offset Y (mm)'].text),
-                    plate_length_mm=float(fields['Plate length (mm)'].text),
-                    plate_width_mm=float(fields['Plate width (mm)'].text),
-                )
-            except ValueError:
-                self._set_status('Labware editor: invalid number in a field')
+            d, _err = _read()
+            if d is None or _problems(d)[0]:
+                _refresh()
                 return
-            self.labware_lib.save(d)
+            self.labware_lib.save(d, replacing=replacing)
             self.labware_options = self.labware_lib.names()
-            self.select_labware(d.name)
+            self.select_labware(d.name, force=True)
             popup.dismiss()
             self._set_status(f'Saved labware "{d.name}"')
 
+        for ti in fields.values():
+            ti.bind(text=_refresh)
+        shape_spin.bind(text=_refresh)
+        center_btn.bind(on_press=_center)
         save_btn.bind(on_press=_save)
         cancel_btn.bind(on_press=popup.dismiss)
+        _refresh()
         popup.open()
 
     # ----------------------------------------------- plate calibration wizard
@@ -738,6 +869,7 @@ class LumaViewProApp(App):
     def select_channel(self, channel: str):
         self.selected_channel = channel
         self._sync_channel_fields()
+        self._refresh_shading_info()
 
     def _sync_channel_fields(self):
         if not self.root:
@@ -797,14 +929,21 @@ class LumaViewProApp(App):
             return
         ids = self.root.ids
         cs = self._cs()
-        cs.exposure_ms = self._f(ids.exposure_input.text, cs.exposure_ms)
-        cs.gain_db = self._f(ids.gain_input.text, cs.gain_db)
-        cs.led_power = int(self._f(ids.led_input.text, cs.led_power))
+        cs.exposure_ms = min(max(self._f(ids.exposure_input.text,
+                                         cs.exposure_ms), self.exp_min_ms),
+                             self.exp_max_ms)
+        cs.gain_db = min(max(self._f(ids.gain_input.text, cs.gain_db),
+                             self.gain_min_db), self.gain_max_db)
+        cs.led_power = int(min(max(round(self._f(ids.led_input.text,
+                                                 cs.led_power)), 0),
+                               LED_MAX_MA))
         cs.z_offset_um = self._f(ids.zoffset_input.text, cs.z_offset_um)
         cs.zstack.range_um = self._f(ids.zstack_range_input.text, cs.zstack.range_um)
         cs.zstack.step_um = self._f(ids.zstack_step_input.text, cs.zstack.step_um)
         cs.enabled = bool(ids.channel_enabled_chk.active)
         cs.zstack.enabled = bool(ids.zstack_enabled_chk.active)
+        self._sync_channel_fields()   # show the clamped values
+        self._refresh_shading_info()  # z-stack / offset change the planes
         self._persist()
         if self.live_channel == self.selected_channel:
             self._bg(self.hw.set_channel, self.selected_channel, cs)
@@ -838,22 +977,34 @@ class LumaViewProApp(App):
 
     # -------- sliders: sync with the text fields, debounce live apply
 
-    def slider_changed(self, kind: str, value: float):
+    def slider_changed(self, kind: str, pos: float):
+        """Exposure and LED sliders are logarithmic (equal travel = equal
+        brightness ratio) over what the hardware accepts; gain is in dB,
+        already logarithmic, so its slider is linear over the camera's
+        range."""
         if not self.root or getattr(self, '_slider_sync', False):
             return
         ids = self.root.ids
         cs = self._cs()
         if kind == 'exposure':
-            cs.exposure_ms = float(value)
-            ids.exposure_input.text = f'{cs.exposure_ms:.1f}'
+            cs.exposure_ms = self._round_sig(acq.log_slider_value(
+                pos, self.exp_min_ms, self.exp_max_ms))
+            ids.exposure_input.text = f'{cs.exposure_ms:g}'
         elif kind == 'gain':
-            cs.gain_db = float(value)
-            ids.gain_input.text = f'{cs.gain_db:.1f}'
+            cs.gain_db = round(float(pos), 1)
+            ids.gain_input.text = f'{cs.gain_db:g}'
         elif kind == 'led':
-            cs.led_power = int(value)
+            cs.led_power = int(round(acq.log_slider_value(
+                pos, 1.0, LED_MAX_MA, zero_at_start=True)))
             ids.led_input.text = f'{cs.led_power}'
         if self.live_channel == self.selected_channel:
             self._live_apply_debounced()
+
+    @staticmethod
+    def _round_sig(v: float, sig: int = 3) -> float:
+        if v <= 0:
+            return 0.0
+        return round(v, max(sig - 1 - int(math.floor(math.log10(v))), 0))
 
     def _live_apply_debounced(self):
         if not hasattr(self, '_apply_trigger'):
@@ -861,7 +1012,7 @@ class LumaViewProApp(App):
                 ch = self.selected_channel
                 if self.live_channel == ch and not self.worker_busy:
                     self._bg(self.hw.set_channel, ch, self._cs(ch))
-            self._apply_trigger = Clock.create_trigger(_do, 0.25)
+            self._apply_trigger = Clock.create_trigger(_do, 0.08)
         self._apply_trigger()
 
     def _sync_channel_sliders(self):
@@ -871,14 +1022,72 @@ class LumaViewProApp(App):
         cs = self._cs()
         self._slider_sync = True
         try:
-            for key, val in (('exposure_slider', min(cs.exposure_ms, 1000.0)),
-                             ('gain_slider', min(cs.gain_db, 48.0)),
-                             ('led_slider', min(cs.led_power, 600))):
+            for key, pos in (
+                    ('exposure_slider', acq.log_slider_pos(
+                        cs.exposure_ms, self.exp_min_ms, self.exp_max_ms)),
+                    ('gain_slider', min(max(cs.gain_db, self.gain_min_db),
+                                        self.gain_max_db)),
+                    ('led_slider', acq.log_slider_pos(
+                        cs.led_power, 1.0, LED_MAX_MA, zero_at_start=True))):
                 w = ids.get(key)
                 if w is not None:
-                    w.value = float(val)
+                    w.value = float(pos)
         finally:
             self._slider_sync = False
+
+    def toggle_autoscale(self):
+        self.autoscale_on = not self.autoscale_on
+        self._persist()
+        self._set_status('Display autoscale ' + ('ON - brightness is '
+                         're-stretched per frame, so exposure/LED changes '
+                         'will not look brighter/darker' if self.autoscale_on
+                         else 'off - display follows the real signal'))
+
+    def toggle_clip_overlay(self):
+        self.clip_overlay_on = not self.clip_overlay_on
+        self._persist()
+
+    def _check_camera_manual(self):
+        """Make sure the camera's own auto gain/exposure is really off
+        (it would override the sliders) and flag it if it will not stay
+        off. Runs on the hardware-init thread."""
+        ok = self.hw.ensure_manual_exposure()
+        state = self.hw.camera_auto_state()
+        print(f'[CAM] auto state after connect: {state} (manual ok={ok})',
+              flush=True)
+        warn = '' if ok else '   !! CAMERA AUTO EXPOSURE/GAIN STILL ON'
+        Clock.schedule_once(
+            lambda dt: setattr(self, 'camera_auto_warning', warn), 0)
+        if not ok:
+            self._set_status(f'WARNING: camera auto gain/exposure could not '
+                             f'be turned off ({state}) - sliders will be '
+                             f'overridden')
+
+    def _refresh_camera_limits(self):
+        """Fit the sliders to the connected camera's real ranges."""
+        lo, hi, glo, ghi = self.hw.camera_limits()
+        self.exp_min_ms, self.exp_max_ms = lo, hi
+        self.gain_min_db, self.gain_max_db = glo, ghi
+        self._sync_channel_sliders()
+
+    def nudge(self, kind: str, direction: int):
+        """Fine step buttons: exposure / LED by ~10 %, gain by 1 dB."""
+        cs = self._cs()
+        if kind == 'exposure':
+            v = cs.exposure_ms * (1.1 if direction > 0 else 1 / 1.1)
+            cs.exposure_ms = self._round_sig(
+                min(max(v, self.exp_min_ms), self.exp_max_ms))
+        elif kind == 'led':
+            cur = cs.led_power
+            v = max(cur * 1.1, cur + 1) if direction > 0 else \
+                min(cur / 1.1, cur - 1)
+            cs.led_power = int(min(max(round(v), 0), LED_MAX_MA))
+        elif kind == 'gain':
+            cs.gain_db = round(min(max(cs.gain_db + direction,
+                                       self.gain_min_db), self.gain_max_db), 1)
+        self._sync_channel_fields()
+        if self.live_channel == self.selected_channel:
+            self._live_apply_debounced()
 
     # ---------------------------------------------------- camera controls
 
@@ -1187,6 +1396,9 @@ class LumaViewProApp(App):
             'format': 'lvp-protocol-1',
             'name': name,
             'labware_name': self.labware_name,
+            'labware_def': (None if self.current_labware.builtin else
+                            labware_defs.labware_to_dict(
+                                self.current_labware)),
             'channel_settings': acq.channel_settings_to_dict(self.channel_settings),
             'af_config': {
                 'z_bottom_um': self.af_config.z_bottom_um,
@@ -1200,6 +1412,7 @@ class LumaViewProApp(App):
             'interval_min': ids.protocol_interval_input.text if ids else '5',
             'af_each_cycle': self.af_each_cycle_on,
             'af_channel': self.af_channel,
+            'af_method': self.af_method,
             'use_surface': self.use_surface_on,
             'use_z_offsets': self.use_z_offsets_on,
             'travel_clearance_um': self.travel_clearance_um,
@@ -1267,6 +1480,8 @@ class LumaViewProApp(App):
             self.protocol_positions = [dict(p) for p in d.get('positions', [])]
             self.af_each_cycle_on = bool(d.get('af_each_cycle', True))
             self.af_channel = d.get('af_channel', 'BF')
+            if d.get('af_method') in acq.AF_METHODS:
+                self.af_method = d['af_method']
             self.surface.anchor_channel = self.af_channel
             self.use_surface_on = bool(d.get('use_surface', True))
             self.use_z_offsets_on = bool(d.get('use_z_offsets', True))
@@ -1274,6 +1489,15 @@ class LumaViewProApp(App):
             if d.get('output_dir'):
                 self.output_dir = d['output_dir']
             lw_name = d.get('labware_name')
+            if lw_name and self.labware_lib.get(lw_name) is None and \
+                    d.get('labware_def'):
+                try:
+                    lw_def = labware_defs.labware_from_dict(d['labware_def'])
+                    if not labware_defs.validate_labware(lw_def)[0]:
+                        self.labware_lib.save(lw_def)
+                        self.labware_options = self.labware_lib.names()
+                except Exception:
+                    pass
             if lw_name and self.labware_lib.get(lw_name) is not None:
                 self.select_labware(lw_name)
             ids = self.root.ids
@@ -1490,6 +1714,17 @@ class LumaViewProApp(App):
                                          self.af_config.step_um)
         self._persist()
 
+    def cycle_af_method(self):
+        """Step to the next autofocus algorithm (two-pass / global fit)."""
+        methods = acq.AF_METHODS
+        i = methods.index(self.af_method) if self.af_method in methods else -1
+        self.af_method = methods[(i + 1) % len(methods)]
+        self._persist()
+
+    @staticmethod
+    def af_method_text(method: str) -> str:
+        return 'AF method: ' + acq.AF_METHOD_LABELS.get(method, method)
+
     @staticmethod
     def af_range_text(bottom_txt: str, top_txt: str) -> str:
         try:
@@ -1563,7 +1798,8 @@ class LumaViewProApp(App):
                                            status_cb=self._set_status,
                                            pos_cb=_pos,
                                            template=self.af_template,
-                                           high_stability=self.high_stability_on)
+                                           high_stability=self.high_stability_on,
+                                           method=self.af_method)
             # Keep the AF channel lit so the image stream stays visible.
             Clock.schedule_once(lambda dt: setattr(self, 'live_channel', ch), 0)
             dt_s = time.time() - t0
@@ -1600,7 +1836,8 @@ class LumaViewProApp(App):
                                            status_cb=self._set_status,
                                            pos_cb=_pos,
                                            template=self.af_template,
-                                           high_stability=self.high_stability_on)
+                                           high_stability=self.high_stability_on,
+                                           method=self.af_method)
             # Keep the AF channel lit so the image stream stays visible.
             Clock.schedule_once(lambda dt: setattr(self, 'live_channel', ch), 0)
             if best is None:
@@ -1669,9 +1906,118 @@ class LumaViewProApp(App):
             time.sleep(0.3)
             ok = self.shading.capture_reference(self.hw, ch)
             self.hw.leds_off()
+            Clock.schedule_once(lambda dt: self._refresh_shading_info(), 0)
             self._set_status(f'Shading reference for {ch} '
                              f'{"captured" if ok else "FAILED"}')
         self._bg(_job, busy_job=True)
+
+    def _shading_planes(self, channel: str | None = None):
+        """The acquisition z-stack planes for ``channel`` around the marked
+        focus Z (exactly what run_z_stack will visit), or None."""
+        if self.shading_focus_z is None:
+            return None
+        ch = channel or self.selected_channel
+        cs = self._cs(ch)
+        if self.root and ch == self.selected_channel:
+            ids = self.root.ids   # use what is typed, even if not applied
+            cs.zstack.range_um = self._f(ids.zstack_range_input.text,
+                                         cs.zstack.range_um)
+            cs.zstack.step_um = self._f(ids.zstack_step_input.text,
+                                        cs.zstack.step_um)
+            cs.z_offset_um = self._f(ids.zoffset_input.text, cs.z_offset_um)
+        return acq.zstack_planes(self.shading_focus_z, cs,
+                                 self.use_z_offsets_on, force_stack=True)
+
+    def shading_focus_here(self):
+        """Step 1 (labware IN, sample in focus): mark the focus Z the
+        acquisition z-stack will be centered on."""
+        self.shading_focus_z = float(self.stage_z_um)
+        self._persist()
+        self._refresh_shading_info()
+        self._set_status(f'Shading: focus Z = {self.shading_focus_z:.1f} um. '
+                         f'Now remove the labware and capture.')
+
+    def capture_shading_stack(self):
+        """Step 2 (labware REMOVED): capture a flat-field reference at every
+        plane of the selected channel's acquisition z-stack (z-stack range /
+        step and colour Z offset around the marked focus Z) - the same
+        planes the run will acquire. Confirms first."""
+        if not (self.stage_connected and self.camera_connected):
+            self._set_status('Shading stack needs stage + camera')
+            return
+        zs = self._shading_planes()
+        if zs is None:
+            self._set_status('Shading: focus on the sample (labware in) and '
+                             'press "Focus Z = here" first')
+            return
+        ch = self.selected_channel
+        from kivy.uix.button import Button
+        box = BoxLayout(orientation='vertical', spacing=6, padding=6)
+        planes = ', '.join(f'{z:.1f}' for z in zs[:12]) + \
+            (' ...' if len(zs) > 12 else '')
+        msg = Label(text=(f'Remove the labware so the field is empty.\n\n'
+                          f'{ch}: {len(zs)} planes, {zs[0]:.1f} to '
+                          f'{zs[-1]:.1f} um\n({planes})\n\n'
+                          f'These are the planes the {ch} z-stack acquires '
+                          f'around focus Z {self.shading_focus_z:.1f} um.'),
+                    halign='center', valign='middle', font_size='12sp')
+        msg.bind(size=lambda w, s: setattr(w, 'text_size', s))
+        box.add_widget(msg)
+        btns = BoxLayout(size_hint_y=None, height='36dp', spacing=6)
+        go, no = Button(text='Labware removed - capture'), Button(text='Cancel')
+        btns.add_widget(go)
+        btns.add_widget(no)
+        box.add_widget(btns)
+        popup = Popup(title='Capture shading Z-stack', content=box,
+                      size_hint=(None, None), size=('440dp', '300dp'))
+        focus_z = self.shading_focus_z
+
+        def _job():
+            self.hw.set_channel(ch, self._cs(ch))
+            time.sleep(0.3)
+            ok = self.shading.capture_reference_stack(
+                self.hw, ch, zs, cancel=self.worker.cancel,
+                status_cb=self._set_status, return_z=focus_z)
+            Clock.schedule_once(lambda dt: self._refresh_shading_info(), 0)
+            if not ok:
+                self._set_status(f'Shading Z-stack for {ch} FAILED/canceled '
+                                 f'(previous reference kept)')
+            elif self.shading.last_structure > self.shading.STRUCTURE_WARN:
+                self._set_status(
+                    f'Shading Z-stack for {ch} captured, BUT the field does '
+                    f'not look empty (detail {self.shading.last_structure:.1%})'
+                    f' - is the labware still in? Recapture if so.')
+            else:
+                self._set_status(f'Shading Z-stack for {ch} captured: '
+                                 f'{len(zs)} planes {zs[0]:.1f}-{zs[-1]:.1f} um')
+
+        def _go(*_):
+            popup.dismiss()
+            self._bg(_job, busy_job=True)
+
+        go.bind(on_press=_go)
+        no.bind(on_press=popup.dismiss)
+        popup.open()
+
+    def _sync_shading_fields(self):
+        self._refresh_shading_info()
+
+    def _refresh_shading_info(self):
+        ch = self.selected_channel
+        info = 'Stored: ' + self.shading.describe(ch)
+        zs = None
+        try:
+            zs = self._shading_planes(ch)
+        except Exception:
+            pass
+        if zs is None:
+            plan = 'Focus Z not marked'
+        else:
+            cs = self._cs(ch)
+            plan = (f'Will capture {len(zs)} planes {zs[0]:.1f}-{zs[-1]:.1f} um'
+                    f' (focus {self.shading_focus_z:.1f}'
+                    f'{", z-stack OFF for " + ch if not cs.zstack.enabled else ""})')
+        self.shading_info = f'{plan}\n{info}'
 
     def toggle_shading(self, active: bool):
         self.shading_on = active
@@ -1935,7 +2281,8 @@ class LumaViewProApp(App):
                         self.hw, cfg, self._cs(self.surface.anchor_channel),
                         cancel=cancel, status_cb=self._set_status,
                         template=self.af_template,
-                        high_stability=self.high_stability_on)
+                        high_stability=self.high_stability_on,
+                        method=self.af_method)
                     if best is not None and af_ok:
                         if self.surface.ref_z is None:
                             self.surface.set_reference_z(best)
@@ -1969,7 +2316,8 @@ class LumaViewProApp(App):
                         frame = self.hw.grab_settled(settle_s=0.2)
                         if frame is not None:
                             if self.shading_on:
-                                frame = self.shading.apply(frame, ch)
+                                frame = self.shading.apply(
+                                    frame, ch, base_z + z_off)
                             acq.save_image(
                                 os.path.join(cyc_dir,
                                              f'{p["name"]}_{ch}.tiff'), frame)
@@ -2028,6 +2376,10 @@ class LumaViewProApp(App):
             'img_cal': self.img_cal,
             'af_channel': self.af_channel,
             'high_stability_on': self.high_stability_on,
+            'af_method': self.af_method,
+            'autoscale_on': self.autoscale_on,
+            'clip_overlay_on': self.clip_overlay_on,
+            'shading_focus_z': self.shading_focus_z,
             'protocol_dir': self.protocol_dir,
             'protocol_optin_v2': True,
         }
@@ -2079,6 +2431,12 @@ class LumaViewProApp(App):
             self.img_cal = d.get('img_cal')
             self.af_channel = d.get('af_channel', 'BF')
             self.high_stability_on = bool(d.get('high_stability_on', False))
+            if d.get('af_method') in acq.AF_METHODS:
+                self.af_method = d['af_method']
+            self.autoscale_on = bool(d.get('autoscale_on', self.autoscale_on))
+            self.clip_overlay_on = bool(d.get('clip_overlay_on', True))
+            fz = d.get('shading_focus_z')
+            self.shading_focus_z = float(fz) if fz is not None else None
             self.protocol_dir = d.get('protocol_dir') or PROTOCOLS_DIR
             # One-time migration: protocol membership became opt-in; clear
             # any enables carried over from older settings files.

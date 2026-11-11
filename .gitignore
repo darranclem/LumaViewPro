@@ -58,3 +58,7 @@ data/shading/
 captures/
 .venv*/
 data/custom_labware.json
+
+# Machine-specific state (differs per PC; do not sync)
+data/af_template.npy
+data/protocols/_autosave.json

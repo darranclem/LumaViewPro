@@ -68,6 +68,69 @@ class LabwareDef:
                 self.a1_offset_y_mm + row * self.spacing_y_mm)
 
 
+def labware_to_dict(d: LabwareDef) -> dict:
+    item = asdict(d)
+    item.pop('builtin', None)
+    return item
+
+
+def labware_from_dict(item: dict) -> LabwareDef:
+    """Build a custom LabwareDef from a dict, ignoring unknown keys."""
+    known = {f for f in LabwareDef.__dataclass_fields__ if f != 'builtin'}
+    return LabwareDef(builtin=False,
+                      **{k: v for k, v in item.items() if k in known})
+
+
+def centered_a1_offsets(rows: int, cols: int, spacing_x_mm: float,
+                        spacing_y_mm: float, plate_length_mm: float,
+                        plate_width_mm: float) -> tuple[float, float]:
+    """A1 offsets that center the well grid on the plate footprint."""
+    return ((plate_length_mm - (cols - 1) * spacing_x_mm) / 2.0,
+            (plate_width_mm - (rows - 1) * spacing_y_mm) / 2.0)
+
+
+def validate_labware(d: LabwareDef) -> tuple[list[str], list[str]]:
+    """(errors, warnings) for a design. Errors block saving; warnings are
+    shown but allowed (e.g. wells touching)."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    if not d.name.strip():
+        errors.append('Name is empty')
+    if d.rows < 1 or d.cols < 1:
+        errors.append('Rows and columns must be at least 1')
+    if d.rows > 64 or d.cols > 96:
+        errors.append('At most 64 rows x 96 columns')
+    for label, v in (('Plate length', d.plate_length_mm),
+                     ('Plate width', d.plate_width_mm),
+                     ('Well size X', d.well_size_x_mm),
+                     ('Well size Y', d.well_size_y_mm)):
+        if not v > 0:
+            errors.append(f'{label} must be > 0')
+    if (d.cols > 1 and not d.spacing_x_mm > 0) or \
+            (d.rows > 1 and not d.spacing_y_mm > 0):
+        errors.append('Spacing must be > 0 when there is more than one well')
+    if d.shape not in ('round', 'square'):
+        errors.append('Well shape must be round or square')
+    if errors:
+        return errors, warnings
+    # Every well must lie on the plate footprint.
+    hx, hy = d.well_size_x_mm / 2.0, d.well_size_y_mm / 2.0
+    x0 = d.a1_offset_x_mm - hx
+    y0 = d.a1_offset_y_mm - hy
+    x1 = d.a1_offset_x_mm + (d.cols - 1) * d.spacing_x_mm + hx
+    y1 = d.a1_offset_y_mm + (d.rows - 1) * d.spacing_y_mm + hy
+    eps = 1e-6
+    if x0 < -eps or y0 < -eps or x1 > d.plate_length_mm + eps or \
+            y1 > d.plate_width_mm + eps:
+        errors.append(f'Wells extend past the plate edge (wells span '
+                      f'{x0:.2f}..{x1:.2f} x {y0:.2f}..{y1:.2f} mm, plate is '
+                      f'{d.plate_length_mm:g} x {d.plate_width_mm:g} mm)')
+    if (d.cols > 1 and d.well_size_x_mm > d.spacing_x_mm + eps) or \
+            (d.rows > 1 and d.well_size_y_mm > d.spacing_y_mm + eps):
+        warnings.append('Wells are larger than their spacing and overlap')
+    return errors, warnings
+
+
 def builtin_labware() -> dict[str, LabwareDef]:
     defs = [
         LabwareDef('96-well plate', 8, 12, 9.0, 9.0, 6.4, 6.4, 'round',
@@ -96,25 +159,25 @@ def load_custom_labware() -> dict[str, LabwareDef]:
     try:
         with open(CUSTOM_LABWARE_PATH, 'r', encoding='utf-8') as f:
             raw = json.load(f)
-        out = {}
-        for item in raw:
-            item.pop('builtin', None)
-            d = LabwareDef(builtin=False, **item)
-            out[d.name] = d
-        return out
     except Exception:
         return {}
+    out = {}
+    for item in raw:
+        try:            # one bad entry must not hide the others
+            d = labware_from_dict(item)
+        except Exception:
+            continue
+        out[d.name] = d
+    return out
 
 
 def save_custom_labware(customs: dict[str, LabwareDef]) -> None:
     os.makedirs(os.path.dirname(CUSTOM_LABWARE_PATH), exist_ok=True)
-    payload = []
-    for d in customs.values():
-        item = asdict(d)
-        item.pop('builtin', None)
-        payload.append(item)
-    with open(CUSTOM_LABWARE_PATH, 'w', encoding='utf-8') as f:
+    payload = [labware_to_dict(d) for d in customs.values()]
+    tmp = CUSTOM_LABWARE_PATH + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(payload, f, indent=2)
+    os.replace(tmp, CUSTOM_LABWARE_PATH)   # never leave a half-written file
 
 
 class LabwareLibrary:
@@ -145,9 +208,36 @@ class LabwareLibrary:
         save_custom_labware(self.customs)
         return dup
 
-    def save(self, d: LabwareDef) -> None:
-        """Create or update a custom design (built-ins stay immutable)."""
+    def unique_name(self, base: str) -> str:
+        if self.get(base) is None:
+            return base
+        i = 2
+        while self.get(f'{base} {i}') is not None:
+            i += 1
+        return f'{base} {i}'
+
+    def check_name(self, name: str, replacing: str | None = None) -> str | None:
+        """Why ``name`` cannot be used for a custom design (or None).
+        ``replacing`` is the custom being edited, which may keep its name."""
+        name = name.strip()
+        if not name:
+            return 'Name is empty'
+        if name in self.builtins:
+            return f'"{name}" is a built-in design - choose another name'
+        if name in self.customs and name != replacing:
+            return f'A design named "{name}" already exists'
+        return None
+
+    def save(self, d: LabwareDef, replacing: str | None = None) -> None:
+        """Create or update a custom design (built-ins stay immutable).
+        ``replacing``: name of the custom being edited - when the name
+        changed, the old entry is removed (a rename, not a copy)."""
+        d.name = d.name.strip()
+        if d.name in self.builtins:
+            raise ValueError(f'"{d.name}" is a built-in design')
         d.builtin = False
+        if replacing and replacing != d.name and replacing in self.customs:
+            del self.customs[replacing]
         self.customs[d.name] = d
         save_custom_labware(self.customs)
 

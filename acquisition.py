@@ -87,6 +87,55 @@ def default_channel_settings() -> dict[str, ChannelSettings]:
     return defaults
 
 
+SLIDER_STEPS = 1000.0   # slider position range 0..SLIDER_STEPS
+
+
+def log_slider_value(pos: float, lo: float, hi: float,
+                     zero_at_start: bool = False) -> float:
+    """Slider position (0..SLIDER_STEPS) -> value on a log scale lo..hi.
+
+    Exposure and LED current act multiplicatively on brightness, so equal
+    slider travel should give equal brightness *ratios*: on a linear
+    1-1000 ms slider the whole useful brightfield range (< 5 ms) would sit
+    in the first few pixels. With ``zero_at_start`` position 0 is exactly
+    0 (e.g. LED off) and the log range starts one step later.
+    """
+    pos = min(max(float(pos), 0.0), SLIDER_STEPS)
+    lo, hi = max(lo, 1e-9), max(hi, lo * 1.000001)
+    if zero_at_start:
+        if pos <= 0.0:
+            return 0.0
+        frac = (pos - 1.0) / (SLIDER_STEPS - 1.0)
+    else:
+        frac = pos / SLIDER_STEPS
+    return float(lo * (hi / lo) ** max(frac, 0.0))
+
+
+def log_slider_pos(value: float, lo: float, hi: float,
+                   zero_at_start: bool = False) -> float:
+    """Inverse of ``log_slider_value``."""
+    lo, hi = max(lo, 1e-9), max(hi, lo * 1.000001)
+    if zero_at_start and value <= 0:
+        return 0.0
+    v = min(max(float(value), lo), hi)
+    frac = math.log(v / lo) / math.log(hi / lo)
+    if zero_at_start:
+        return 1.0 + frac * (SLIDER_STEPS - 1.0)
+    return frac * SLIDER_STEPS
+
+
+def saturation_level(significant_bits: int) -> int:
+    return (1 << max(int(significant_bits), 1)) - 1
+
+
+def saturated_fraction(img: np.ndarray, significant_bits: int) -> float:
+    """Fraction of pixels at the sensor's full-scale value (clipped)."""
+    if img is None or img.size == 0:
+        return 0.0
+    return float(np.count_nonzero(img >= saturation_level(significant_bits))
+                 / img.size)
+
+
 def save_settings(payload: dict) -> None:
     os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
     with open(SETTINGS_PATH, 'w', encoding='utf-8') as f:
@@ -128,19 +177,95 @@ class ScopeHW:
                 return
             idx = LED_CHANNEL_MAP.get(channel, 3)
             try:
-                self.led.exchange_command('LEDS_OFF')
-                self.led.exchange_command('LEDS_ENT')
-                self.led.exchange_command(f'LED{idx}_{int(power)}')
+                if channel != self.active_channel:
+                    # Switching channel: everything else off first.
+                    self.led.exchange_command('LEDS_OFF')
+                    self.led.exchange_command('LEDS_ENT')
+                # Same channel (e.g. a slider drag): just change the
+                # current - no off/on flash between steps.
+                self.led.exchange_command(f'LED{idx}_{int(round(power))}')
+                self.active_channel = channel
             except Exception:
-                pass
+                self.active_channel = None   # unknown state: resync next time
 
     # ----------------------------------------------------------- camera
+
+    def camera_limits(self) -> tuple[float, float, float, float]:
+        """(exposure_min_ms, exposure_max_ms, gain_min_db, gain_max_db) the
+        camera actually accepts; conservative defaults without a camera."""
+        exp_lo, exp_hi, g_lo, g_hi = 0.02, 1000.0, 0.0, 24.0
+        cam = self.camera
+        prof = getattr(cam, 'profile', None)
+        try:
+            v = getattr(prof, 'exposure_min_us', None)
+            if v:
+                exp_lo = float(v) / 1000.0
+            v = getattr(prof, 'exposure_max_us', None)
+            if v:
+                exp_hi = float(v) / 1000.0
+        except Exception:
+            pass
+        try:   # the driver refuses anything above its own cap
+            exp_hi = min(exp_hi, float(getattr(cam, 'max_exposure', exp_hi)))
+        except Exception:
+            pass
+        try:
+            g = getattr(prof, 'gain', None)
+            if g is not None and g.total_max_db is not None:
+                g_lo = float(g.total_min_db or 0.0)
+                g_hi = float(g.total_max_db)
+        except Exception:
+            pass
+        exp_lo = max(exp_lo, 0.001)
+        return exp_lo, max(exp_hi, exp_lo * 2), g_lo, max(g_hi, g_lo + 1.0)
+
+    def camera_auto_state(self) -> dict[str, str]:
+        """{'GainAuto': ..., 'ExposureAuto': ...} as the camera reports
+        them right now ('Off' / 'Once' / 'Continuous'); empty when they
+        cannot be read."""
+        out = {}
+        cam = self.camera
+        node_owner = getattr(cam, 'active', None)
+        if not node_owner:
+            return out
+        for name in ('GainAuto', 'ExposureAuto'):
+            try:
+                out[name] = str(getattr(node_owner, name).GetValue())
+            except Exception:
+                pass
+        return out
+
+    def ensure_manual_exposure(self) -> bool:
+        """Force the camera's auto gain / auto exposure OFF and verify it.
+
+        While either runs, the camera overwrites the exposure and gain the
+        user sets, so sliders appear not to work. The driver turns them
+        off at connect but only logs if that fails; this re-asserts and
+        reads back. Returns True when both read back 'Off' (or the camera
+        has no such nodes)."""
+        with self.lock:
+            state = self.camera_auto_state()
+            if all(v == 'Off' for v in state.values()):
+                return True
+            cam = self.camera
+            try:
+                cam.auto_gain(state=False)
+            except Exception:
+                pass
+            for name in ('GainAuto', 'ExposureAuto'):
+                if self.camera_auto_state().get(name, 'Off') != 'Off':
+                    try:
+                        getattr(cam.active, name).SetValue('Off')
+                    except Exception:
+                        pass
+            return all(v == 'Off' for v in self.camera_auto_state().values())
 
     def apply_camera_settings(self, settings: ChannelSettings) -> None:
         with self.lock:
             cam = self.camera
             if cam is None or not getattr(cam, 'active', False):
                 return
+            self.ensure_manual_exposure()
             try:
                 cam.exposure_t(float(settings.exposure_ms))
             except Exception:
@@ -160,7 +285,8 @@ class ScopeHW:
             if settings is not None:
                 self.apply_camera_settings(settings)
             self.led_on(channel, settings.led_power if settings else 50)
-            self.active_channel = channel
+            if self.led is None or not getattr(self.led, 'driver', False):
+                self.active_channel = channel   # no LED board: track anyway
 
     def grab_fresh(self, timeout_s: float = 3.0) -> np.ndarray | None:
         """Block for a genuinely new frame; returns a copy or None.
@@ -403,14 +529,181 @@ def _parabolic_peak(zs, scores, i, lo, hi, step):
     return min(max(best, lo), hi)
 
 
+# ---------------------------------------------------- global curve fitting
+
+AF_METHODS = ('two_pass', 'vcurve')
+AF_METHOD_LABELS = {'two_pass': 'Two-pass', 'vcurve': 'Global V-curve fit'}
+
+
+@dataclass
+class FocusFit:
+    """Result of a global focus-curve fit."""
+    z: float            # estimated best focus
+    model: str          # 'parabola' (log-parabola / Gaussian) or 'vcurve'
+    r2: float           # goodness of fit on the points used (0..1)
+    n_points: int       # points used in the fit
+    z_alt: float | None = None   # the other model's estimate, if available
+
+
+def _peak_window(zs: np.ndarray, s: np.ndarray, floor_frac: float):
+    """Indices of the contiguous region around the global maximum whose
+    normalized score stays above ``floor_frac``. Restricting the fit to
+    the main peak keeps secondary maxima (coverslip / dust reflections)
+    out of the model."""
+    i = int(np.argmax(s))
+    a = i
+    while a > 0 and s[a - 1] >= floor_frac:
+        a -= 1
+    b = i
+    while b < len(s) - 1 and s[b + 1] >= floor_frac:
+        b += 1
+    return a, b, i
+
+
+def _r2(y: np.ndarray, yhat: np.ndarray) -> float:
+    ss_res = float(((y - yhat) ** 2).sum())
+    ss_tot = float(((y - y.mean()) ** 2).sum()) + 1e-12
+    return max(0.0, 1.0 - ss_res / ss_tot)
+
+
+def _fit_log_parabola(zs: np.ndarray, sn: np.ndarray):
+    """Weighted least-squares parabola through log(score) over the peak.
+
+    A defocus curve is close to Gaussian, b + A*exp(-(z-z0)^2 / 2s^2), so
+    after baseline removal its log is an exact parabola whose vertex is the
+    focus. Weights ~ score^2 (Caruana) favour the well-measured top of the
+    peak over the noisy flanks. One pass of outlier rejection drops a
+    single bad frame (vibration, LED flicker). Returns (z0, r2, n) or None.
+    """
+    a, b, _ = _peak_window(zs, sn, 0.15)
+    z, y = zs[a:b + 1], sn[a:b + 1]
+    if len(z) < 4:
+        return None
+    zc = z.mean()   # center Z for numerical conditioning
+    ly = np.log(np.maximum(y, 1e-6))
+
+    def _fit(zk, lyk, wk):
+        return np.polyfit(zk - zc, lyk, 2, w=wk)
+
+    c = _fit(z, ly, y)
+    zk, yk = z, y
+    if len(z) > 4:
+        # Weighted residuals; drop the single worst frame if it is a
+        # clear outlier, then refit once.
+        resid = np.abs(np.polyval(c, z - zc) - ly) * y
+        worst = int(np.argmax(resid))
+        if resid[worst] > 6.0 * (float(np.median(resid)) + 1e-9):
+            keep = np.arange(len(z)) != worst
+            zk, yk = z[keep], y[keep]
+            c = _fit(zk, ly[keep], yk)
+    if c[0] >= -1e-12:          # opens upward / flat: no peak
+        return None
+    z0 = zc - c[1] / (2.0 * c[0])
+    # The vertex must lie within the fitted span (no wild extrapolation).
+    span = zk.max() - zk.min()
+    if not (zk.min() - 0.1 * span <= z0 <= zk.max() + 0.1 * span):
+        return None
+    # Judge the fit in linear score space - that is what was measured.
+    yhat = np.exp(np.polyval(c, zk - zc))
+    return float(z0), _r2(yk, yhat), int(len(zk))
+
+
+def _fit_vcurve(zs: np.ndarray, sn: np.ndarray):
+    """Symmetric V-curve: s = c - m*|z - z0| fitted to the flanks of the
+    peak (the rounded top, > 90 %, is excluded). Insensitive to the exact
+    peak shape - flat-topped, saturated or plateau peaks that a parabola
+    describes poorly - because it relies on the steep, information-rich
+    flanks. The shared slope makes it robust with few points per side.
+    Solved exactly: for each candidate z0 on a fine grid the model is
+    linear in (c, m); the z0 with least squared error wins. Returns
+    (z0, r2, n) or None."""
+    a, b, i = _peak_window(zs, sn, 0.10)
+    idx = [k for k in range(a, b + 1) if 0.15 <= sn[k] <= 0.90]
+    if not any(k < i for k in idx) or not any(k > i for k in idx):
+        return None
+    z, y = zs[idx], sn[idx]
+    if len(z) < 5:               # 3 parameters: keep >= 2 spare dof
+        return None
+    left_z, right_z = zs[max(a, 0)], zs[min(b, len(zs) - 1)]
+    grid = np.linspace(left_z, right_z, 2001)
+    d = np.abs(z[None, :] - grid[:, None])            # G x n
+    dm = d - d.mean(axis=1, keepdims=True)
+    ym = y - y.mean()
+    var = (dm * dm).sum(axis=1) + 1e-12
+    slope = (dm * ym).sum(axis=1) / var               # = -m
+    sse = ((ym[None, :] - slope[:, None] * dm) ** 2).sum(axis=1)
+    g = int(np.argmin(sse))
+    if slope[g] >= 0:            # not a peak
+        return None
+    yhat = y.mean() + slope[g] * dm[g]
+    return float(grid[g]), _r2(y, yhat), int(len(z))
+
+
+def fit_focus_curve(zs, scores, min_r2: float = 0.85) -> FocusFit | None:
+    """Global fit of a whole focus curve (all sampled Z positions).
+
+    Scores are normalized to 0..1 (baseline = low percentile, so a
+    background offset does not bias the shape), then fitted with a
+    log-parabola (Gaussian model). If that fit is poor or impossible the
+    symmetric V-curve is used instead. Returns None when neither
+    model describes the data well enough - the caller should then sample
+    more finely.
+    """
+    zs = np.asarray(zs, dtype=float)
+    s = np.asarray(scores, dtype=float)
+    if len(zs) < 4 or not np.all(np.isfinite(s)):
+        return None
+    order = np.argsort(zs)
+    zs, s = zs[order], s[order]
+    base = float(np.percentile(s, 10))
+    amp = float(s.max()) - base
+    if amp <= 1e-12:
+        return None
+    sn = np.clip((s - base) / amp, 0.0, None)
+    par = _fit_log_parabola(zs, sn)
+    vc = _fit_vcurve(zs, sn)
+    # The Gaussian model matches real defocus curves best (sharp metrics
+    # are cusp-like with convex flanks, which bias straight-line flank
+    # fits), so it is preferred; the V-curve covers peaks it cannot
+    # describe, e.g. flat-topped / saturated ones.
+    if par is not None and par[1] >= min_r2:
+        return FocusFit(par[0], 'parabola', par[1], par[2],
+                        vc[0] if vc else None)
+    if vc is not None and vc[1] >= min_r2:
+        return FocusFit(vc[0], 'vcurve', vc[1], vc[2],
+                        par[0] if par else None)
+    return None
+
+
+def _describe_fit(tag: str, fit: FocusFit) -> str:
+    alt = '' if fit.z_alt is None else f', other model z={fit.z_alt:.2f}'
+    return (f'{tag}: {fit.model} z={fit.z:.2f} um  R2={fit.r2:.3f}  '
+            f'n={fit.n_points}{alt}')
+
+
 def autofocus_sweep(hw: ScopeHW, cfg: AutofocusConfig,
                     settings: ChannelSettings,
                     cancel: threading.Event | None = None,
                     status_cb=None,
                     pos_cb=None,
                     template: np.ndarray | None = None,
-                    high_stability: bool = False) -> tuple[float | None, bool]:
-    """Two-pass autofocus over [bottom, top] (z-stack style range).
+                    high_stability: bool = False,
+                    method: str = 'two_pass') -> tuple[float | None, bool]:
+    """Autofocus over [bottom, top] (z-stack style range).
+
+    ``method``:
+
+    - ``'two_pass'``: coarse pass, then a fine pass around the coarse
+      maximum with a 3-point parabolic refinement (described below).
+    - ``'vcurve'``: global curve fit. The WHOLE coarse curve is fitted
+      (log-parabola / Gaussian model, V-curve flank intersection as the
+      fallback model - see ``fit_focus_curve``). When the fit is good the
+      stage goes straight to the fitted focus: a single pass, using every
+      sample rather than the three around the maximum, so it is faster
+      and less sensitive to one noisy frame. When the coarse curve is too
+      sparse to fit (interval wide relative to depth of field) a fine pass
+      is run around the best estimate and fitted the same way. High
+      stability always runs the template fine pass, centered on the fit.
 
     Coarse pass at ``step_um`` using a channel-appropriate sharpness
     metric (Tenengrad for transmitted, normalized variance for
@@ -467,6 +760,27 @@ def autofocus_sweep(hw: ScopeHW, cfg: AutofocusConfig,
         return mid, False
     i = int(np.argmax(scores))
     z_coarse = zs[i]
+    use_template = fine_scorer is not coarse_scorer
+
+    if method == 'vcurve':
+        fit = fit_focus_curve(zs, scores)
+        if fit is not None:
+            if status_cb:
+                status_cb(_describe_fit('AF global fit', fit))
+            z_coarse = min(max(fit.z, lo), hi)
+            if not use_template:
+                best = z_coarse
+                # Approach from below for repeatable mechanics.
+                hw.move_z(max(best - 5.0, 0.0))
+                hw.move_z(best)
+                if pos_cb:
+                    pos_cb(best)
+                if status_cb:
+                    status_cb(f'AF best focus (global {fit.model} fit, '
+                              f'1 pass): z={best:.2f} um')
+                return float(best), True
+        elif status_cb:
+            status_cb('AF global fit: coarse curve too sparse - refining')
 
     # ---- fine pass around the coarse peak
     fstep = max(step / 5.0, 0.4)
@@ -483,14 +797,22 @@ def autofocus_sweep(hw: ScopeHW, cfg: AutofocusConfig,
         fzs.append(z)
         fscores.append(s)
         if status_cb:
-            tag = 'AF fine (hi-stab)' if fine_scorer is not coarse_scorer else 'AF fine'
+            tag = 'AF fine (hi-stab)' if use_template else 'AF fine'
             status_cb(f'{tag}: z={z:.1f} um  score={s:.3f}')
         z += fstep
     if not fscores or max(fscores) <= -1.0:
         hw.move_z(mid)
         return mid, False
     j = int(np.argmax(fscores))
-    best = _parabolic_peak(fzs, fscores, j, lo, hi, fstep)
+    best = None
+    if method == 'vcurve':
+        ffit = fit_focus_curve(fzs, fscores)
+        if ffit is not None:
+            best = min(max(ffit.z, lo), hi)
+            if status_cb:
+                status_cb(_describe_fit('AF fine fit', ffit))
+    if best is None:
+        best = _parabolic_peak(fzs, fscores, j, lo, hi, fstep)
     hw.move_z(best)
     if pos_cb:
         pos_cb(best)
@@ -582,6 +904,41 @@ class FocusSurface:
 
 # -------------------------------------------------------------- shading
 
+def zstack_planes(center_z_um: float, cs: ChannelSettings,
+                  use_channel_z_offsets: bool = True,
+                  force_stack: bool = False) -> np.ndarray:
+    """The Z planes a channel is acquired at around ``center_z_um``.
+
+    Single source for both the z-stack acquisition and the shading
+    reference stack, so the shading planes are exactly the acquisition
+    planes. A channel without an enabled z-stack is acquired at one plane
+    (center + chromatic offset) unless ``force_stack``.
+    """
+    z0 = center_z_um + (cs.z_offset_um if use_channel_z_offsets else 0.0)
+    zc = cs.zstack
+    if not (zc.enabled or force_stack) or abs(zc.range_um) < 1e-6:
+        return np.array([z0], dtype=np.float64)
+    half = abs(zc.range_um) / 2.0
+    step = max(abs(zc.step_um), 0.1)
+    return np.arange(z0 - half, z0 + half + 1e-6, step, dtype=np.float64)
+
+
+def field_structure(img: np.ndarray) -> float:
+    """Fine detail relative to brightness (high-pass std / mean, on a
+    downsampled copy). Near the noise floor for an empty field; clearly
+    higher when cells / a plate / dust are in view."""
+    if img is None or img.size == 0 or cv2 is None:
+        return 0.0
+    s = img.astype(np.float32)
+    if s.ndim == 3:
+        s = s.mean(axis=2)
+    f = max(max(s.shape) // 512, 1)
+    s = s[::f, ::f]
+    s = cv2.GaussianBlur(s, (3, 3), 0)          # suppress pixel noise
+    hp = s - cv2.GaussianBlur(s, (0, 0), 6.0)
+    return float(hp.std() / (s.mean() + 1e-6))
+
+
 class ShadingCorrector:
     """Per-channel flat-field (shading) correction.
 
@@ -589,64 +946,226 @@ class ShadingCorrector:
     smooths them; ``apply`` divides a raw frame by the normalized reference
     (gain map), preserving the frame's mean brightness. References persist
     to data/shading/<channel>.npy.
+
+    Depth-resolved (Z-stack) references: phase contrast in particular has
+    a shading pattern that changes with focal depth (annulus / meniscus
+    refraction), so one flat field is wrong away from the Z it was taken
+    at. ``capture_reference_stack`` records a gain map per Z plane over a
+    range; ``apply(img, ch, z_um)`` then linearly blends the two planes
+    bracketing ``z_um`` (clamped at the ends). Stacks persist to
+    data/shading/<channel>_zstack.npz. A channel holds either a single
+    map or a stack - capturing one replaces the other.
     """
+
+    STACK_MAX_SIDE = 512     # stack planes stored downsampled (smooth maps)
+    _CACHE_Z_RES_UM = 0.5    # blended map reused within this Z tolerance
 
     def __init__(self):
         self.references: dict[str, np.ndarray] = {}
+        self.stacks: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self.enabled = False
+        self.last_structure = 0.0
+        self._cache: dict[str, tuple[tuple, np.ndarray]] = {}
 
-    def capture_reference(self, hw: ScopeHW, channel: str,
-                          n_frames: int = 8) -> bool:
+    # ------------------------------------------------------------ capture
+
+    @staticmethod
+    def _gain_from_frames(frames: list[np.ndarray]) -> np.ndarray:
+        ref = np.mean(frames, axis=0)
+        if ref.ndim == 3:            # colour camera: one map for all planes
+            ref = ref.mean(axis=2)
+        if cv2 is not None:
+            k = max(int(min(ref.shape[:2]) * 0.05) | 1, 31)
+            ref = cv2.GaussianBlur(ref, (k, k), 0)
+        ref[ref <= 0] = 1.0
+        return (ref / float(ref.mean())).astype(np.float32)  # mean 1.0
+
+    @staticmethod
+    def _grab_frames(hw, n_frames: int) -> list[np.ndarray]:
         frames = []
         for _ in range(n_frames):
             f = hw.grab_fresh()
             if f is not None:
                 frames.append(f.astype(np.float32))
+        return frames
+
+    def capture_reference(self, hw: ScopeHW, channel: str,
+                          n_frames: int = 8) -> bool:
+        frames = self._grab_frames(hw, n_frames)
         if not frames:
             return False
-        ref = np.mean(frames, axis=0)
-        if cv2 is not None:
-            k = max(int(min(ref.shape[:2]) * 0.05) | 1, 31)
-            ref = cv2.GaussianBlur(ref, (k, k), 0)
-        ref[ref <= 0] = 1.0
-        gain = ref / float(ref.mean())  # normalized gain map, mean 1.0
-        self.references[channel] = gain.astype(np.float32)
+        self.references[channel] = self._gain_from_frames(frames)
+        self._drop_stack(channel)
+        self._cache.pop(channel, None)
         self._save(channel)
         return True
 
-    def has_reference(self, channel: str) -> bool:
-        return channel in self.references
+    # High-pass detail above this (fraction of mean) means the field is
+    # probably not empty - labware / sample still in the light path.
+    STRUCTURE_WARN = 0.03
 
-    def apply(self, img: np.ndarray, channel: str) -> np.ndarray:
-        gain = self.references.get(channel)
-        if gain is None or img is None:
+    def capture_reference_stack(self, hw: ScopeHW, channel: str,
+                                zs, n_frames: int = 6,
+                                cancel: threading.Event | None = None,
+                                status_cb=None,
+                                settle_s: float = 0.2,
+                                return_z: float | None = None) -> bool:
+        """Capture a gain map at each Z in ``zs`` over an empty field (the
+        labware removed). Planes are visited bottom to top (always moving
+        up, for repeatable mechanics); the stage then goes to ``return_z``
+        (default: the lowest plane). Returns False on cancel or if any
+        plane fails - the old reference is then kept.
+
+        ``self.last_structure`` holds the largest field-structure value
+        seen; above ``STRUCTURE_WARN`` the field was probably not empty.
+        """
+        zs = np.unique(np.asarray(zs, dtype=np.float64))
+        if zs.size == 0:
+            return False
+        lo = float(zs[0])
+        self.last_structure = 0.0
+        hw.move_z(max(lo - 5.0, 0.0))
+        maps = []
+        for k, z in enumerate(zs):
+            if cancel is not None and cancel.is_set():
+                return False
+            if status_cb:
+                status_cb(f'Shading stack {channel}: plane {k + 1}/{len(zs)} '
+                          f'z={z:.1f} um')
+            hw.move_z(float(z))
+            if settle_s > 0:
+                time.sleep(settle_s)
+            hw.grab_fresh()          # discard a frame exposed during the move
+            frames = self._grab_frames(hw, n_frames)
+            if not frames:
+                return False
+            self.last_structure = max(self.last_structure,
+                                      field_structure(frames[0]))
+            maps.append(self._downsample(self._gain_from_frames(frames)))
+        hw.move_z(float(lo if return_z is None else return_z))
+        self.stacks[channel] = (zs, np.stack(maps).astype(np.float32))
+        self.references.pop(channel, None)
+        self._cache.pop(channel, None)
+        self._save(channel)
+        return True
+
+    @classmethod
+    def _downsample(cls, gain: np.ndarray) -> np.ndarray:
+        h, w = gain.shape[:2]
+        f = max(h, w) / cls.STACK_MAX_SIDE
+        if f <= 1.0 or cv2 is None:
+            return gain
+        return cv2.resize(gain, (max(int(round(w / f)), 1),
+                                 max(int(round(h / f)), 1)),
+                          interpolation=cv2.INTER_AREA)
+
+    # -------------------------------------------------------------- query
+
+    def has_reference(self, channel: str) -> bool:
+        return channel in self.references or channel in self.stacks
+
+    def has_stack(self, channel: str) -> bool:
+        return channel in self.stacks
+
+    def describe(self, channel: str) -> str:
+        if channel in self.stacks:
+            zs = self.stacks[channel][0]
+            return (f'{channel}: Z-stack, {len(zs)} planes '
+                    f'{zs[0]:.0f}-{zs[-1]:.0f} um')
+        if channel in self.references:
+            return f'{channel}: single plane'
+        return f'{channel}: none'
+
+    def gain_at(self, channel: str, z_um: float | None = None
+                ) -> np.ndarray | None:
+        """Gain map for ``channel`` at ``z_um`` (stack: linear blend of the
+        bracketing planes, clamped at the ends; no Z given -> the middle of
+        the stack). Single-plane references ignore Z."""
+        st = self.stacks.get(channel)
+        if st is None:
+            return self.references.get(channel)
+        zs, maps = st
+        if len(zs) == 1:
+            return maps[0]
+        z = float(zs[len(zs) // 2]) if z_um is None else \
+            min(max(float(z_um), float(zs[0])), float(zs[-1]))
+        j = int(np.clip(np.searchsorted(zs, z) - 1, 0, len(zs) - 2))
+        t = (z - zs[j]) / (zs[j + 1] - zs[j])
+        return ((1.0 - t) * maps[j] + t * maps[j + 1]).astype(np.float32)
+
+    # -------------------------------------------------------------- apply
+
+    def _full_gain(self, channel: str, z_um: float | None,
+                   shape: tuple) -> np.ndarray | None:
+        zq = None if z_um is None or channel not in self.stacks else \
+            round(float(z_um) / self._CACHE_Z_RES_UM)
+        key = (zq, shape)
+        hit = self._cache.get(channel)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        gain = self.gain_at(channel, z_um)
+        if gain is None:
+            return None
+        if gain.shape != shape:
+            if cv2 is None:
+                return None
+            gain = cv2.resize(gain, (shape[1], shape[0]),
+                              interpolation=cv2.INTER_LINEAR)
+        self._cache[channel] = (key, gain)
+        return gain
+
+    def apply(self, img: np.ndarray, channel: str,
+              z_um: float | None = None) -> np.ndarray:
+        if img is None:
             return img
-        if gain.shape != img.shape[:2]:
-            if cv2 is not None:
-                gain = cv2.resize(gain, (img.shape[1], img.shape[0]))
-            else:
-                return img
+        gain = self._full_gain(channel, z_um, img.shape[:2])
+        if gain is None:
+            return img
+        if img.ndim == 3:
+            gain = gain[:, :, None]
         out = img.astype(np.float32) / gain
         if img.dtype == np.uint8:
             return np.clip(out, 0, 255).astype(np.uint8)
         return np.clip(out, 0, 65535).astype(np.uint16)
 
+    # -------------------------------------------------------- persistence
+
+    def _paths(self, channel: str) -> tuple[str, str]:
+        return (os.path.join(SHADING_DIR, f'{channel}.npy'),
+                os.path.join(SHADING_DIR, f'{channel}_zstack.npz'))
+
+    def _drop_stack(self, channel: str) -> None:
+        self.stacks.pop(channel, None)
+
     def _save(self, channel: str) -> None:
+        single, stack = self._paths(channel)
         try:
             os.makedirs(SHADING_DIR, exist_ok=True)
-            np.save(os.path.join(SHADING_DIR, f'{channel}.npy'),
-                    self.references[channel])
+            if channel in self.stacks:
+                zs, maps = self.stacks[channel]
+                np.savez_compressed(stack, zs=zs, maps=maps)
+                if os.path.exists(single):
+                    os.remove(single)
+            elif channel in self.references:
+                np.save(single, self.references[channel])
+                if os.path.exists(stack):
+                    os.remove(stack)
         except Exception:
             pass
 
     def load_all(self) -> None:
-        try:
-            for ch in CHANNELS:
-                p = os.path.join(SHADING_DIR, f'{ch}.npy')
-                if os.path.exists(p):
-                    self.references[ch] = np.load(p)
-        except Exception:
-            pass
+        for ch in CHANNELS:
+            single, stack = self._paths(ch)
+            try:
+                if os.path.exists(stack):
+                    with np.load(stack) as d:
+                        self.stacks[ch] = (d['zs'].astype(np.float64),
+                                           d['maps'].astype(np.float32))
+                elif os.path.exists(single):
+                    self.references[ch] = np.load(single)
+            except Exception:
+                pass
+        self._cache.clear()
 
 
 # --------------------------------------------------------------- tiling
@@ -846,16 +1365,20 @@ def run_tile_scan(hw: ScopeHW,
             if cancel.is_set():
                 break
             cs = channel_settings[ch]
+            z_now = None
             if base_z is not None:
                 z_off = cs.z_offset_um if use_channel_z_offsets else 0.0
-                hw.move_z(base_z + z_off)
+                z_now = base_z + z_off
+                hw.move_z(z_now)
             hw.set_channel(ch, cs)
             frame = hw.grab_settled(settle_s=settle_s)
             if frame is None:
                 _status(f'Tile {i + 1}: no frame for {ch}')
                 continue
             if shading is not None and shading.enabled:
-                frame = shading.apply(frame, ch)
+                if z_now is None and shading.has_stack(ch):
+                    z_now = hw.get_pos()[2]
+                frame = shading.apply(frame, ch, z_now)
             save_image(os.path.join(out_dir, f'tile_{i:04d}_{ch}.tiff'), frame)
             collected[ch].append(frame)
             if on_tile is not None:
@@ -905,14 +1428,11 @@ def run_z_stack(hw: ScopeHW,
         cs = channel_settings.get(ch)
         if cs is None:
             continue
-        zc = cs.zstack
-        half = abs(zc.range_um) / 2.0
-        step = max(abs(zc.step_um), 0.1)
-        z0 = center_z_um + (cs.z_offset_um if use_channel_z_offsets else 0.0)
-        zs = np.arange(z0 - half, z0 + half + 1e-6, step)
+        zs = zstack_planes(center_z_um, cs, use_channel_z_offsets,
+                           force_stack=True)
         hw.set_channel(ch, cs)
         _status(f'Z-stack {ch}: {len(zs)} slices '
-                f'({z0 - half:.1f} to {z0 + half:.1f} um)')
+                f'({zs[0]:.1f} to {zs[-1]:.1f} um)')
         for j, z in enumerate(zs):
             if cancel.is_set():
                 break
@@ -921,7 +1441,7 @@ def run_z_stack(hw: ScopeHW,
             if frame is None:
                 continue
             if shading is not None and shading.enabled:
-                frame = shading.apply(frame, ch)
+                frame = shading.apply(frame, ch, float(z))
             save_image(os.path.join(out_dir, f'zstack_{ch}_{j:03d}_'
                                              f'{z:.1f}um.tiff'), frame)
     hw.move_z(center_z_um)

@@ -147,11 +147,17 @@ LumaViewProMainLayout:
             background_color: ACCENT if app.crosshair_on else PANEL2
             on_press: app.crosshair_on = not app.crosshair_on
         FlatButton:
-            text: 'Autoscale: ' + ('ON' if app.autoscale_on else 'off')
+            text: 'Display autoscale: ' + ('ON' if app.autoscale_on else 'off')
             size_hint_x: None
-            width: '100dp'
+            width: '140dp'
             background_color: ACCENT if app.autoscale_on else PANEL2
-            on_press: app.autoscale_on = not app.autoscale_on
+            on_press: app.toggle_autoscale()
+        FlatButton:
+            text: 'Clip overlay: ' + ('ON' if app.clip_overlay_on else 'off')
+            size_hint_x: None
+            width: '110dp'
+            background_color: (0.75, 0.2, 0.17, 1) if app.clip_overlay_on else PANEL2
+            on_press: app.toggle_clip_overlay()
         FlatButton:
             text: 'Snap'
             size_hint_x: None
@@ -281,15 +287,32 @@ LumaViewProMainLayout:
                             SmallInput:
                                 id: exposure_input
                                 text: '20'
+                                on_text_validate: app.apply_channel_fields()
+                            FlatButton:
+                                text: '-'
+                                size_hint_x: None
+                                width: '26dp'
+                                height: '26dp'
+                                on_press: app.nudge('exposure', -1)
+                            FlatButton:
+                                text: '+'
+                                size_hint_x: None
+                                width: '26dp'
+                                height: '26dp'
+                                on_press: app.nudge('exposure', 1)
                         Slider:
                             id: exposure_slider
-                            min: 1
+                            min: 0
                             max: 1000
-                            value: 20
+                            value: 500
                             size_hint_y: None
                             height: '24dp'
                             cursor_size: '14dp', '14dp'
                             on_value: app.slider_changed('exposure', self.value)
+                        PanelLabel:
+                            text: 'log scale %g - %g ms' % (round(app.exp_min_ms, 3), round(app.exp_max_ms))
+                            font_size: '9sp'
+                            height: '12dp'
                         FieldRow:
                             PanelLabel:
                                 text: 'Gain (dB)'
@@ -297,15 +320,32 @@ LumaViewProMainLayout:
                             SmallInput:
                                 id: gain_input
                                 text: '0'
+                                on_text_validate: app.apply_channel_fields()
+                            FlatButton:
+                                text: '-'
+                                size_hint_x: None
+                                width: '26dp'
+                                height: '26dp'
+                                on_press: app.nudge('gain', -1)
+                            FlatButton:
+                                text: '+'
+                                size_hint_x: None
+                                width: '26dp'
+                                height: '26dp'
+                                on_press: app.nudge('gain', 1)
                         Slider:
                             id: gain_slider
-                            min: 0
-                            max: 48
+                            min: app.gain_min_db
+                            max: app.gain_max_db
                             value: 0
                             size_hint_y: None
                             height: '24dp'
                             cursor_size: '14dp', '14dp'
                             on_value: app.slider_changed('gain', self.value)
+                        PanelLabel:
+                            text: '%g - %g dB (camera range)' % (round(app.gain_min_db, 1), round(app.gain_max_db, 1))
+                            font_size: '9sp'
+                            height: '12dp'
                         FieldRow:
                             PanelLabel:
                                 text: 'LED power (mA)'
@@ -313,15 +353,32 @@ LumaViewProMainLayout:
                             SmallInput:
                                 id: led_input
                                 text: '50'
+                                on_text_validate: app.apply_channel_fields()
+                            FlatButton:
+                                text: '-'
+                                size_hint_x: None
+                                width: '26dp'
+                                height: '26dp'
+                                on_press: app.nudge('led', -1)
+                            FlatButton:
+                                text: '+'
+                                size_hint_x: None
+                                width: '26dp'
+                                height: '26dp'
+                                on_press: app.nudge('led', 1)
                         Slider:
                             id: led_slider
                             min: 0
-                            max: 600
-                            value: 50
+                            max: 1000
+                            value: 500
                             size_hint_y: None
                             height: '24dp'
                             cursor_size: '14dp', '14dp'
                             on_value: app.slider_changed('led', self.value)
+                        PanelLabel:
+                            text: 'log scale off, 1 - 600 mA'
+                            font_size: '9sp'
+                            height: '12dp'
                         FieldRow:
                             PanelLabel:
                                 text: 'Colour Z offset (um)'
@@ -366,6 +423,22 @@ LumaViewProMainLayout:
                         FlatButton:
                             text: 'Capture shading ref (selected ch)'
                             on_press: app.capture_shading_reference()
+                        PanelLabel:
+                            text: 'Shading Z-stack = the acquisition z-stack planes'
+                        PanelLabel:
+                            text: '1. Labware IN, sample in focus:'
+                        FlatButton:
+                            text: 'Focus Z = here'
+                            on_press: app.shading_focus_here()
+                        PanelLabel:
+                            text: '2. Remove the labware (empty field), then:'
+                        FlatButton:
+                            text: 'Capture shading Z-stack (selected ch)'
+                            on_press: app.capture_shading_stack()
+                        PanelLabel:
+                            text: app.shading_info
+                            font_size: '10sp'
+                            height: '28dp'
 
                     Collapsible:
                         title: 'AUTOFOCUS'
@@ -404,6 +477,10 @@ LumaViewProMainLayout:
                                 text: '10'
                         PanelLabel:
                             text: app.af_range_text(af_bottom_input.text, af_top_input.text)
+                        FlatButton:
+                            text: app.af_method_text(app.af_method)
+                            background_color: ACCENT if app.af_method == 'vcurve' else PANEL2
+                            on_press: app.cycle_af_method()
                         FlatButton:
                             text: 'High stability AF: ' + ('ON' if app.high_stability_on else 'off')
                             background_color: ACCENT if app.high_stability_on else PANEL2
@@ -708,26 +785,34 @@ LumaViewProMainLayout:
                             size: self.size
 
                     Collapsible:
-                        title: 'LABWARE'
-                        DarkSpinner:
-                            id: labware_spinner
-                            text: app.labware_name
-                            values: app.labware_options
-                            on_text: app.select_labware(self.text)
+                        title: 'PLATE NAVIGATOR'
+                        open: True
                         FieldRow:
+                            height: '28dp'
+                            PanelLabel:
+                                text: 'Labware'
+                                size_hint_x: None
+                                width: '52dp'
+                                height: '28dp'
+                            DarkSpinner:
+                                id: labware_spinner
+                                text: app.labware_name
+                                values: app.labware_options
+                                on_text: app.select_labware(self.text)
+                        FieldRow:
+                            FlatButton:
+                                text: 'New...'
+                                on_press: app.new_labware()
+                            FlatButton:
+                                text: 'Edit...'
+                                on_press: app.open_labware_editor()
                             FlatButton:
                                 text: 'Duplicate'
                                 on_press: app.duplicate_labware()
                             FlatButton:
-                                text: 'Edit / New'
-                                on_press: app.open_labware_editor()
-                            FlatButton:
                                 text: 'Delete'
+                                disabled: app.labware_name in app.builtin_labware_names
                                 on_press: app.delete_labware()
-
-                    Collapsible:
-                        title: 'PLATE NAVIGATOR'
-                        open: True
                         WellPlateMapWidget:
                             id: plate_map
                             size_hint_y: None

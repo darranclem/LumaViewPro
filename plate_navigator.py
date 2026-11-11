@@ -160,7 +160,10 @@ class ZoomPanCameraWidget(Image):
         return np.clip(frame_np, 0, 255).astype(np.uint8)
 
     def update_frame_texture(self, frame_np: np.ndarray, tint=None,
-                             significant_bits: int = 8):
+                             significant_bits: int = 8, clip_level=None):
+        """``clip_level``: raw value at/above which a pixel is saturated;
+        those pixels are painted red so clipping is visible regardless of
+        display autoscale or LUT tint."""
         if frame_np is None or not isinstance(frame_np, np.ndarray) or frame_np.size == 0:
             return
 
@@ -187,6 +190,14 @@ class ZoomPanCameraWidget(Image):
                 frame_rgb = np.stack(chans, axis=-1)
             else:
                 frame_rgb = frame_8u
+
+            if clip_level is not None:
+                raw = frame_np if frame_np.ndim == 2 else frame_np.max(axis=2)
+                clipped = raw >= clip_level
+                if clipped.any():
+                    if frame_rgb is frame_np or not frame_rgb.flags.writeable:
+                        frame_rgb = frame_rgb.copy()
+                    frame_rgb[clipped] = (255, 0, 0)
 
             h, w = frame_rgb.shape[:2]
             self._frame_px_w, self._frame_px_h = w, h
