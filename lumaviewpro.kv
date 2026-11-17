@@ -590,6 +590,13 @@ LumaViewProMainLayout:
                             FlatButton:
                                 text: 'Stitch folder'
                                 on_press: app.quark_stitch_folder(quark_folder_input.text)
+                            FlatButton:
+                                text: 'Correct tiles'
+                                on_press: app.quark_correct_folder(quark_folder_input.text)
+                        FieldRow:
+                            FlatButton:
+                                text: 'Shading from folder -> live view + captures'
+                                on_press: app.quark_measure_shading(quark_folder_input.text)
 
                     Collapsible:
                         title: 'PROTOCOL / TIMELAPSE'

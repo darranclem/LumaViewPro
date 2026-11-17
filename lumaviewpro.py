@@ -2138,6 +2138,86 @@ class LumaViewProApp(App):
                 self._set_status(f'Quark stitching failed: {e}')
         self._bg(_job)
 
+    def _quark_folder_for(self, text: str, what: str):
+        """The folder typed (or the last tile scan's) for a Quark tool, or None with the
+        reason on the status line."""
+        import quark_stitch
+        folder = (text or '').strip().strip('"') or self.quark_folder
+        if not folder:
+            self._set_status(f'{what}: type a tile scan or plate folder, or run a tile scan first')
+            return None
+        if not os.path.isdir(folder):
+            self._set_status(f'{what}: {folder} is not a folder')
+            return None
+        if not quark_stitch.available():
+            self._set_status(quark_stitch.why_unavailable())
+            return None
+        self.quark_folder = folder
+        return folder
+
+    def quark_measure_shading(self, text: str = ''):
+        """Measure every channel's shading from the tiles of a folder (Quark's algorithmic
+        shading correction: no empty-field reference) and store it as that channel's shading
+        reference. The Shading switch then applies it to the live view, to snapshots, tile
+        scans and protocol runs. Touches no hardware; runs off the UI thread."""
+        import quark_stitch
+        folder = self._quark_folder_for(text, 'Shading from folder')
+        if folder is None:
+            return
+
+        def _job():
+            try:
+                measured = quark_stitch.measure_shading(folder, status_cb=self._set_status)
+                on_top = quark_stitch.shading_was_applied(folder)
+                said = []
+                for ch, (gain, info) in measured.items():
+                    note = quark_stitch.describe_shading(info)
+                    if gain is None:
+                        said.append(f'{ch}: {note}')
+                        continue
+                    if ch not in acq.CHANNELS:
+                        said.append(f'{ch}: not a channel of this microscope')
+                        continue
+                    # Tiles saved with the shading switch on hold only what the reference of
+                    # the time left: the new map is that reference times what was measured.
+                    old = self.shading.gain_at(ch) if on_top else None
+                    if old is not None:
+                        if old.shape != gain.shape and acq.cv2 is not None:
+                            old = acq.cv2.resize(old, (gain.shape[1], gain.shape[0]),
+                                                 interpolation=acq.cv2.INTER_LINEAR)
+                        if old.shape == gain.shape:
+                            gain = gain * old
+                            note += ', on top of the reference in use when the tiles were taken'
+                    self.shading.set_measured(ch, gain, note)
+                    said.append(f'{ch}: {note}')
+                Clock.schedule_once(lambda dt: self._refresh_shading_info(), 0)
+                self._set_status('Shading ' + '; '.join(said)
+                                 + ('' if self.shading_on else ' | switch Shading ON to use it'))
+            except Exception as e:
+                self._set_status(f'Shading from folder failed: {e}')
+        self._bg(_job)
+
+    def quark_correct_folder(self, text: str = ''):
+        """Write a shading-corrected copy of every tile of a folder to
+        ``<folder>/shading_corrected`` (Quark; the shading is measured from the tiles
+        themselves, the tiles are never changed). Touches no hardware."""
+        import quark_stitch
+        folder = self._quark_folder_for(text, 'Correct tiles')
+        if folder is None:
+            return
+
+        def _job():
+            try:
+                record = quark_stitch.correct_folder(folder, status_cb=self._set_status)
+                said = [f"{ch}: {e['corrected']} tiles ({e['measured']})"
+                        + (f", {len(e['skipped'])} skipped" if e['skipped'] else '')
+                        for ch, e in record['channels'].items()]
+                self._set_status('Shading-corrected tiles written to '
+                                 f"{record['out_dir']} | " + '; '.join(said))
+            except Exception as e:
+                self._set_status(f'Shading correction of the folder failed: {e}')
+        self._bg(_job)
+
     # ---------------------------------------------- live mosaic preview
 
     def _mosaic_reset(self):

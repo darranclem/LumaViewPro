@@ -30,9 +30,10 @@ The custom app is a handful of top-level files; most work happens here:
 ## Stitching and shading by Quark
 
 - `quark_stitch.py` wraps Quark's tile stitching and flat-field correction (the compiled module `quark_tiles`, built from the private Quark repository's `quark-py` crate with PyO3). It is not a port: the same Rust code Quark runs.
-- The compiled file lives in `lib/quark/quark_tiles.pyd` and is **not in this repository** (ignored). Install it per PC by copying it, or with `toolsuild_quark_tiles.ps1`. Without it everything still works; tile scans are stitched by stage position as before and the status line says so.
+- The compiled file lives in `lib/quark/quark_tiles.pyd` and is **not in this repository** (ignored). Install it per PC by copying it, or with `tools\build_quark_tiles.ps1`. Without it everything still works; tile scans are stitched by stage position as before and the status line says so.
 - `acquisition.run_tile_scan` writes `tile_scan.json` (tile positions, pixel size) beside the tiles and, when the module is present, makes `stitched_<channel>.tiff` with Quark (shading measured from the tiles themselves and divided out, tiles placed by their overlaps and blended).
 - UI: Tile Scan section, "Stitch folder" re-stitches a finished tile scan or plate folder into `<folder>/quark`. Command line: `.venv\Scripts\python quark_stitch.py <folder>`.
+- Shading correction on its own (no empty-field reference): "Shading from folder" measures every channel's shading from a folder's tiles (`quark_stitch.measure_shading`) and stores it as that channel's reference (`ShadingCorrector.set_measured`, note in `data/shading/<channel>.txt`), so the existing Shading switch applies it to live view, snapshots, tile scans and protocol runs. "Correct tiles" writes corrected copies to `<folder>/shading_corrected` (`quark_stitch.correct_folder`; command line `quark_stitch.py <folder> --correct`). Originals are never changed. `tile_scan.json` records `shading_applied`; a map measured from tiles saved with shading on is multiplied onto the reference then in use.
 - Tests: `tests/test_quark_stitch.py` (the Quark tests skip themselves when the module is absent).
 
 ## Tests

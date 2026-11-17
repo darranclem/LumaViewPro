@@ -26,19 +26,33 @@ Folders it reads:
 * a **plate protocol** folder: ``experiment.json`` and one sub-folder per well holding
   ``<well>_<site>_Z<n>_<channel>_t<n>.tiff``.
 
+Shading correction on its own (no stitching):
+
+* ``measure_shading(folder)``: the gain map of every channel, measured from the folder's
+  tiles. LumaViewPro stores it as that channel's shading reference
+  (``ShadingCorrector.set_measured``), so the **Shading** switch applies it to the live
+  view and to everything captured afterwards, with no empty-field reference.
+* ``correct_folder(folder)``: a shading-corrected copy of every tile, written to
+  ``<folder>/shading_corrected`` with the gain maps and a record of what was measured. The
+  tiles themselves are never changed.
+
 Command line (writes ``<name>_stitched.ome.tif`` per well into ``<folder>/quark``)::
 
     .venv\\Scripts\\python quark_stitch.py <folder> [--well D5] [--out DIR] [--reduce 2]
+    .venv\\Scripts\\python quark_stitch.py <folder> --correct     (corrected tiles instead)
 """
 from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import sys
 
 import numpy as np
 
 TILE_SCAN_SIDECAR = 'tile_scan.json'
+SHADING_OUT = 'shading_corrected'
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _MODULE_DIR = os.path.join(_HERE, 'lib', 'quark')
 _module = None
@@ -180,8 +194,114 @@ def apply_flat_field(tile: np.ndarray, gain: np.ndarray) -> np.ndarray:
 
 # -------------------------------------------------------------- tile scans
 
+# ------------------------------------------------------ shading on its own
+
+def measure_shading(folder: str, channels: list[str] | None = None, status_cb=None) -> dict:
+    """The shading of every channel of a tile-scan or plate folder, measured from its own
+    tiles: ``{channel name: (gain, info)}``. ``gain`` is ``None`` where it could not be
+    measured (too few plain tiles), with the reason in ``info['error']``."""
+    listed = scan(folder)
+    out = {}
+    for index, ch in enumerate(listed['channels']):
+        if channels is not None and ch not in channels:
+            continue
+        if status_cb:
+            status_cb(f'Measuring the shading of {ch} from the images (Quark)...')
+        try:
+            out[ch] = flat_field(folder, index)
+        except Exception as e:
+            out[ch] = (None, {'error': str(e)})
+    return out
+
+
+def describe_shading(info: dict) -> str:
+    """A few words on a measured gain map, for the status line and the stored note."""
+    if 'error' in info:
+        return f"not measured ({info['error']})"
+    parts = ['measured from images (Quark)']
+    if info.get('fields_used') is not None:
+        of = f" of {info['fields_read']}" if info.get('fields_read') is not None else ''
+        parts.append(f"{info['fields_used']}{of} tiles")
+    if info.get('split_half_rms') is not None:
+        parts.append(f"known to {100.0 * float(info['split_half_rms']):.1f} %")
+    return ', '.join(parts)
+
+
+def shading_was_applied(folder: str) -> bool:
+    """Whether a tile scan's tiles were saved with LumaViewPro's shading switched on (what
+    is measured from them is then what that reference left, not the whole pattern)."""
+    try:
+        with open(os.path.join(folder, TILE_SCAN_SIDECAR), encoding='utf-8') as f:
+            return bool(json.load(f).get('shading_applied', False))
+    except Exception:
+        return False
+
+
+def _tile_files(folder: str, channel: str) -> list[str]:
+    """The tiles of ``channel`` under ``folder`` (a tile scan's ``tile_NNNN_<ch>.tiff``, a
+    plate's ``<well>_<site>_Z<n>_<ch>_t<n>.tiff``), not what this module wrote."""
+    named = re.compile(rf'(^|_){re.escape(channel)}(_t\d+)?\.tiff?$', re.IGNORECASE)
+    found = []
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if d not in ('quark', SHADING_OUT)]
+        for name in sorted(files):
+            if named.search(name) and not name.lower().startswith('stitched'):
+                found.append(os.path.join(root, name))
+    return found
+
+
+def correct_folder(folder: str, out_dir: str | None = None, channels: list[str] | None = None,
+                   status_cb=None) -> dict:
+    """Write a shading-corrected copy of every tile of a tile-scan or plate folder to
+    ``<folder>/shading_corrected`` (same names and sub-folders), with each channel's gain map
+    (``gain_<channel>.npy``) and ``shading.json`` saying what was measured and done. The
+    shading is measured from the folder's own tiles. Returns that record."""
+    import tifffile
+    folder = os.fspath(folder)
+    out_dir = out_dir or os.path.join(folder, SHADING_OUT)
+    os.makedirs(out_dir, exist_ok=True)
+    record = {'format': 'lvp-shading-1', 'source': folder, 'channels': {}}
+    for ch, (gain, info) in measure_shading(folder, channels, status_cb).items():
+        entry = {'measured': describe_shading(info), 'info': info, 'corrected': 0, 'skipped': []}
+        record['channels'][ch] = entry
+        if gain is None:
+            continue
+        np.save(os.path.join(out_dir, f'gain_{ch}.npy'), gain)
+        files = _tile_files(folder, ch)
+        for k, path in enumerate(files):
+            if status_cb and k % 10 == 0:
+                status_cb(f'Shading correction {ch}: tile {k + 1} of {len(files)}')
+            tile = tifffile.imread(path)
+            if tile.ndim != 2 or tile.shape != gain.shape or tile.dtype not in (np.uint8, np.uint16):
+                entry['skipped'].append(os.path.relpath(path, folder))
+                continue
+            fixed = apply_flat_field(tile.astype(np.uint16), gain)
+            if tile.dtype == np.uint8:
+                fixed = np.clip(fixed, 0, 255).astype(np.uint8)
+            target = os.path.join(out_dir, os.path.relpath(path, folder))
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            tifffile.imwrite(target, fixed)
+            entry['corrected'] += 1
+    # The records that make the corrected copy a folder of its own (stitchable as it is).
+    try:
+        with open(os.path.join(folder, TILE_SCAN_SIDECAR), encoding='utf-8') as f:
+            scan_record = json.load(f)
+        scan_record['shading_applied'] = True
+        with open(os.path.join(out_dir, TILE_SCAN_SIDECAR), 'w', encoding='utf-8') as f:
+            json.dump(scan_record, f, indent=1)
+    except FileNotFoundError:
+        pass
+    if os.path.exists(os.path.join(folder, 'experiment.json')):
+        shutil.copyfile(os.path.join(folder, 'experiment.json'), os.path.join(out_dir, 'experiment.json'))
+    with open(os.path.join(out_dir, 'shading.json'), 'w', encoding='utf-8') as f:
+        json.dump(record, f, indent=1)
+    record['out_dir'] = out_dir
+    return record
+
+
 def write_tile_scan_record(out_dir: str, positions, um_per_px: float,
-                           channels: list[str], pattern: str = '') -> str:
+                           channels: list[str], pattern: str = '',
+                           shading_applied: bool = False) -> str:
     """The record that makes a tile-scan folder readable later (by Quark and by this module):
     each tile's stage position, the pixel size and the channels. Plain JSON; needs no Quark.
     ``positions``: ``[(tile index, x_um, y_um), ...]`` for the tiles that were captured."""
@@ -190,6 +310,7 @@ def write_tile_scan_record(out_dir: str, positions, um_per_px: float,
         'um_per_px': float(um_per_px),
         'channels': list(channels),
         'pattern': pattern,
+        'shading_applied': bool(shading_applied),
         'positions': [{'index': int(i), 'x_um': float(x), 'y_um': float(y)}
                       for (i, x, y) in positions],
     }
@@ -250,10 +371,18 @@ def _main(argv: list[str]) -> int:
     p.add_argument('--reduce', type=int, default=1, help='average NxN pixels (default 1)')
     p.add_argument('--no-shading', action='store_true')
     p.add_argument('--no-register', action='store_true')
+    p.add_argument('--correct', action='store_true',
+                   help='write shading-corrected tiles to <folder>/shading_corrected instead of stitching')
     a = p.parse_args(argv)
     if not available():
         print(why_unavailable())
         return 2
+    if a.correct:
+        record = correct_folder(a.folder, a.out, status_cb=print)
+        for ch, entry in record['channels'].items():
+            print(f"{ch}: {entry['measured']}; {entry['corrected']} tiles corrected, {len(entry['skipped'])} skipped")
+        print(record['out_dir'])
+        return 0
     for path in export_folder(a.folder, a.out, a.well, status_cb=print, reduce=a.reduce,
                               shading=not a.no_shading, register=not a.no_register):
         print(path)

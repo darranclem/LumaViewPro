@@ -947,6 +947,12 @@ class ShadingCorrector:
     (gain map), preserving the frame's mean brightness. References persist
     to data/shading/<channel>.npy.
 
+    ``set_measured`` takes a gain map that was MEASURED FROM IMAGES instead
+    (Quark's algorithmic shading correction, see quark_stitch.measure_shading:
+    the pattern a set of tiles share, no empty field needed). It is stored
+    and applied exactly like a captured reference, with a note of where it
+    came from (data/shading/<channel>.txt).
+
     Depth-resolved (Z-stack) references: phase contrast in particular has
     a shading pattern that changes with focal depth (annulus / meniscus
     refraction), so one flat field is wrong away from the Z it was taken
@@ -966,6 +972,8 @@ class ShadingCorrector:
         self.enabled = False
         self.last_structure = 0.0
         self._cache: dict[str, tuple[tuple, np.ndarray]] = {}
+        # Where a channel's map came from when it was measured from images.
+        self.notes: dict[str, str] = {}
 
     # ------------------------------------------------------------ capture
 
@@ -997,8 +1005,23 @@ class ShadingCorrector:
         self.references[channel] = self._gain_from_frames(frames)
         self._drop_stack(channel)
         self._cache.pop(channel, None)
+        self.notes.pop(channel, None)
         self._save(channel)
         return True
+
+    def set_measured(self, channel: str, gain: np.ndarray, note: str = '') -> None:
+        """Use a gain map measured from images (``stored = gain x true``,
+        any scale) as ``channel``'s reference. Replaces a captured reference
+        or stack; ``note`` says where it came from."""
+        g = np.asarray(gain, dtype=np.float32)
+        if g.ndim != 2 or g.size == 0:
+            raise ValueError('a gain map is a 2-D array')
+        g = np.where(np.isfinite(g) & (g > 0), g, 1.0).astype(np.float32)
+        self.references[channel] = (g / float(g.mean())).astype(np.float32)
+        self._drop_stack(channel)
+        self._cache.pop(channel, None)
+        self.notes[channel] = note or 'measured from images'
+        self._save(channel)
 
     # High-pass detail above this (fraction of mean) means the field is
     # probably not empty - labware / sample still in the light path.
@@ -1046,6 +1069,7 @@ class ShadingCorrector:
         self.stacks[channel] = (zs, np.stack(maps).astype(np.float32))
         self.references.pop(channel, None)
         self._cache.pop(channel, None)
+        self.notes.pop(channel, None)
         self._save(channel)
         return True
 
@@ -1073,7 +1097,8 @@ class ShadingCorrector:
             return (f'{channel}: Z-stack, {len(zs)} planes '
                     f'{zs[0]:.0f}-{zs[-1]:.0f} um')
         if channel in self.references:
-            return f'{channel}: single plane'
+            note = self.notes.get(channel)
+            return f'{channel}: {note}' if note else f'{channel}: single plane'
         return f'{channel}: none'
 
     def gain_at(self, channel: str, z_um: float | None = None
@@ -1150,6 +1175,12 @@ class ShadingCorrector:
                 np.save(single, self.references[channel])
                 if os.path.exists(stack):
                     os.remove(stack)
+            note_path = os.path.join(SHADING_DIR, f'{channel}.txt')
+            if self.notes.get(channel):
+                with open(note_path, 'w', encoding='utf-8') as f:
+                    f.write(self.notes[channel])
+            elif os.path.exists(note_path):
+                os.remove(note_path)
         except Exception:
             pass
 
@@ -1163,6 +1194,10 @@ class ShadingCorrector:
                                            d['maps'].astype(np.float32))
                 elif os.path.exists(single):
                     self.references[ch] = np.load(single)
+                    note_path = os.path.join(SHADING_DIR, f'{ch}.txt')
+                    if os.path.exists(note_path):
+                        with open(note_path, encoding='utf-8') as f:
+                            self.notes[ch] = f.read().strip()
             except Exception:
                 pass
         self._cache.clear()
@@ -1405,7 +1440,8 @@ def run_tile_scan(hw: ScopeHW,
         import quark_stitch
         quark_stitch.write_tile_scan_record(
             out_dir, [(i, x, y) for i, (x, y) in zip(used_indices, used_positions)],
-            um_per_px, enabled)
+            um_per_px, enabled,
+            shading_applied=bool(shading is not None and shading.enabled))
     except Exception as e:
         quark_stitch = None
         quark_note = f' (no tile_scan.json: {e})'

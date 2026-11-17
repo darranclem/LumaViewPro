@@ -160,3 +160,70 @@ def test_shading_from_tiles_in_memory():
     assert abs(fixed[:6].mean() / fixed[-6:].mean() - 1.0) < 0.01
     with pytest.raises(RuntimeError):
         quark_stitch.flat_field_from_tiles(tiles[:2])      # too few to measure from
+
+@pytest.mark.skipif(not quark_stitch.available(), reason=quark_stitch.why_unavailable())
+def test_shading_measured_from_a_scan_becomes_the_reference_for_new_frames(tmp_path, monkeypatch):
+    """The owner's case: tiles darker from top to bottom. The pattern measured from a
+    finished scan is stored as the channel's shading reference, and a frame taken afterwards
+    (another place, same optics) comes out even."""
+    monkeypatch.setattr(acq, 'SHADING_DIR', str(tmp_path / 'shading'))
+    out, positions, paths, said = _scan(tmp_path)
+    assert quark_stitch.shading_was_applied(out) is False
+    measured = quark_stitch.measure_shading(out)
+    gain, info = measured['BF']
+    assert gain is not None and 'measured from images' in quark_stitch.describe_shading(info)
+    corrector = acq.ShadingCorrector()
+    corrector.set_measured('BF', gain, quark_stitch.describe_shading(info))
+    assert corrector.has_reference('BF') and 'Quark' in corrector.describe('BF')
+    # A new frame somewhere else on the sample.
+    hw = _Scope()
+    hw.move_xy(23456.0, 21234.0)
+    raw = hw.grab_settled()
+    yy, xx = np.mgrid[0:TH, 0:TW]
+    truth = _scene(xx + int(round(hw.x / UM)), yy + int(round(hw.y / UM)))
+    uneven = lambda img: float(np.std((img / truth) / (img / truth).mean()))
+    fixed = corrector.apply(raw, 'BF')
+    assert fixed.dtype == np.uint16
+    assert uneven(raw.astype(np.float64)) > 0.07
+    assert uneven(fixed.astype(np.float64)) < 0.015, uneven(fixed.astype(np.float64))
+    # It is kept, with where it came from, for the next start.
+    again = acq.ShadingCorrector()
+    again.load_all()
+    assert again.has_reference('BF') and 'measured from images' in again.describe('BF')
+    # A captured reference replaces it, note and all.
+    class _Flat:
+        def grab_fresh(self):
+            return np.full((TH, TW), 1000, np.uint16)
+    assert again.capture_reference(_Flat(), 'BF', n_frames=2)
+    assert again.describe('BF') == 'BF: single plane'
+
+
+@pytest.mark.skipif(not quark_stitch.available(), reason=quark_stitch.why_unavailable())
+def test_a_folders_tiles_are_written_shading_corrected_beside_the_originals(tmp_path):
+    out, positions, paths, said = _scan(tmp_path)
+    before = {name: os.path.getmtime(os.path.join(out, name)) for name in os.listdir(out)}
+    record = quark_stitch.correct_folder(out)
+    target = os.path.join(out, quark_stitch.SHADING_OUT)
+    assert record['out_dir'] == target and record['channels']['BF']['corrected'] == 9
+    assert not record['channels']['BF']['skipped']
+    # The originals are untouched.
+    assert all(os.path.getmtime(os.path.join(out, name)) == t for name, t in before.items())
+    # Every corrected tile is even from top to bottom (the raw ones are 30 % darker below).
+    for k, (x, y) in enumerate(positions):
+        name = f'tile_{k:04d}_BF.tiff'
+        raw = tifffile.imread(os.path.join(out, name)).astype(np.float64)
+        fixed = tifffile.imread(os.path.join(target, name)).astype(np.float64)
+        yy, xx = np.mgrid[0:TH, 0:TW]
+        truth = _scene(xx + int(round(x / UM)), yy + int(round(y / UM)))
+        assert fixed.shape == raw.shape
+        assert raw[:8].mean() / raw[-8:].mean() > 1.25
+        ratio = fixed / truth
+        assert abs(ratio[:8].mean() / ratio[-8:].mean() - 1.0) < 0.03, name
+    # What was done is written down, and the corrected copy is a tile scan of its own.
+    with open(os.path.join(target, 'shading.json'), encoding='utf-8') as f:
+        assert json.load(f)['channels']['BF']['corrected'] == 9
+    assert os.path.exists(os.path.join(target, 'gain_BF.npy'))
+    assert quark_stitch.shading_was_applied(target) is True
+    assert quark_stitch.scan(target)['wells'][0]['tiles'] == 9
+    # A second run does not take its own output for tiles.
+    assert quark_stitch.correct_folder(out)['channels']['BF']['corrected'] == 9
