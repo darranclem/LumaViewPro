@@ -1334,6 +1334,14 @@ def run_tile_scan(hw: ScopeHW,
     out-of-bounds positions are skipped. ``on_tile(channel, frame, x, y)``
     is called per captured tile for live mosaic preview. Returns
     {channel: stitched_path}.
+
+    Every scan leaves ``tile_scan.json`` beside its tiles (each tile's stage
+    position and the pixel size), so the folder can be stitched again later.
+    When Quark's stitching is installed (``quark_stitch``) the mosaic is made
+    by it: the shading every tile shares is measured from the tiles
+    themselves and divided out, and tiles are placed by their overlaps and
+    blended. Otherwise (or for a channel Quark cannot do) the tiles are
+    placed by stage position as before.
     """
     def _status(msg):
         if status_cb:
@@ -1346,6 +1354,7 @@ def run_tile_scan(hw: ScopeHW,
         return {}
     collected: dict[str, list[np.ndarray]] = {ch: [] for ch in enabled}
     used_positions: list[tuple[float, float]] = []
+    used_indices: list[int] = []    # the number in each tile's file name
     n_txt = str(total) if total else '...'
 
     i = -1
@@ -1361,6 +1370,7 @@ def run_tile_scan(hw: ScopeHW,
         hw.move_xy(x, y)
         base_z = surface.z_at(x, y) if surface is not None else None
         used_positions.append((x, y))
+        used_indices.append(i)
         for ch in enabled:
             if cancel.is_set():
                 break
@@ -1388,18 +1398,44 @@ def run_tile_scan(hw: ScopeHW,
                     pass
     hw.leds_off()
 
+    # The record that lets this folder be stitched again (by Quark, or by
+    # quark_stitch.py from the command line), whether or not it is stitched now.
+    quark_note = ''
+    try:
+        import quark_stitch
+        quark_stitch.write_tile_scan_record(
+            out_dir, [(i, x, y) for i, (x, y) in zip(used_indices, used_positions)],
+            um_per_px, enabled)
+    except Exception as e:
+        quark_stitch = None
+        quark_note = f' (no tile_scan.json: {e})'
+
     stitched_paths: dict[str, str] = {}
     if stitch:
+        mosaics: dict[str, np.ndarray] = {}
+        if quark_stitch is not None and len(used_positions) >= 2:
+            if quark_stitch.available():
+                try:
+                    mosaics, infos = quark_stitch.stitch_tile_scan(
+                        out_dir, enabled, status_cb=_status)
+                    said = [quark_stitch.describe(infos[ch]) for ch in enabled if ch in infos]
+                    quark_note = ' | ' + ' | '.join(said) if said else ''
+                except Exception as e:
+                    mosaics = {}
+                    quark_note = f' | Quark stitching failed, plain stitch used: {e}'
+            else:
+                quark_note = ' | plain stitch (Quark stitching not installed)'
         for ch in enabled:
             tiles = collected[ch]
-            if len(tiles) == len(used_positions) and tiles:
+            mosaic = mosaics.get(ch)
+            if mosaic is None and len(tiles) == len(used_positions) and tiles:
                 _status(f'Stitching {ch} ({len(tiles)} tiles)...')
                 mosaic = stitch_tiles(tiles, used_positions, um_per_px)
-                if mosaic is not None:
-                    p = os.path.join(out_dir, f'stitched_{ch}.tiff')
-                    save_image(p, mosaic)
-                    stitched_paths[ch] = p
-    _status(f'Tile scan finished ({len(used_positions)} tiles) -> {out_dir}')
+            if mosaic is not None:
+                p = os.path.join(out_dir, f'stitched_{ch}.tiff')
+                save_image(p, mosaic)
+                stitched_paths[ch] = p
+    _status(f'Tile scan finished ({len(used_positions)} tiles) -> {out_dir}{quark_note}')
     return stitched_paths
 
 

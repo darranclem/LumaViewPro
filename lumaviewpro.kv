@@ -580,6 +580,16 @@ LumaViewProMainLayout:
                                 text: 'STOP scan' if app.worker_busy else 'Spiral scan'
                                 background_color: RED if app.worker_busy else ACCENT
                                 on_press: app.toggle_tile_scan('spiral')
+                        PanelLabel:
+                            text: 'Stitch + shading correction (Quark): folder'
+                        SmallInput:
+                            id: quark_folder_input
+                            text: app.quark_folder
+                            on_text_validate: app.quark_stitch_folder(self.text)
+                        FieldRow:
+                            FlatButton:
+                                text: 'Stitch folder'
+                                on_press: app.quark_stitch_folder(quark_folder_input.text)
 
                     Collapsible:
                         title: 'PROTOCOL / TIMELAPSE'

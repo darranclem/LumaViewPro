@@ -189,6 +189,8 @@ class LumaViewProApp(App):
     stage_z_um = NumericProperty(0.0)
     af_each_cycle_on = BooleanProperty(True)
     output_dir = StringProperty(CAPTURES_DIR)
+    # The folder "Stitch folder" works on: the last tile scan, or one typed in.
+    quark_folder = StringProperty('')
     positions_info = StringProperty('No positions defined')
     pos_review_active = BooleanProperty(False)
     pos_review_label = StringProperty('')
@@ -2092,6 +2094,7 @@ class LumaViewProApp(App):
                                                 rows, cols, overlap_pct=overlap)
             total = len(positions)
         out_dir = acq.timestamp_dir(self._out_base(), f'tiles_{pattern}')
+        self.quark_folder = out_dir
         use_surface = self.use_surface_on and self.surface.current_z is not None
         self._mosaic_reset()
         def _job():
@@ -2105,6 +2108,35 @@ class LumaViewProApp(App):
                               on_tile=self._mosaic_add)
             Clock.schedule_once(lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
         self._bg(_job, busy_job=True)
+
+    # ------------------------------------------- stitching with Quark
+
+    def quark_stitch_folder(self, text: str = ''):
+        """Stitch a finished tile scan or plate folder with Quark's stitching
+        and shading correction (see quark_stitch.py): one OME-TIFF per well
+        into ``<folder>/quark``. Touches no hardware; runs off the UI thread.
+        The tiles themselves are never changed."""
+        import quark_stitch
+        folder = (text or '').strip().strip('"') or self.quark_folder
+        if not folder:
+            self._set_status('Stitch folder: type a tile scan or plate folder, or run a tile scan first')
+            return
+        if not os.path.isdir(folder):
+            self._set_status(f'Stitch folder: {folder} is not a folder')
+            return
+        if not quark_stitch.available():
+            self._set_status(quark_stitch.why_unavailable())
+            return
+        self.quark_folder = folder
+
+        def _job():
+            try:
+                written = quark_stitch.export_folder(folder, status_cb=self._set_status)
+                self._set_status(f'Quark: {len(written)} stitched file(s) written to '
+                                 f'{os.path.join(folder, "quark")}')
+            except Exception as e:
+                self._set_status(f'Quark stitching failed: {e}')
+        self._bg(_job)
 
     # ---------------------------------------------- live mosaic preview
 
