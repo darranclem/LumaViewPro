@@ -44,6 +44,8 @@ try:
 except Exception:                                   # pragma: no cover
     tifffile = None
 
+# The OME unit for micrometres (the source stays ASCII).
+_UM = chr(0xB5) + 'm'
 FORMATS = ('ome-tiff', 'zarr')
 EXTENSION = {'ome-tiff': '.ome.tiff', 'zarr': '.zarr'}
 VERSION = 1
@@ -233,15 +235,15 @@ class WellWriter:
             xy = self.tile_xy.get(tile)
             # Always named (the tile's name is how a reader tells tiles
             # apart); the position only when the stage position is known.
-            where = (f' X="{xy[0]:.3f}" XUnit="µm" Y="{xy[1]:.3f}" YUnit="µm"'
+            where = (f' X="{xy[0]:.3f}" XUnit="{_UM}" Y="{xy[1]:.3f}" YUnit="{_UM}"'
                      if xy is not None else '')
             out.append(f'<StageLabel Name={quoteattr(tile)}{where}/>')
             phys = ''
             if self.um_per_px > 0:
-                phys += (f' PhysicalSizeX="{self.um_per_px:.6g}" PhysicalSizeXUnit="µm"'
-                         f' PhysicalSizeY="{self.um_per_px:.6g}" PhysicalSizeYUnit="µm"')
+                phys += (f' PhysicalSizeX="{self.um_per_px:.6g}" PhysicalSizeXUnit="{_UM}"'
+                         f' PhysicalSizeY="{self.um_per_px:.6g}" PhysicalSizeYUnit="{_UM}"')
             if self.z_step_um > 0 and n_z > 1:
-                phys += f' PhysicalSizeZ="{self.z_step_um:.6g}" PhysicalSizeZUnit="µm"'
+                phys += f' PhysicalSizeZ="{self.z_step_um:.6g}" PhysicalSizeZUnit="{_UM}"'
             out.append(f'<Pixels ID="Pixels:{ti}" DimensionOrder="XYZCT" Type="{ptype}" '
                        f'SignificantBits="{bits}" BigEndian="false" Interleaved="false" '
                        f'SizeX="{w}" SizeY="{h}" SizeZ="{n_z}" SizeC="{n_c}" SizeT="{n_t}"{phys}>')
@@ -265,10 +267,10 @@ class WellWriter:
                 if 'exposure_ms' in p:
                     extra += f' ExposureTime="{p["exposure_ms"]:.4g}" ExposureTimeUnit="ms"'
                 if 'x_um' in p and 'y_um' in p:
-                    extra += (f' PositionX="{p["x_um"]:.3f}" PositionXUnit="µm"'
-                              f' PositionY="{p["y_um"]:.3f}" PositionYUnit="µm"')
+                    extra += (f' PositionX="{p["x_um"]:.3f}" PositionXUnit="{_UM}"'
+                              f' PositionY="{p["y_um"]:.3f}" PositionYUnit="{_UM}"')
                 if 'z_um' in p:
-                    extra += f' PositionZ="{p["z_um"]:.3f}" PositionZUnit="µm"'
+                    extra += f' PositionZ="{p["z_um"]:.3f}" PositionZUnit="{_UM}"'
                 out.append(f'<Plane TheC="{ci}" TheZ="{p["z"]}" TheT="{p["t"]}"{extra}/>')
             out.append('</Pixels></Image>')
         note = dict(self.info)
