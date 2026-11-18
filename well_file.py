@@ -23,7 +23,7 @@ before ``close()``, ``<file>.index.json`` (appended after every frame)
 still says what every page is.
 
 OME-Zarr (v2 arrays, NGFF 0.4 metadata): ``<well>.zarr/<tile>/0`` is the
-tile's ``t, c, z, y, x`` array, one chunk per plane, zlib-compressed; the
+tile's ``t, c, z, y, x`` array, one chunk per plane, gzip-compressed; the
 store's root lists the tiles as the fields of a well.
 
 No hardware and no UI in here. Needs ``numpy``; OME-TIFF needs ``tifffile``.
@@ -34,7 +34,7 @@ from __future__ import annotations
 import json
 import os
 import re
-import zlib
+import gzip
 from xml.sax.saxutils import quoteattr
 
 import numpy as np
@@ -164,7 +164,7 @@ class WellWriter:
             data = np.ascontiguousarray(frame).astype(
                 frame.dtype.newbyteorder('<'), copy=False).tobytes()
             with open(os.path.join(chunk, '0'), 'wb') as f:
-                f.write(zlib.compress(data, 1))
+                f.write(gzip.compress(data, 1, mtime=0))
             rec['tile_index'] = ti
         self.planes.append(rec)
 
@@ -334,7 +334,7 @@ class WellWriter:
             put(os.path.join(group, '0', '.zarray'), {
                 'zarr_format': 2, 'shape': [n_t, n_c, n_z, h, w],
                 'chunks': [1, 1, 1, h, w], 'dtype': dtype, 'order': 'C',
-                'compressor': {'id': 'zlib', 'level': 1}, 'fill_value': 0,
+                'compressor': {'id': 'gzip', 'level': 1}, 'fill_value': 0,
                 'filters': None, 'dimension_separator': '/'})
 
 
@@ -368,7 +368,7 @@ def read_well(path: str) -> dict:
                         chunk = os.path.join(path, tile, '0', str(t), str(c), str(z), '0', '0')
                         if os.path.exists(chunk):
                             with open(chunk, 'rb') as f:
-                                arr[t, c, z] = np.frombuffer(zlib.decompress(f.read()), arr.dtype).reshape(h, w)
+                                arr[t, c, z] = np.frombuffer(gzip.decompress(f.read()), arr.dtype).reshape(h, w)
             out['tiles'][tile] = arr
         return out
     if tifffile is None:
