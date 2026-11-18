@@ -8,7 +8,7 @@ installs it on every PC; one file works with 64-bit Windows Python 3.9 and later
 binary of Quark, which is proprietary (c) its owner: it is here to be used with this application,
 not as open source, and the licence of this repository's Python code does not extend to it.
 
-The file here was built from Quark build 2026-11-18a. It provides: reading plate and tile-scan
+The file here was built from Quark build 2026-11-18c. It provides: reading plate and tile-scan
 folders (this fork's and stock LumaViewPro protocol runs), stitching, flat-field correction
 measured from a folder's own tiles, and `flatten_field` (a meniscus bright spot, rings, a lamp hot
 spot and well-wall shadow divided out of one transmitted-light field, measured from that field).
