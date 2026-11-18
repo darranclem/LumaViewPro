@@ -227,3 +227,30 @@ def test_a_folders_tiles_are_written_shading_corrected_beside_the_originals(tmp_
     assert quark_stitch.scan(target)['wells'][0]['tiles'] == 9
     # A second run does not take its own output for tiles.
     assert quark_stitch.correct_folder(out)['channels']['BF']['corrected'] == 9
+
+def test_a_meniscus_spot_is_divided_out_of_each_field_and_the_folder_copy_is_written(tmp_path):
+    """Each transmitted-light field is corrected from itself; fluorescence files are left out."""
+    import tifffile
+    rng = np.random.default_rng(3)
+    yy, xx = np.mgrid[0:480, 0:640].astype(np.float32)
+    r = np.hypot(xx - 280, yy - 260) / 640
+    light = (1 + 0.6 * np.exp(-r ** 2 / (2 * 0.05 ** 2)) + 0.2 * np.exp(-(r - 0.3) ** 2 / (2 * 0.03 ** 2)))
+    field = (1200 * light * rng.uniform(0.9, 1.1, light.shape)).astype(np.uint16)
+    fixed, info = quark_stitch.flatten_field(field)
+    assert fixed.shape == field.shape and fixed.dtype == np.uint16 and fixed.max() <= 4095
+    assert info['spread_before'] > 0.15 and info['spread_after'] < 0.05, info
+    spot, plain = fixed[250:270, 270:290].mean(), fixed[40:60, 560:580].mean()
+    assert abs(spot / plain - 1) < 0.05
+    assert quark_stitch.is_transmitted_name('custom0002_BF_0000.tiff')
+    assert not quark_stitch.is_transmitted_name('custom0003_Green_0000.tiff')
+    assert not quark_stitch.is_transmitted_name('A1_APC_0001.tiff')
+    src = tmp_path / 'run'
+    src.mkdir()
+    tifffile.imwrite(src / 'custom0002_BF_0000.tiff', field)
+    tifffile.imwrite(src / 'custom0003_Green_0000.tiff', field)
+    record = quark_stitch.flatten_folder(str(src))
+    assert list(record['corrected']) == ['custom0002_BF_0000.tiff'] and not record['skipped']
+    out = tifffile.imread(os.path.join(record['out_dir'], 'custom0002_BF_0000.tiff'))
+    assert np.array_equal(out, fixed)
+    assert np.array_equal(tifffile.imread(src / 'custom0002_BF_0000.tiff'), field), 'the original is untouched'
+    assert os.path.exists(os.path.join(record['out_dir'], 'flatten.json'))

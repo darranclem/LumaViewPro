@@ -53,6 +53,7 @@ import numpy as np
 
 TILE_SCAN_SIDECAR = 'tile_scan.json'
 SHADING_OUT = 'shading_corrected'
+FLATTEN_OUT = 'field_flattened'
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _MODULE_DIR = os.path.join(_HERE, 'lib', 'quark')
 _module = None
@@ -299,6 +300,72 @@ def correct_folder(folder: str, out_dir: str | None = None, channels: list[str] 
     return record
 
 
+def flatten_field(image: np.ndarray):
+    """One transmitted-light field (2-D uint8/uint16) with its own illumination divided out:
+    the bright spot and rings a meniscus puts in a low-magnification field, a lamp's hot spot
+    and the well wall's shadow, measured from this field alone. Returns ``(corrected, info)``;
+    ``info`` has the spread of brightness before and after (``spread_before``/``spread_after``)
+    and the share of the field too dim to correct fully. For transmitted light only (it
+    divides)."""
+    mod = _need()
+    if image.ndim != 2 or image.dtype not in (np.uint8, np.uint16):
+        raise ValueError('flatten_field needs one 2-D uint8 or uint16 field')
+    h, w = image.shape
+    raw, info = mod.flatten_field(np.ascontiguousarray(image, dtype='<u2').tobytes(), w, h)
+    fixed = np.frombuffer(raw, dtype='<u2').reshape(h, w).copy()
+    if image.dtype == np.uint8:
+        fixed = np.clip(fixed, 0, 255).astype(np.uint8)
+    return fixed, json.loads(info)
+
+
+_TRANSMITTED = re.compile(r'(?<![A-Za-z])(BF|PC|DF|DIC|Brightfield|Phase)(?![A-Za-z])', re.IGNORECASE)
+
+
+def is_transmitted_name(name: str) -> bool:
+    """Whether a file or channel name says transmitted light (BF, PC, DF, DIC, brightfield,
+    phase) as a word of its own: "APC" and "PCNA" are not."""
+    return bool(_TRANSMITTED.search(name.replace('_', ' ')))
+
+
+def flatten_folder(folder: str, out_dir: str | None = None, all_channels: bool = False,
+                   status_cb=None) -> dict:
+    """Write a copy of every transmitted-light image of a folder (and its sub-folders) with
+    its own illumination divided out (``flatten_field``) to ``<folder>/field_flattened``, same
+    names and sub-folders, with ``flatten.json`` saying what was done to each. The originals
+    are never changed. Images whose name does not say transmitted light are left out unless
+    ``all_channels``. Works on stock LumaViewPro runs and on this fork's folders alike."""
+    import tifffile
+    folder = os.fspath(folder)
+    out_dir = out_dir or os.path.join(folder, FLATTEN_OUT)
+    record = {'format': 'lvp-flatten-1', 'source': folder, 'corrected': {}, 'skipped': []}
+    files = []
+    for base, dirs, names in os.walk(folder):
+        dirs[:] = [d for d in dirs if d not in (FLATTEN_OUT, SHADING_OUT, 'quark')]
+        files += [os.path.join(base, n) for n in sorted(names) if n.lower().endswith(('.tif', '.tiff'))]
+    files = [f for f in files if all_channels or is_transmitted_name(os.path.basename(f))]
+    os.makedirs(out_dir, exist_ok=True)
+    for k, path in enumerate(files):
+        rel = os.path.relpath(path, folder)
+        if status_cb and k % 10 == 0:
+            status_cb(f'Flattening fields: {k + 1} of {len(files)}')
+        try:
+            fixed, info = flatten_field(tifffile.imread(path))
+        except Exception as e:
+            record['skipped'].append({'file': rel, 'why': str(e)})
+            continue
+        target = os.path.join(out_dir, rel)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        tifffile.imwrite(target, fixed)
+        record['corrected'][rel] = info
+    for name in ('experiment.json', TILE_SCAN_SIDECAR):
+        if os.path.exists(os.path.join(folder, name)):
+            shutil.copyfile(os.path.join(folder, name), os.path.join(out_dir, name))
+    with open(os.path.join(out_dir, 'flatten.json'), 'w', encoding='utf-8') as f:
+        json.dump(record, f, indent=1)
+    record['out_dir'] = out_dir
+    return record
+
+
 def write_tile_scan_record(out_dir: str, positions, um_per_px: float,
                            channels: list[str], pattern: str = '',
                            shading_applied: bool = False) -> str:
@@ -373,10 +440,18 @@ def _main(argv: list[str]) -> int:
     p.add_argument('--no-register', action='store_true')
     p.add_argument('--correct', action='store_true',
                    help='write shading-corrected tiles to <folder>/shading_corrected instead of stitching')
+    p.add_argument('--flatten', action='store_true',
+                   help='write each transmitted-light field with its own illumination (meniscus spot, '
+                        'rings, lamp hot spot) divided out to <folder>/field_flattened')
     a = p.parse_args(argv)
     if not available():
         print(why_unavailable())
         return 2
+    if a.flatten:
+        record = flatten_folder(a.folder, a.out, status_cb=print)
+        print(f"{len(record['corrected'])} fields flattened, {len(record['skipped'])} skipped")
+        print(record['out_dir'])
+        return 0
     if a.correct:
         record = correct_folder(a.folder, a.out, status_cb=print)
         for ch, entry in record['channels'].items():

@@ -2218,6 +2218,33 @@ class LumaViewProApp(App):
                 self._set_status(f'Shading correction of the folder failed: {e}')
         self._bg(_job)
 
+    def quark_flatten_folder(self, text: str = ''):
+        """Write a copy of every transmitted-light image of a folder with its own illumination
+        (meniscus bright spot and rings, lamp hot spot, well-wall shadow) divided out to
+        ``<folder>/field_flattened`` (Quark; each field is measured from itself, the originals
+        are never changed). Touches no hardware."""
+        import quark_stitch
+        folder = self._quark_folder_for(text, 'Flatten fields')
+        if folder is None:
+            return
+
+        def _job():
+            try:
+                record = quark_stitch.flatten_folder(folder, status_cb=self._set_status)
+                done = list(record['corrected'].values())
+                if not done:
+                    self._set_status('No transmitted-light images (BF, PC, ...) were found in '
+                                     f"{folder}; {len(record['skipped'])} skipped")
+                    return
+                before = sorted(i['spread_before'] for i in done)[len(done) // 2]
+                after = sorted(i['spread_after'] for i in done)[len(done) // 2]
+                self._set_status(f"{len(done)} fields flattened to {record['out_dir']} | brightness "
+                                 f'spread over the field {before * 100:.0f} % -> {after * 100:.1f} % '
+                                 f"(typical){', ' + str(len(record['skipped'])) + ' skipped' if record['skipped'] else ''}")
+            except Exception as e:
+                self._set_status(f'Flattening the folder failed: {e}')
+        self._bg(_job)
+
     # ---------------------------------------------- live mosaic preview
 
     def _mosaic_reset(self):

@@ -595,6 +595,10 @@ LumaViewProMainLayout:
                                 on_press: app.quark_correct_folder(quark_folder_input.text)
                         FieldRow:
                             FlatButton:
+                                text: 'Flatten fields (meniscus, hot spot)'
+                                on_press: app.quark_flatten_folder(quark_folder_input.text)
+                        FieldRow:
+                            FlatButton:
                                 text: 'Shading from folder -> live view + captures'
                                 on_press: app.quark_measure_shading(quark_folder_input.text)
 

@@ -63,5 +63,3 @@ data/custom_labware.json
 data/af_template.npy
 data/protocols/_autosave.json
 
-# Quark stitching module: a compiled file, installed per PC (see lib/quark/README.md)
-lib/quark/*.pyd
