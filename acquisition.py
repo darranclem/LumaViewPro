@@ -1628,41 +1628,55 @@ def run_z_planes(hw: ScopeHW,
                  cancel: threading.Event,
                  status_cb=None,
                  settle_s: float = 0.1,
-                 return_z_um: float | None = None) -> None:
-    """Acquire each channel at exactly the given Z planes, in the order
-    given (a stack set by its begin and end). The planes are absolute:
-    no chromatic offset is added. Z returns to ``return_z_um`` at the
-    end (default: the first plane)."""
+                 return_z_um: float | None = None,
+                 order: str = 'slice') -> int:
+    """Acquire the channels at exactly the given Z planes, in the order
+    given (a stack set by its begin and end, or a centre and a range).
+
+    ``order`` 'slice': every channel at one plane, then the next plane
+    (one Z move per plane, the channels of a plane taken together).
+    'channel': the whole stack in one channel, then the same stack in
+    the next. The planes are absolute: no chromatic offset is added. Z
+    returns to ``return_z_um`` at the end (default: the first plane).
+    Returns the number of images saved."""
     def _status(msg):
         if status_cb:
             status_cb(msg)
 
     zs = [max(float(z), 0.0) for z in planes_um]
-    if not zs:
-        return
-    for ch in channels:
+    chans = [ch for ch in channels if channel_settings.get(ch) is not None]
+    if not zs or not chans:
+        return 0
+    if order == 'channel':
+        shots = [(ch, j) for ch in chans for j in range(len(zs))]
+    else:
+        shots = [(ch, j) for j in range(len(zs)) for ch in chans]
+    saved = 0
+    at_ch = at_j = None
+    for ch, j in shots:
         if cancel.is_set():
             break
-        cs = channel_settings.get(ch)
-        if cs is None:
-            continue
-        hw.set_channel(ch, cs)
-        _status(f'Z-stack {ch}: {len(zs)} slices '
-                f'({zs[0]:.1f} to {zs[-1]:.1f} um)')
-        for j, z in enumerate(zs):
-            if cancel.is_set():
-                break
+        z = zs[j]
+        if j != at_j:
             hw.move_z(z)
-            frame = hw.grab_settled(settle_s=settle_s)
-            if frame is None:
-                continue
-            if shading is not None and shading.enabled:
-                frame = shading.apply(frame, ch, z)
-            save_image(os.path.join(out_dir, f'zstack_{ch}_{j:03d}_'
-                                             f'{z:.1f}um.tiff'), frame)
+            at_j = j
+        if ch != at_ch:
+            hw.set_channel(ch, channel_settings[ch])
+            at_ch = ch
+        _status(f'Z-stack plane {j + 1}/{len(zs)} ({z:.1f} um) {ch}')
+        frame = hw.grab_settled(settle_s=settle_s)
+        if frame is None:
+            continue
+        if shading is not None and shading.enabled:
+            frame = shading.apply(frame, ch, z)
+        save_image(os.path.join(out_dir, f'zstack_{ch}_{j:03d}_'
+                                         f'{z:.1f}um.tiff'), frame)
+        saved += 1
     hw.move_z(zs[0] if return_z_um is None else float(return_z_um))
     hw.leds_off()
-    _status(f'Z-stack finished -> {out_dir}')
+    _status(f'Z-stack {"STOPPED" if cancel.is_set() else "finished"}: '
+            f'{saved} images -> {out_dir}')
+    return saved
 
 
 def measure_image_shift(img_a: np.ndarray, img_b: np.ndarray,

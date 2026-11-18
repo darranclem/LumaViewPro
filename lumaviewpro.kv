@@ -414,6 +414,7 @@ LumaViewProMainLayout:
                             CheckBox:
                                 id: channel_enabled_chk
                                 active: False
+                                on_active: app.set_channel_enabled(self.active)
                                 size_hint_x: 0.25
                         FieldRow:
                             PanelLabel:
@@ -571,53 +572,23 @@ LumaViewProMainLayout:
                             text_size: self.width, None
 
                     Collapsible:
-                        title: 'Z-STACK (per channel)'
-                        FieldRow:
-                            PanelLabel:
-                                text: 'Stack this channel'
-                                size_hint_x: 0.75
-                            CheckBox:
-                                id: zstack_enabled_chk
-                                size_hint_x: 0.25
-                        FieldRow:
-                            PanelLabel:
-                                text: 'Range (um)'
-                                size_hint_x: 0.55
-                            SmallInput:
-                                id: zstack_range_input
-                                text: '50'
-                        FieldRow:
-                            PanelLabel:
-                                text: 'Interval (um)'
-                                size_hint_x: 0.55
-                            SmallInput:
-                                id: zstack_step_input
-                                text: '5'
-                                on_text: app.zman_refresh()
+                        title: 'Z-STACK'
                         PanelLabel:
-                            text: 'Interval from the lens (optical section):'
+                            text: '1. Set the stack by'
                         FieldRow:
                             FlatButton:
-                                text: 'Optimise 1x'
-                                on_press: app.zman_optimise(1.0)
+                                text: 'Begin and end'
+                                background_color: ACCENT if app.zman_mode == 'ends' else PANEL2
+                                on_press: app.set_zman_mode('ends')
                             FlatButton:
-                                text: 'Nyquist 2.3x'
-                                on_press: app.zman_optimise(2.3)
-                        PanelLabel:
-                            text: 'Centered on the focus (range above):'
+                                text: 'Centre, + and -'
+                                background_color: ACCENT if app.zman_mode == 'centre' else PANEL2
+                                on_press: app.set_zman_mode('centre')
                         FieldRow:
-                            FlatButton:
-                                text: 'Stack marked'
-                                on_press: app.run_zstack(all_channels=False)
-                            FlatButton:
-                                text: 'Stack all'
-                                on_press: app.run_zstack(all_channels=True)
-                        PanelLabel:
-                            text: 'From a begin to an end (focus to each, press "= here"):'
-                        FieldRow:
+                            disabled: app.zman_mode != 'ends'
                             PanelLabel:
-                                text: 'Begin'
-                                size_hint_x: 0.5
+                                text: 'Begin (um)'
+                                size_hint_x: 0.8
                             SmallInput:
                                 id: zman_begin_input
                                 text: ''
@@ -630,9 +601,10 @@ LumaViewProMainLayout:
                                 size_hint_x: 0.5
                                 on_press: app.zman_goto('begin')
                         FieldRow:
+                            disabled: app.zman_mode != 'ends'
                             PanelLabel:
-                                text: 'End'
-                                size_hint_x: 0.5
+                                text: 'End (um)'
+                                size_hint_x: 0.8
                             SmallInput:
                                 id: zman_end_input
                                 text: ''
@@ -644,20 +616,123 @@ LumaViewProMainLayout:
                                 text: 'Go'
                                 size_hint_x: 0.5
                                 on_press: app.zman_goto('end')
+                        FieldRow:
+                            disabled: app.zman_mode != 'centre'
+                            PanelLabel:
+                                text: 'Centre (um)'
+                                size_hint_x: 0.8
+                            SmallInput:
+                                id: zman_centre_input
+                                text: ''
+                                on_text: app.zman_refresh()
+                            FlatButton:
+                                text: '= here'
+                                on_press: app.zman_set('centre')
+                            FlatButton:
+                                text: 'Go'
+                                size_hint_x: 0.5
+                                on_press: app.zman_goto('centre')
+                        FieldRow:
+                            disabled: app.zman_mode != 'centre'
+                            PanelLabel:
+                                text: '+ above (um)'
+                            SmallInput:
+                                id: zman_plus_input
+                                text: '25'
+                                on_text: app.zman_refresh()
+                            PanelLabel:
+                                text: '- below (um)'
+                            SmallInput:
+                                id: zman_minus_input
+                                text: '25'
+                                on_text: app.zman_refresh()
+                        PanelLabel:
+                            text: '2. Interval'
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Interval (um)'
+                                size_hint_x: 0.55
+                            SmallInput:
+                                id: zman_step_input
+                                text: app.zman_step_text
+                                on_text: app.zman_step_text = self.text; app.zman_refresh()
+                                on_text_validate: app._persist()
+                        FieldRow:
+                            FlatButton:
+                                text: 'From the lens 1x'
+                                on_press: app.zman_optimise(1.0)
+                            FlatButton:
+                                text: 'Nyquist 2.3x'
+                                on_press: app.zman_optimise(2.3)
+                        PanelLabel:
+                            text: '3. Order, with more than one colour'
+                        FieldRow:
+                            FlatButton:
+                                text: 'Slice by slice'
+                                background_color: ACCENT if app.zman_order == 'slice' else PANEL2
+                                on_press: app.set_zman_order('slice')
+                            FlatButton:
+                                text: 'Colour by colour'
+                                background_color: ACCENT if app.zman_order == 'channel' else PANEL2
+                                on_press: app.set_zman_order('channel')
+                        WrapLabel:
+                            text: 'Every colour at one plane, then the next plane.' if app.zman_order == 'slice' else 'The whole stack in one colour, then the same stack in the next.'
+                        PanelLabel:
+                            text: '4. Save in (a dated folder for each stack)'
+                        SmallInput:
+                            id: zstack_dir_input
+                            text: app.zstack_dir
+                            hint_text: 'empty: the data directory'
+                            on_text_validate: app.set_zstack_dir(self.text)
+                        FieldRow:
+                            FlatButton:
+                                text: 'Browse...'
+                                on_press: app.browse_dir('zstack')
+                            FlatButton:
+                                text: 'Set'
+                                on_press: app.set_zstack_dir(zstack_dir_input.text)
+                            FlatButton:
+                                text: 'Open folder'
+                                on_press: app.open_zstack_dir()
                         WrapLabel:
                             text: app.zman_info
                             color: (0.3, 0.85, 1.0, 1)
+                        WrapLabel:
+                            text: app.zman_marked
                         FieldRow:
                             AccentButton:
-                                text: 'Stack begin to end'
-                                disabled: app.worker_busy
-                                on_press: app.run_zstack_between(all_channels=False)
+                                text: 'STOP' if app.worker_busy else 'Stack this colour'
+                                background_color: RED if app.worker_busy else ACCENT
+                                on_press: app.toggle_zstack(False)
                             AccentButton:
-                                text: 'All marked channels'
-                                disabled: app.worker_busy
-                                on_press: app.run_zstack_between(all_channels=True)
+                                text: 'STOP' if app.worker_busy else 'Stack marked colours'
+                                background_color: RED if app.worker_busy else ACCENT
+                                on_press: app.toggle_zstack(True)
+                        PanelLabel:
+                            text: 'In protocols (the colour selected above):'
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Stack this colour in protocols'
+                                size_hint_x: 0.75
+                            CheckBox:
+                                id: zstack_enabled_chk
+                                size_hint_x: 0.25
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Range about the focus (um)'
+                                size_hint_x: 0.7
+                            SmallInput:
+                                id: zstack_range_input
+                                text: '50'
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Interval in protocols (um)'
+                                size_hint_x: 0.7
+                            SmallInput:
+                                id: zstack_step_input
+                                text: '5'
                         FlatButton:
-                            text: 'Use this span and interval in protocols'
+                            text: 'Use the span and interval above in protocols'
                             on_press: app.zman_to_range()
 
                     Collapsible:

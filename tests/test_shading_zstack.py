@@ -225,3 +225,98 @@ def test_an_empty_field_passes_and_labware_left_in_is_flagged(shading):
 
     assert _capture(shading, _WithSample())
     assert shading.last_structure > shading.STRUCTURE_WARN
+
+
+# ------------------------------------------- live z-stack: order of work
+
+class _StackScope:
+    """Records what a z-stack asks of the microscope."""
+
+    def __init__(self):
+        self.log = []
+        self.z = None
+        self.ch = None
+
+    def move_z(self, z, **_):
+        self.z = z
+        self.log.append(('z', z))
+
+    def set_channel(self, ch, cs):
+        self.ch = ch
+        self.log.append(('ch', ch))
+
+    def grab_settled(self, settle_s=0.1):
+        self.log.append(('grab', self.ch, self.z))
+        return np.zeros((4, 4), np.uint16)
+
+    def leds_off(self):
+        self.log.append(('off',))
+
+
+def _run_planes(tmp_path, order, channels=('BF', 'Green'), cancel_after=None):
+    import threading
+    scope = _StackScope()
+    cancel = threading.Event()
+    settings = {ch: acq.ChannelSettings() for ch in ('BF', 'Green', 'Red')}
+    seen = []
+
+    def status(msg):
+        seen.append(msg)
+        if cancel_after is not None and len(seen) >= cancel_after:
+            cancel.set()
+    saved = acq.run_z_planes(scope, settings, list(channels),
+                             [100.0, 110.0, 120.0], None, str(tmp_path),
+                             cancel, status_cb=status, return_z_um=105.0,
+                             order=order)
+    grabs = [(e[1], e[2]) for e in scope.log if e[0] == 'grab']
+    return scope, grabs, saved
+
+
+def test_stack_slice_by_slice_takes_every_colour_at_a_plane(tmp_path):
+    scope, grabs, saved = _run_planes(tmp_path, 'slice')
+    assert grabs == [('BF', 100.0), ('Green', 100.0), ('BF', 110.0),
+                     ('Green', 110.0), ('BF', 120.0), ('Green', 120.0)]
+    assert saved == 6
+    # one Z move per plane, then back to where it started
+    assert [e[1] for e in scope.log if e[0] == 'z'] == \
+        [100.0, 110.0, 120.0, 105.0]
+    assert scope.log[-1] == ('off',)
+
+
+def test_stack_colour_by_colour_finishes_one_colour_first(tmp_path):
+    scope, grabs, saved = _run_planes(tmp_path, 'channel')
+    assert grabs == [('BF', 100.0), ('BF', 110.0), ('BF', 120.0),
+                     ('Green', 100.0), ('Green', 110.0), ('Green', 120.0)]
+    assert [e[1] for e in scope.log if e[0] == 'ch'] == ['BF', 'Green']
+    assert saved == 6
+
+
+def test_stack_default_order_is_slice_by_slice(tmp_path):
+    import inspect
+    assert inspect.signature(acq.run_z_planes).parameters['order'].default \
+        == 'slice'
+
+
+def test_stack_images_only_the_colours_asked_for(tmp_path):
+    import os
+    _, grabs, saved = _run_planes(tmp_path, 'slice', channels=('Green',))
+    assert {ch for ch, _ in grabs} == {'Green'}
+    names = sorted(os.listdir(tmp_path))
+    assert saved == 3 and len(names) == 3
+    assert all(n.startswith('zstack_Green_') for n in names)
+
+
+def test_stack_file_names_are_the_same_in_either_order(tmp_path):
+    import os
+    a, b = tmp_path / 'a', tmp_path / 'b'
+    a.mkdir(), b.mkdir()
+    _run_planes(a, 'slice')
+    _run_planes(b, 'channel')
+    assert sorted(os.listdir(a)) == sorted(os.listdir(b))
+    assert 'zstack_BF_000_100.0um.tiff' in os.listdir(a)
+
+
+def test_stack_stopped_part_way_still_returns_and_switches_off(tmp_path):
+    scope, grabs, saved = _run_planes(tmp_path, 'slice', cancel_after=2)
+    assert saved == 2 and len(grabs) == 2
+    assert scope.log[-2:] == [('z', 105.0), ('off',)]

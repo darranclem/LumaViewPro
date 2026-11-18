@@ -247,6 +247,11 @@ class LumaViewProApp(ExperimentWizardMixin, App):
     map_big = BooleanProperty(False)      # plate map fills the image area
     pos_edit_mode = StringProperty('')    # map clicks: '', 'move' or 'add'
     zman_info = StringProperty('')        # manual z-stack: what will be run
+    zman_mode = StringProperty('ends')    # set by 'ends' or 'centre' +/-
+    zman_order = StringProperty('slice')  # 'slice' by slice, or by 'channel'
+    zman_step_text = StringProperty('5')  # its interval: one for all colours
+    zman_marked = StringProperty('')      # colours ticked "Use in protocol"
+    zstack_dir = StringProperty('')       # live z-stacks; '' = data folder
     lens_pos_info = StringProperty('')    # work position of the lens in use
     work_at_start_on = BooleanProperty(True)   # raise to it after homing
     map_flip_x = BooleanProperty(True)    # plate map drawn left-right mirrored
@@ -1510,6 +1515,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             af_chk.active = (self.selected_channel == self.af_channel)
             self._af_chk_sync = False
         self._sync_channel_sliders()
+        self.zman_refresh()   # marked colours, optical section of this one
 
     @staticmethod
     def _f(widget_text, fallback):
@@ -2030,7 +2036,9 @@ class LumaViewProApp(ExperimentWizardMixin, App):
     def browse_dir(self, which: str):
         """Pick the data ('output') or autosave ('protocol') folder in the
         Windows folder window."""
-        current = self.output_dir if which == 'output' else self.protocol_dir
+        current = {'output': self.output_dir,
+                   'zstack': self.zstack_dir or self.output_dir
+                   }.get(which, self.protocol_dir)
         try:
             import tkinter
             from tkinter import filedialog
@@ -2040,8 +2048,9 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             path = filedialog.askdirectory(
                 parent=root, mustexist=False,
                 initialdir=current if os.path.isdir(current) else None,
-                title='Folder for the image data' if which == 'output'
-                else 'Folder for autosaved and saved protocols')
+                title={'output': 'Folder for the image data',
+                       'zstack': 'Folder for z-stacks taken by hand'
+                       }.get(which, 'Folder for autosaved and saved protocols'))
             root.destroy()
         except Exception as e:
             self._set_status(f'Folder window not available ({e}): type the '
@@ -2052,6 +2061,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         path = os.path.normpath(path)
         if which == 'output':
             self.set_output_dir(path)
+        elif which == 'zstack':
+            self.set_zstack_dir(path)
         else:
             self.set_protocol_dir(path)
 
@@ -3457,62 +3468,70 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                 c.open = bool(sections[c.title])
         self._set_status(f'Layout "{name}" loaded')
 
-    def run_zstack(self, all_channels: bool = False):
-        if not (self.stage_connected and self.camera_connected):
-            self._set_status('Z-stack needs stage + camera')
-            return
-        if all_channels:
-            channels = [ch for ch in CHANNELS if self.channel_settings[ch].enabled]
-        else:
-            channels = [ch for ch in CHANNELS
-                        if self.channel_settings[ch].enabled
-                        and self.channel_settings[ch].zstack.enabled]
-        if not channels:
-            self._set_status('No channels enabled for z-stack')
-            return
-        center_z = None
-        if self.use_surface_on:
-            center_z = self.surface.z_at(self.stage_x_um, self.stage_y_um)
-        if center_z is None:
-            center_z = self.stage_z_um
-        out_dir = acq.timestamp_dir(self._out_base(), 'zstack')
-        def _job():
-            acq.run_z_stack(self.hw, self.channel_settings, channels,
-                            center_z, self.shading if self.shading_on else None,
-                            out_dir, self.worker.cancel,
-                            status_cb=self._set_status,
-                            use_channel_z_offsets=self.use_z_offsets_on)
-            Clock.schedule_once(lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
-        self._bg(_job, busy_job=True)
+    # --------------- live z-stack: begin / end, or a centre and a range
 
-    # ------------------------- manual z-stack: begin, end and interval
+    def set_channel_enabled(self, active: bool):
+        """'Use in protocol' takes effect when it is ticked (it used to
+        wait for the channel fields to be applied, and was lost when
+        another channel was selected first)."""
+        cs = self._cs()
+        if cs.enabled == bool(active):
+            return
+        cs.enabled = bool(active)
+        self._persist()
+        self.zman_refresh()
+        self._set_status(f'{self.selected_channel} '
+                         + ('marked' if cs.enabled else 'not marked')
+                         + ' for protocols and "Stack marked colours"')
+
+    def _marked_channels(self) -> list[str]:
+        return [ch for ch in CHANNELS if self.channel_settings[ch].enabled]
+
+    def _zman_num(self, widget_id: str) -> float | None:
+        try:
+            return float(self.root.ids[widget_id].text.strip())
+        except (ValueError, KeyError):
+            return None
 
     def _zman_fields(self) -> tuple[float | None, float | None, float]:
-        ids = self.root.ids
+        """(begin, end, interval) of the live z-stack, from whichever
+        pair of controls is in use. A centre and a range runs upwards,
+        from centre - below to centre + above."""
+        step = self._zman_num('zman_step_input')
+        step = abs(step) if step else 0.0
+        if self.zman_mode == 'centre':
+            centre = self._zman_num('zman_centre_input')
+            if centre is None:
+                return None, None, step
+            above = abs(self._zman_num('zman_plus_input') or 0.0)
+            below = abs(self._zman_num('zman_minus_input') or 0.0)
+            return (max(centre - below, 0.0),
+                    min(centre + above, self.Z_TRAVEL_UM), step)
+        return (self._zman_num('zman_begin_input'),
+                self._zman_num('zman_end_input'), step)
 
-        def num(widget_id):
-            text = ids[widget_id].text.strip()
-            try:
-                return float(text)
-            except ValueError:
-                return None
-        step = num('zstack_step_input')
-        return num('zman_begin_input'), num('zman_end_input'), \
-            abs(step) if step else 0.0
+    def set_zman_mode(self, mode: str):
+        """Set the stack by its two ends or by a centre and a range. The
+        other pair of fields shows the same stack, so switching keeps it."""
+        self.zman_mode = 'centre' if mode == 'centre' else 'ends'
+        self._persist()
+        self.zman_refresh()
+
+    def set_zman_order(self, order: str):
+        self.zman_order = 'channel' if order == 'channel' else 'slice'
+        self._persist()
+        self.zman_refresh()
 
     def zman_set(self, which: str):
-        """Take the present focus position as the begin or the end."""
-        ids = self.root.ids
-        ids['zman_begin_input' if which == 'begin'
-            else 'zman_end_input'].text = f'{self.stage_z_um:.1f}'
+        """Take the present focus position as the begin, end or centre."""
+        self.root.ids[f'zman_{which}_input'].text = f'{self.stage_z_um:.1f}'
         self.zman_refresh()
 
     def zman_goto(self, which: str):
-        begin, end, _ = self._zman_fields()
-        z = begin if which == 'begin' else end
+        z = self._zman_num(f'zman_{which}_input')
         if z is None or not self.stage_connected:
             return
-        self._bg(self.hw.move_z, max(float(z), 0.0))
+        self._bg(self.hw.move_z, min(max(z, 0.0), self.Z_TRAVEL_UM))
 
     def _lens_section(self, channels: list[str]) -> tuple[float, str, float]:
         """(optical section um, the channel it is for, NA) for this lens:
@@ -3530,26 +3549,56 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         the lens in use: 1 = one section per step, 2.3 = Nyquist."""
         section, ch, na = self._lens_section([self.selected_channel])
         step = experiment.stack_step_um(section, sampling)
-        self.root.ids.zstack_step_input.text = f'{step:.2f}'
-        self.apply_channel_fields()
+        self.zman_step_text = f'{step:.2f}'
+        self._persist()
         self.zman_refresh()
         self._set_status(
             f'Step {step:.2f} um: optical section {section:.2f} um for '
             f'{self.objective_name or "this lens"} (NA {na:g}, {ch}) at '
             f'{sampling:g}x sampling')
 
-    def zman_refresh(self, *_):
-        """Show what the begin / end / interval fields amount to."""
-        if not self.root or 'zman_begin_input' not in self.root.ids:
+    def _zman_mirror(self, begin: float | None, end: float | None):
+        """Show the stack in the pair of fields that is not in use."""
+        if begin is None or end is None:
             return
+        ids = self.root.ids
+        if self.zman_mode == 'centre':
+            shown = {'zman_begin_input': f'{begin:.1f}',
+                     'zman_end_input': f'{end:.1f}'}
+        else:
+            half = abs(end - begin) / 2.0
+            shown = {'zman_centre_input': f'{(begin + end) / 2.0:.1f}',
+                     'zman_plus_input': f'{half:g}',
+                     'zman_minus_input': f'{half:g}'}
+        self._zman_sync = True
+        try:
+            for widget_id, text in shown.items():
+                if ids[widget_id].text != text:
+                    ids[widget_id].text = text
+        finally:
+            self._zman_sync = False
+
+    def zman_refresh(self, *_):
+        """Show what the z-stack controls amount to."""
+        if getattr(self, '_zman_sync', False):
+            return
+        if not self.root or 'zman_centre_input' not in self.root.ids:
+            return
+        marked = self._marked_channels()
+        self.zman_marked = ('Marked colours: ' + ', '.join(marked) if marked
+                            else 'No colour is ticked "Use in protocol"')
         begin, end, step = self._zman_fields()
+        self._zman_mirror(begin, end)
         section, ch, na = self._lens_section([self.selected_channel])
         lens = (f'Optical section {section:.2f} um ({ch}, NA {na:g}, '
                 f'{self.objective_name or "no objective selected"}).')
         if begin is None or end is None:
-            self.zman_info = ('Focus to one end of the sample and press '
-                              '"Begin = here", then the other end and '
-                              '"End = here". ' + lens)
+            self.zman_info = (
+                ('Focus to the middle of the sample and press "= here" on '
+                 'Centre, then type how far above (+) and below (-) to go. '
+                 if self.zman_mode == 'centre' else
+                 'Focus to one end of the sample and press "= here" on '
+                 'Begin, then the other end and "= here" on End. ') + lens)
             return
         if step <= 0:
             self.zman_info = 'Type an interval, or press Optimise. ' + lens
@@ -3562,35 +3611,82 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             + (' The interval is wider than the optical section: planes '
                'are skipped.' if real > section * 1.05 else ''))
 
-    def run_zstack_between(self, all_channels: bool = False):
-        """Z-stack from Begin to End at the interval, here, for the
-        selected channel or for every channel marked for the protocol."""
+    # Where live z-stacks are saved: their own folder, kept per user.
+
+    def _zstack_base(self) -> str:
+        base = (self.zstack_dir or '').strip()
+        if base:
+            try:
+                os.makedirs(base, exist_ok=True)
+                if acq.dir_writable(base):
+                    return base
+            except Exception:
+                pass
+            self._set_status(f'CANNOT WRITE TO {base}: this stack goes to '
+                             f'the data directory instead')
+        return self._out_base()
+
+    def set_zstack_dir(self, text: str):
+        self.zstack_dir = text.strip()
+        self._persist()
+        if not self.zstack_dir:
+            self._set_status('Z-stacks are saved in the data directory: '
+                             f'{self.output_dir}')
+            return
+        self._set_status(f'Z-stack directory: {self.zstack_dir}'
+                         + self._dir_note(self.zstack_dir))
+
+    def open_zstack_dir(self):
+        try:
+            os.startfile(self._zstack_base())
+        except Exception as e:
+            self._set_status(f'Open folder failed: {e}')
+
+    def toggle_zstack(self, marked: bool = False):
+        """Click-on / click-off: start the stack, or stop the one running."""
+        if self.worker_busy:
+            self.cancel_job()
+            return
+        self.run_zstack_between(marked)
+
+    def run_zstack_between(self, marked: bool = False):
+        """Z-stack here over the planes shown, for the selected colour or
+        for exactly the colours ticked "Use in protocol"."""
         if not (self.stage_connected and self.camera_connected):
             self._set_status('Z-stack needs stage + camera')
             return
         begin, end, step = self._zman_fields()
         if begin is None or end is None:
-            self._set_status('Set the begin and the end of the stack first')
+            self._set_status('Set the centre of the stack first'
+                             if self.zman_mode == 'centre' else
+                             'Set the begin and the end of the stack first')
             return
         if step <= 0:
             self._set_status('Type an interval, or press Optimise')
             return
         self.apply_channel_fields()
-        channels = ([ch for ch in CHANNELS
-                     if self.channel_settings[ch].enabled]
-                    if all_channels else [self.selected_channel])
+        channels = (self._marked_channels() if marked
+                    else [self.selected_channel])
         if not channels:
-            self._set_status('No channels marked "Use in protocol"')
+            self._set_status('No colour is ticked "Use in protocol": tick '
+                             'the colours to stack, or use "Stack this '
+                             'colour"')
             return
         planes = experiment.stack_between(begin, end, step)
-        out_dir = acq.timestamp_dir(self._out_base(), 'zstack')
+        out_dir = acq.timestamp_dir(self._zstack_base(), 'zstack')
         back = self.stage_z_um
+        order = self.zman_order
+        said = (f'Z-stack: {len(planes)} planes x {", ".join(channels)}, '
+                + ('colour by colour' if order == 'channel'
+                   else 'slice by slice') + f' -> {out_dir}')
 
         def _job():
+            self._set_status(said)
             acq.run_z_planes(self.hw, self.channel_settings, channels,
                              planes, self.shading if self.shading_on else None,
                              out_dir, self.worker.cancel,
-                             status_cb=self._set_status, return_z_um=back)
+                             status_cb=self._set_status, return_z_um=back,
+                             order=order)
             Clock.schedule_once(lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
         self._bg(_job, busy_job=True)
 
@@ -3604,6 +3700,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             return
         ids = self.root.ids
         ids.zstack_range_input.text = f'{abs(end - begin):g}'
+        ids.zstack_step_input.text = f'{step:g}'
         ids.zstack_enabled_chk.active = True
         self.apply_channel_fields()
         self._set_status(
@@ -3995,6 +4092,10 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             'clip_overlay_on': self.clip_overlay_on,
             'shading_focus_z': self.shading_focus_z,
             'protocol_dir': self.protocol_dir,
+            'zstack_dir': self.zstack_dir,
+            'zman_mode': self.zman_mode,
+            'zman_order': self.zman_order,
+            'zman_step': self.zman_step_text,
             'map_flip_x': bool(self.map_flip_x),
             'lens_work_z': self.lens_work_z,
             'work_at_start_on': bool(self.work_at_start_on),
@@ -4029,6 +4130,16 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self.output_dir = d['output_dir']
         if isinstance(d.get('protocol_dir'), str) and d['protocol_dir'].strip():
             self.protocol_dir = d['protocol_dir']
+        if isinstance(d.get('zstack_dir'), str):
+            self.zstack_dir = d['zstack_dir'].strip()
+        self.zman_mode = ('centre' if d.get('zman_mode') == 'centre'
+                          else 'ends')
+        self.zman_order = ('channel' if d.get('zman_order') == 'channel'
+                           else 'slice')
+        try:
+            self.zman_step_text = f"{abs(float(d.get('zman_step', 5))):g}"
+        except (TypeError, ValueError):
+            pass
         self.map_flip_x = bool(d.get('map_flip_x', True))
         self.work_at_start_on = bool(d.get('work_at_start_on', True))
         try:
