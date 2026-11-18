@@ -163,3 +163,118 @@ def test_camera_limits_come_from_the_camera():
     lo, hi, glo, ghi = acq.ScopeHW(camera=cam).camera_limits()
     assert lo == pytest.approx(0.019) and hi == 1000.0
     assert (glo, ghi) == (0.0, 36.0)
+
+
+# ------------------------------------------- double-click centering check
+
+def _scene(seed=0, size=(600, 800)):
+    rng = np.random.default_rng(seed)
+    img = rng.normal(100, 5, size).astype(np.float32)
+    for _ in range(150):
+        y, x = rng.integers(10, size[0] - 10), rng.integers(10, size[1] - 10)
+        img[y - 4:y + 4, x - 4:x + 4] += rng.uniform(40, 120)
+    return img
+
+
+def _shifted(img, dx, dy):
+    """Content moved by (dx, dy) px; uncovered area filled with noise."""
+    out = np.random.default_rng(9).normal(100, 5, img.shape).astype(np.float32)
+    h, w = img.shape
+    xs, xd = (0, dx) if dx >= 0 else (-dx, 0)
+    ys, yd = (0, dy) if dy >= 0 else (-dy, 0)
+    out[yd:h - ys, xd:w - xs] = img[ys:h - yd, xs:w - xd]
+    return out
+
+
+@pytest.mark.parametrize('click, error', [((650, 120), (0, 0)),
+                                          ((650, 120), (9, -6)),
+                                          ((90, 520), (-14, 11)),
+                                          ((780, 590), (5, 5))])
+def test_the_clicked_spot_is_found_after_a_move_that_leaves_little_overlap(
+        click, error):
+    """A click far from the center means the two frames barely overlap;
+    the clicked neighbourhood must still be located, including the error
+    the move left."""
+    a = _scene()
+    cx, cy = 400, 300
+    dx = cx - click[0] + error[0]         # where the content actually went
+    dy = cy - click[1] + error[1]
+    b = _shifted(a, dx, dy)
+    x, y, score = acq.locate_patch(a, click, b, (cx, cy))
+    assert score > 0.8
+    assert (x - cx, y - cy) == pytest.approx(error, abs=1.0)
+
+
+def test_a_featureless_field_gives_no_measurement():
+    flat = np.full((600, 800), 50, dtype=np.float32)
+    assert acq.locate_patch(flat, (500, 200), flat, (400, 300)) is None
+
+
+def test_whole_frame_shift_measurement_keeps_its_sign_convention():
+    a = _scene(3)
+    s = acq.measure_image_shift(a, _shifted(a, 20, -12))
+    assert (s[0], s[1]) == pytest.approx((20, -12), abs=0.5)
+
+
+# ------------------------------------------------------------ shutdown
+
+def test_parking_lowers_the_objective_before_centering_the_stage():
+    calls = []
+
+    class Stage:
+        driver = True
+
+        def move_abs_pos(self, axis, pos):
+            calls.append(('move', axis, pos))
+
+        def xycenter(self):
+            calls.append(('center',))
+
+        def target_status(self, axis):
+            calls.append(('wait', axis))
+            return True
+
+        def current_pos(self, axis):
+            return self.z
+
+        def zhome(self):
+            calls.append(('zhome',))
+
+    stage = Stage()
+    stage.z = 0.0
+    hw = acq.ScopeHW(stage=stage)
+    assert hw.park() is True
+    assert calls == [('move', 'Z', 0.0), ('wait', 'Z'), ('center',),
+                     ('wait', 'X'), ('wait', 'Y')]
+    assert acq.ScopeHW().park() is False        # no stage: nothing to do
+
+    # Objective not confirmed down (even after homing Z): XY must not move.
+    calls.clear()
+    stage.z = 3000.0
+    assert hw.park() is False
+    assert ('zhome',) in calls and ('center',) not in calls
+
+
+def test_parking_gives_up_when_a_stuck_thread_holds_the_hardware_lock():
+    import threading
+
+    class Stage:
+        driver = True
+
+    hw = acq.ScopeHW(stage=Stage())
+    held, release = threading.Event(), threading.Event()
+
+    def _stuck():
+        with hw.lock:
+            held.set()
+            release.wait(5.0)
+
+    t = threading.Thread(target=_stuck, daemon=True)
+    t.start()
+    held.wait(2.0)
+    try:
+        assert hw.park(lock_timeout_s=0.1) is False
+        assert hw.get_pos_now(lock_timeout_s=0.1) is None
+    finally:
+        release.set()
+        t.join(2.0)

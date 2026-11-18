@@ -15,6 +15,11 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
+# The simulator keeps its settings with its own copy of the program, so a
+# simulator run never reads or changes the user's real settings.
+os.environ.setdefault('LUMAVIEW_SETTINGS', os.path.join(
+    script_dir, 'data', 'lvp_custom_settings.json'))
+
 import image_utils
 
 print("[LumaViewPro Simulator] Initializing offline hardware & camera mocks...")

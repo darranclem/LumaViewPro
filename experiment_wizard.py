@@ -18,8 +18,12 @@ from kivy.properties import (BooleanProperty, NumericProperty,
 
 import acquisition as acq
 import experiment
+import online_processing
 import plate_navigator
 from acquisition import AutofocusConfig, CHANNELS
+
+# Basler daA3840-45um sensor pixel pitch (unbinned).
+CAMERA_PIXEL_UM = 2.0
 
 # (key, title, help)
 WIZARD_STEPS = [
@@ -32,10 +36,11 @@ WIZARD_STEPS = [
      'Press Start. The stage goes to six rim positions in turn: A1 at 12, '
      '3, 6 and 9 o\'clock, the last well of the first row at 9 o\'clock '
      'and the last well of the first column at 12 o\'clock. Each time, '
-     'jog until the well rim crosses the image center, then press MARK. '
-     'The red target on the navigator shows which rim point is wanted. '
-     'The result gives the A1 position, well size, well spacing and plate '
-     'rotation. Next skips this step and keeps the current calibration.'),
+     'jog until the well rim crosses the image center, then press CONFIRM '
+     'THIS POINT (or Enter). Only confirmed points count; when the sixth '
+     'is confirmed the calibration finishes by itself. The navigator '
+     'below zooms in on the well and shows the live image on it. '
+     '"Next step" without starting keeps the current calibration.'),
     ('autofocus', 'Autofocus channel and point',
      '1. Pick the autofocus channel.  2. Drive to a spot with clear '
      'structure that will stay put.  3. Find focus (coarse) sweeps the '
@@ -66,15 +71,25 @@ WIZARD_STEPS = [
      'Each focus is stored as an offset from the autofocus result, and '
      'the surface between and beyond the points is interpolated.'),
     ('acquire', 'Z-stacks and timelapse',
-     'Z-stack: the same range and step for every channel, centered on '
-     'the focus surface. Timelapse: how many timepoints and how far '
+     'Z-stack: on for every well and colour unless opted out below. '
+     'Each stack is centered on the position\'s focus and runs from the '
+     'top of the range down. The step is suggested from the lens (NA, '
+     'wavelength and the image scale, which carries the magnification - '
+     'pick the objective in the top bar): 1x sampling steps by one optical '
+     'section, 2.3x is Nyquist, or type your own step. '
+     'Timelapse: how many timepoints and how far '
      'apart. Autofocus re-runs at the one AF point (every timepoint, or '
      'every N timepoints); if focus has drifted, the whole focus surface '
-     'moves up or down by that amount, so every position follows.'),
+     'moves up or down by that amount, so every position follows. '
+     'Online compositing and stitching run while the experiment goes on: '
+     'a position is composited when all its colours and planes are in, a '
+     'well is stitched when all its tiles are in, and the timelapse video '
+     'is made after the last timepoint. The raw files are always kept.'),
     ('save', 'Save and run',
      'Check the summary, name the protocol and save it. Files are named '
      'well_tile-or-position_Z_colour_timepoint, for example '
-     'B3_TA1_Z001_GREEN_T0001.tiff.'),
+     'B3_TA1_Z001_GREEN_t0001.tiff (T = tile, t = timepoint; Z001 is the '
+     'top plane of a stack).'),
 ]
 
 
@@ -93,6 +108,12 @@ class ExperimentWizardMixin:
     fmap_label = StringProperty('')
     no_plate_on = BooleanProperty(False)
     af_every_n = NumericProperty(1)       # autofocus every n-th timepoint
+    wiz_step_hint = StringProperty('')
+    wiz_no_overlap = BooleanProperty(True)   # random fields must not overlap
+    zmark_on = BooleanProperty(False)     # navigator marks z-stack opt-outs
+    compose_on = BooleanProperty(False)   # online: channels into one file
+    stitch_on = BooleanProperty(False)    # online: tiles into one image
+    zmark_scope = StringProperty('All channels')
 
     sampling_labels = [experiment.SAMPLING_LABELS[m]
                        for m in experiment.SAMPLING_MODES]
@@ -110,16 +131,40 @@ class ExperimentWizardMixin:
     def wiz_start(self):
         self.wiz_active = True
         self._wiz_goto(0)
+        # The plate map becomes the main view for the setup (the live
+        # image is drawn on it); "camera view" under it switches back.
+        if not self.no_plate_on:
+            self.set_map_big(True)
+
+    def wiz_open_tool(self, key: str):
+        """Open one wizard step by itself, for manual work: its tools
+        appear in the wizard panel without going through the steps before
+        it, and the view stays as it is. Close ends it as usual."""
+        index = next((i for i, s in enumerate(WIZARD_STEPS) if s[0] == key),
+                     None)
+        if index is None:
+            return
+        if self.wiz_active:
+            self._wiz_leave()
+        self.wiz_active = True
+        self._wiz_goto(index)
+        self._set_status(f'{WIZARD_STEPS[index][1]}: tools opened in the '
+                         f'EXPERIMENT SETUP WIZARD panel (right)')
 
     def wiz_close(self):
-        if self.fmap_active:
-            self.wiz_fmap_cancel()
+        self._wiz_leave()
         self.wiz_active = False
+        self.set_map_big(False)
 
     def _wiz_skipped(self, index: int) -> bool:
         return self.no_plate_on and WIZARD_STEPS[index][0] == 'calibrate'
 
     def wiz_next(self):
+        if self.wiz_key == 'plate' and not self.objective_name:
+            self._set_status('Select the objective that is on the '
+                             'microscope first: image size, tile spacing '
+                             'and z steps all depend on it')
+            return
         self._wiz_leave()
         i = int(self.wiz_step) + 1
         while i < len(WIZARD_STEPS) and self._wiz_skipped(i):
@@ -156,9 +201,15 @@ class ExperimentWizardMixin:
         key = self.wiz_key
         if key == 'plate':
             lw = self.current_labware
-            self.wiz_info = ('No plate: free positions, no well names'
-                             if self.no_plate_on else
-                             f'{lw.name}: {lw.rows} x {lw.cols} wells')
+            fov = self._fov_um()
+            self.wiz_info = (
+                ('No plate: free positions, no well names'
+                 if self.no_plate_on else
+                 f'{lw.name}: {lw.rows} x {lw.cols} wells')
+                + (f'\nObjective {self.objective_name}: field of view '
+                   f'{fov[0] / 1000:.2f} x {fov[1] / 1000:.2f} mm'
+                   if self.objective_name else
+                   '\nNO OBJECTIVE SELECTED'))
         elif key == 'calibrate':
             self.wiz_info = self.cal_info
         elif key == 'autofocus':
@@ -187,6 +238,8 @@ class ExperimentWizardMixin:
             self.wiz_info = self.positions_info
         elif key == 'focusmap':
             self.wiz_info = f'{len(self.surface.points)} focus points stored'
+        elif key == 'acquire':
+            self.wiz_info = self._optout_text()
         elif key == 'save':
             self.wiz_info = self.wiz_summary()
 
@@ -396,15 +449,16 @@ class ExperimentWizardMixin:
         mode = self.wiz_sampling
         lw = self.current_labware
         fov_x, fov_y = (v / 1000.0 for v in self._fov_um())
+        well_x, well_y = self.well_size_mm()
         params = dict(
-            well_x_mm=lw.well_size_x_mm, well_y_mm=lw.well_size_y_mm,
+            well_x_mm=well_x, well_y_mm=well_y,
             shape=lw.shape, fov_x_mm=fov_x, fov_y_mm=fov_y,
             rows=int(self._f(ids.wiz_tile_rows.text, 3)),
             cols=int(self._f(ids.wiz_tile_cols.text, 3)),
             overlap_pct=self._f(ids.wiz_overlap.text, 10.0),
             n_random=int(self._f(ids.wiz_random_n.text, 3)),
             coverage_pct=self._f(ids.wiz_coverage.text, 100.0),
-            seed=int(time.time()))
+            seed=int(time.time()), allow_overlap=not self.wiz_no_overlap)
         new, skipped = [], 0
 
         if self.no_plate_on:
@@ -459,9 +513,16 @@ class ExperimentWizardMixin:
             self._set_status('No position is inside the stage travel')
             return
         self.protocol_positions = new
+        self.positions_objective = self.objective_name
         self._persist()
         self._refresh_positions()
         note = f' ({skipped} outside the stage travel left out)' if skipped else ''
+        if mode in ('random', 'random_same') and not self.no_plate_on:
+            fewest = min(len(v) for v in sites.values())
+            if fewest < params['n_random']:
+                note += (f'. Only {fewest} of {params["n_random"]} random '
+                         f'fields fit in a well without overlapping - ask '
+                         f'for fewer, or switch "No overlap" off')
         self._set_status(f'{len(new)} positions generated in {groups}{note}')
         self._wiz_refresh_info()
 
@@ -485,9 +546,10 @@ class ExperimentWizardMixin:
                 pos = [pos[i] for i in idx]
             return [{'label': p['name'], 'x': p['x_um'], 'y': p['y_um'],
                      'plate_mm': None} for p in pos]
+        well_x, well_y = self.well_size_mm()
         pts = experiment.focus_points(
             self.wiz_focus_mode, self._wiz_wells(),
-            well_x_mm=lw.well_size_x_mm, well_y_mm=lw.well_size_y_mm,
+            well_x_mm=well_x, well_y_mm=well_y,
             n_per_well=n)
         out = []
         count: dict[tuple[int, int], int] = {}
@@ -525,7 +587,42 @@ class ExperimentWizardMixin:
             self._set_status('No focus points: select wells or generate '
                              'positions first')
             return
+        self._fmap_run(plan, update=False)
+
+    def wiz_load(self, name: str):
+        """Load a saved configuration from inside the wizard."""
+        self.load_protocol(name)
+        self._wiz_refresh_info()
+
+    def wiz_focus_update(self):
+        """Refresh the focus of the current (loaded) configuration without
+        redefining it: autofocus at its AF point, then revisit each of its
+        stored focus points at the expected focus for a touch-up."""
+        if not (self.stage_connected and self.camera_connected):
+            self._set_status('Updating focus needs stage + camera')
+            return
+        if self.surface.anchor_xy is None:
+            self._set_status('This configuration has no AF point: set one '
+                             'in step 3')
+            return
+        lw = self.current_labware
+        plan = []
+        for i, p in enumerate(self.surface.points):
+            rel = self.stage_to_plate_rel(p[0], p[1])
+            plan.append({
+                'label': self._pos_well_name(p[0], p[1])
+                or f'Focus point {i + 1}',
+                'x': p[0], 'y': p[1],
+                'plate_mm': None if rel is None else (
+                    lw.a1_offset_x_mm + rel[0], lw.a1_offset_y_mm + rel[1])})
+        self._fmap_run(plan, update=True)
+
+    def _fmap_run(self, plan: list[dict], update: bool):
+        """Autofocus at the AF point, then walk ``plan``. ``update``: the
+        points are the stored focus map being refreshed (start each at
+        its expected focus; a skipped point keeps its old value)."""
         self._fmap_points = plan
+        self._fmap_update = update
         self._fmap_done = {}
         self._fmap_index = 0
         cfg = AutofocusConfig(z_bottom_um=self.af_config.z_bottom_um,
@@ -551,8 +648,14 @@ class ExperimentWizardMixin:
                 self.surface.update_cycle(best)
 
             def _begin(dt):
-                self.fmap_active = True
                 self._refresh_surface_info()
+                if not self._fmap_points:
+                    self._persist()
+                    self._set_status(
+                        'AF point refreshed (this configuration has no '
+                        'focus map points)' + self._update_hint())
+                    return
+                self.fmap_active = True
                 self._fmap_goto()
             Clock.schedule_once(_begin, 0)
         self._bg(_job, busy_job=True)
@@ -570,8 +673,12 @@ class ExperimentWizardMixin:
             x, y, z = self._fmap_done[i]
         else:
             x, y = p['x'], p['y']
-            z = experiment.interpolate_offsets(
-                list(self._fmap_done.values()), x, y)
+            if getattr(self, '_fmap_update', False):
+                # The stored map, already shifted by the new autofocus.
+                z = self.surface.z_at(x, y)
+            else:
+                z = experiment.interpolate_offsets(
+                    list(self._fmap_done.values()), x, y)
             if z is None:
                 z = self.surface.current_z
         self._set_status(f'Focus point {p["label"]}: focus, then Set focus')
@@ -613,9 +720,21 @@ class ExperimentWizardMixin:
         if not self.fmap_active:
             return
         done = [self._fmap_done[i] for i in sorted(self._fmap_done)]
-        if not done:
+        update = getattr(self, '_fmap_update', False)
+        if not done and not update:
             self._set_status('No focus point set yet')
             return
+        missed = len(self._fmap_points) - len(done)
+        if update:
+            # A point that was not revisited keeps its stored focus.
+            done = []
+            for i, p in enumerate(self._fmap_points):
+                if i in self._fmap_done:
+                    done.append(self._fmap_done[i])
+                else:
+                    z = self.surface.z_at(p['x'], p['y'])
+                    if z is not None:
+                        done.append((p['x'], p['y'], z))
         self.surface.clear_points()
         for x, y, z in done:
             self.surface.add_point(x, y, z)
@@ -624,39 +743,230 @@ class ExperimentWizardMixin:
         self._persist()
         self._refresh_surface_info()
         self._wiz_refresh_info()
-        missed = len(self._fmap_points) - len(done)
-        note = f' ({missed} skipped)' if missed else ''
-        self._set_status(f'Focus map stored: {len(done)} points{note}')
+        if update:
+            note = f' ({missed} kept as stored)' if missed else ''
+            self._set_status(f'Focus updated: {len(done)} points{note}'
+                             + self._update_hint())
+        else:
+            note = f' ({missed} skipped)' if missed else ''
+            self._set_status(f'Focus map stored: {len(done)} points{note}')
+
+    def _update_hint(self) -> str:
+        return (f'. Press Update "{self.protocol_loaded}" (step 9) to keep '
+                f'it in the saved configuration.'
+                if self.protocol_loaded else '')
 
     # ------------------------------------------- z-stacks and timelapse
+
+    def _wiz_na(self) -> float:
+        """Lens NA: as typed in, else the selected objective's, else a
+        typical value for the magnification implied by the image scale."""
+        return float(self.zplan.get('na') or self.objective_na()
+                     or experiment.typical_na(
+                         CAMERA_PIXEL_UM / max(self.base_um_per_px, 1e-6)))
+
+    def _wiz_stack_channels(self) -> list[str]:
+        off = self.zplan.get('channels_off') or []
+        return [ch for ch in CHANNELS
+                if self.channel_settings[ch].enabled and ch not in off]
+
+    def wiz_stack_step(self) -> tuple[float, str]:
+        """Z interval for the global z-stack and how it was arrived at:
+        the lens's optical section (for the shortest wavelength being
+        stacked, so no colour is undersampled) divided by the sampling
+        rate, unless a step was typed in."""
+        na = self._wiz_na()
+        chans = self._wiz_stack_channels() or [self.af_channel]
+        # Camera pixel projected into the sample = the image scale, which
+        # already contains the magnification (and the binning).
+        scale = self.effective_um_per_px()
+        section, ch = min(
+            (experiment.optical_section_um(
+                na, experiment.CHANNEL_WAVELENGTH_NM.get(c, 550.0), 1.0,
+                scale), c) for c in chans)
+        rate = self.zplan.get('rate') or 1.0
+        override = self.zplan.get('override_um')
+        step = experiment.stack_step_um(section, rate, override)
+        text = (f'Optical section for NA {na:g} at {scale:g} um/px: '
+                f'{section:.2f} um ({ch}). ')
+        text += (f'Step {step:.2f} um (typed in).' if override else
+                 f'Step {step:.2f} um at {rate:g}x sampling.')
+        return step, text
+
+    def wiz_update_step_hint(self):
+        """Read the z-stack fields and show the resulting step."""
+        if not self.root or getattr(self, '_wiz_syncing', False):
+            return
+        ids = self.root.ids
+        if 'wiz_z_override' not in ids:
+            return
+        na = self._f(ids.wiz_z_na.text, 0.0)
+        rate = self._f(ids.wiz_z_rate.text, 1.0)
+        override = self._f(ids.wiz_z_override.text, 0.0)
+        self.zplan.update({
+            'na': na if na > 0 else None,
+            'rate': rate if rate > 0 else 1.0,
+            'override_um': override if override > 0 else None,
+            'range_um': abs(self._f(ids.wiz_z_range.text, 50.0)),
+        })
+        step, text = self.wiz_stack_step()
+        offs = experiment.stack_offsets(self.zplan['range_um'], step)
+        self.wiz_step_hint = (f'{text} {len(offs)} planes from '
+                              f'{offs[0]:+.1f} to {offs[-1]:+.1f} um around '
+                              f'the focus point, top first.')
 
     def _wiz_sync_acquire(self):
         ids = self.root.ids
         on = [cs for cs in self.channel_settings.values() if cs.enabled]
         stacked = [cs for cs in on if cs.zstack.enabled]
-        self.wiz_zstack_on = bool(stacked)
+        self.wiz_zstack_on = bool(self.zplan.get('on', bool(stacked)))
         src = (stacked or on or list(self.channel_settings.values()))[0]
-        ids.wiz_z_range.text = f'{src.zstack.range_um:g}'
-        ids.wiz_z_step.text = f'{src.zstack.step_um:g}'
+        na = self._wiz_na()
+        self._wiz_syncing = True
+        ids.wiz_z_range.text = f"{self.zplan.get('range_um') or src.zstack.range_um:g}"
+        ids.wiz_z_na.text = f'{na:g}'
+        ids.wiz_z_rate.text = f"{self.zplan.get('rate') or 1.0:g}"
+        ov = self.zplan.get('override_um')
+        ids.wiz_z_override.text = f'{ov:g}' if ov else ''
+        self._wiz_syncing = False
         ids.wiz_cycles.text = ids.protocol_cycles_input.text
         ids.wiz_interval.text = ids.protocol_interval_input.text
         ids.wiz_af_every.text = str(int(self.af_every_n))
+        self.wiz_update_step_hint()
+        self._refresh_flagged()
 
     def wiz_apply_acquire(self):
+        """Write the global z-stack plan into every channel: stacked unless
+        the channel was opted out, all with the same range and step."""
         ids = self.root.ids
-        rng = abs(self._f(ids.wiz_z_range.text, 50.0))
-        step = max(abs(self._f(ids.wiz_z_step.text, 5.0)), 0.1)
-        for cs in self.channel_settings.values():
-            cs.zstack.enabled = bool(self.wiz_zstack_on)
-            cs.zstack.range_um = rng
-            cs.zstack.step_um = step
+        self.wiz_update_step_hint()
+        step, _ = self.wiz_stack_step()
+        self.zplan['on'] = bool(self.wiz_zstack_on)
+        off = self.zplan.get('channels_off') or []
+        for ch, cs in self.channel_settings.items():
+            cs.zstack.enabled = bool(self.wiz_zstack_on) and ch not in off
+            cs.zstack.range_um = self.zplan['range_um']
+            cs.zstack.step_um = round(step, 3)
         cycles = max(int(self._f(ids.wiz_cycles.text, 1)), 1)
         interval = max(self._f(ids.wiz_interval.text, 5.0), 0.0)
         ids.protocol_cycles_input.text = str(cycles)
         ids.protocol_interval_input.text = f'{interval:g}'
         self.af_every_n = max(int(self._f(ids.wiz_af_every.text, 1)), 1)
+        self._set_zmark(False)
         self._sync_channel_fields()
         self._persist()
+
+    # --- opting out of the z-stack
+
+    def wiz_stack_channel_on(self, channel: str, _rev=0) -> bool:
+        return channel not in (self.zplan.get('channels_off') or [])
+
+    def wiz_toggle_stack_channel(self, channel: str):
+        off = set(self.zplan.get('channels_off') or [])
+        off.symmetric_difference_update({channel})
+        self.zplan['channels_off'] = sorted(off)
+        self.wiz_rev += 1
+        self.wiz_update_step_hint()
+
+    def wiz_toggle_zmark(self):
+        self._set_zmark(not self.zmark_on)
+
+    def _set_zmark(self, on: bool):
+        """While on, clicks and rectangles on the navigator mark wells as
+        'no z-stack' instead of switching them in or out of the protocol."""
+        self.zmark_on = on
+        plate = self.root.ids.get('plate_map') if self.root else None
+        if plate is not None:
+            plate.on_wells_flag = self.on_wells_flagged
+            plate.mark_mode = on
+        if on:
+            self._set_status('Click or drag wells on the map to take them '
+                             'out of the z-stack; click a marked well to '
+                             'put it back')
+
+    def on_wells_flagged(self, wells: list[tuple[int, int]], flag_on: bool):
+        lw = self.current_labware
+        in_protocol = set(self._wiz_wells())
+        scope = '*' if self.zmark_scope == 'All channels' else self.zmark_scope
+        opt = dict(self.zstack_optout)
+        for w in wells:
+            if w not in in_protocol:
+                continue
+            name = lw.get_well_name(*w)
+            if not flag_on:
+                opt.pop(name, None)
+            elif scope == '*':
+                opt[name] = ['*']
+            elif '*' not in opt.get(name, []):
+                opt[name] = sorted(set(opt.get(name, [])) | {scope})
+        self.zstack_optout = opt
+        self._persist()
+        self._refresh_flagged()
+        self._wiz_refresh_info()
+
+    def wiz_clear_optout(self):
+        self.zstack_optout = {}
+        self._persist()
+        self._refresh_flagged()
+        self._wiz_refresh_info()
+
+    def _refresh_flagged(self):
+        plate = self.root.ids.get('plate_map') if self.root else None
+        if plate is None:
+            return
+        lw = self.current_labware
+        plate.flagged_wells = {
+            (r, c) for r in range(lw.rows) for c in range(lw.cols)
+            if lw.get_well_name(r, c) in self.zstack_optout}
+        plate.redraw()
+
+    def _optout_text(self) -> str:
+        if not self.zstack_optout:
+            return 'Every selected well is stacked'
+        parts = [f"{w} ({'all' if '*' in chs else ', '.join(chs)})"
+                 for w, chs in sorted(self.zstack_optout.items())]
+        if len(parts) > 12:
+            parts = parts[:12] + [f'... {len(self.zstack_optout)} wells']
+        return 'No z-stack in: ' + ', '.join(parts)
+
+    def toggle_online(self, which: str):
+        if which == 'compose':
+            self.compose_on = not self.compose_on
+        else:
+            self.stitch_on = not self.stitch_on
+        if (self.compose_on or self.stitch_on) and \
+                not online_processing.available():
+            self._set_status('Online processing needs the tifffile and '
+                             'opencv-python packages in .venv')
+        self._persist()
+        if self.wiz_active:
+            self._wiz_refresh_info()
+
+    def _online_text(self, cycles: int) -> str:
+        parts = []
+        if self.compose_on:
+            parts.append('compositing')
+        if self.stitch_on:
+            n = len(online_processing.stitch_groups(self.protocol_positions))
+            parts.append(f'stitching ({n} tile scan{"s" if n != 1 else ""})'
+                         if n else 'stitching (NO TILE SCANS in the '
+                                   'positions)')
+        if parts and cycles > 1:
+            parts.append('timelapse video')
+        return ', '.join(parts) or 'off'
+
+    def _wiz_image_count(self, chans: list[str], cycles: int) -> int:
+        named = self._use_wells()
+        per_ch = {ch: len(acq.zstack_planes(0.0, self.channel_settings[ch]))
+                  for ch in chans}
+        total = 0
+        for p in self.protocol_positions:
+            well = p.get('well') if 'well' in p else (
+                self._pos_well_name(p['x_um'], p['y_um']) if named else None)
+            opt = self.zstack_optout.get(well or '', ())
+            total += sum(1 if ('*' in opt or ch in opt) else per_ch[ch]
+                         for ch in chans)
+        return total * cycles
 
     # ------------------------------------------------------------- save
 
@@ -670,7 +980,19 @@ class ExperimentWizardMixin:
             planes = max(len(acq.zstack_planes(0.0, self.channel_settings[ch]))
                          for ch in chans)
         cycles = max(int(self._f(ids.protocol_cycles_input.text, 1)), 1)
-        images = n_pos * len(chans) * planes * cycles
+        images = self._wiz_image_count(chans, cycles)
+        single = [ch for ch in chans
+                  if not self.channel_settings[ch].zstack.enabled]
+        stack = 'no z-stack'
+        if planes > 1:
+            cs = next(self.channel_settings[ch] for ch in chans
+                      if self.channel_settings[ch].zstack.enabled)
+            stack = (f'{planes} planes, {cs.zstack.range_um:g} um range, '
+                     f'{cs.zstack.step_um:g} um step')
+            if single:
+                stack += f'; not {", ".join(single)}'
+            if self.zstack_optout:
+                stack += f'; {len(self.zstack_optout)} wells opted out'
         plate = ('no plate' if self.no_plate_on else
                  f'{lw.name}, {len(self._wiz_wells())} wells'
                  if self._use_wells() else lw.name)
@@ -682,14 +1004,21 @@ class ExperimentWizardMixin:
         n = int(self.af_every_n)
         every = ('never re-run' if not self.af_each_cycle_on else
                  'every timepoint' if n <= 1 else f'every {n} timepoints')
-        return (f'Plate: {plate}{cal}\n'
+        laid = getattr(self, 'positions_objective', '')
+        lens = self.objective_name or 'NOT SELECTED'
+        if n_pos and laid and laid != self.objective_name:
+            lens += (f'  - POSITIONS WERE LAID OUT FOR {laid}: generate '
+                     f'them again (step 6)')
+        return (f'Objective: {lens}\n'
+                f'Plate: {plate}{cal}\n'
                 f'Positions: {n_pos}\n'
                 f'Colours: {", ".join(chans) or "NONE SWITCHED ON"}\n'
-                f'Z planes per colour: {planes}\n'
+                f'Z-stack: {stack}\n'
                 f'Timepoints: {cycles}, every '
                 f'{ids.protocol_interval_input.text} min\n'
                 f'Autofocus: {self.af_channel}, AF point {af}, {every}; '
                 f'{surf}\n'
+                f'Online processing: {self._online_text(cycles)}\n'
                 f'Images in total: {images}')
 
     def wiz_save(self):

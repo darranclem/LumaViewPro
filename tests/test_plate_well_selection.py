@@ -35,6 +35,7 @@ class Plate:
         self.w.size = (640, 440)
         self.mods: set[str] = set()
         self.w._modifiers = lambda: self.mods
+        self.w.click_delay_s = 0            # act on a click at once
         self.calls: list[tuple[list, bool]] = []
         self.moves: list[tuple[int, int]] = []
         self.w.on_well_double_click = lambda r, c, x, y: self.moves.append((r, c))
@@ -155,11 +156,37 @@ def test_without_an_owner_a_click_only_selects():
     assert p.w.selected_well == (0, 1) and p.active == set()
 
 
-def test_the_mouse_wheel_is_left_to_the_scroll_view():
+def test_ctrl_wheel_zooms_and_never_toggles_a_well():
     p = Plate()
+    p.mods = {'ctrl'}
     t = FakeTouch(*p.xy(0, 0), button='scrolldown')
-    assert p.w.on_touch_down(t) is False
-    assert p.calls == []
+    assert p.w.on_touch_down(t) is True
+    assert p.w.zoom > 1.0 and p.calls == []
+
+
+def test_the_wheel_alone_is_left_to_the_panel_on_the_small_map():
+    p = Plate()
+    focus = []
+    p.w.on_focus_scroll = focus.append
+    t = FakeTouch(*p.xy(0, 0), button='scrolldown')
+    assert p.w.on_touch_down(t) is False        # the panel scrolls
+    assert p.w.zoom == 1.0 and focus == [] and p.calls == []
+
+
+def test_the_wheel_alone_focuses_when_the_map_is_the_main_view():
+    p = Plate()
+    focus = []
+    p.w.on_focus_scroll = focus.append
+    p.w.wheel_focus = True
+    assert p.w.on_touch_down(
+        FakeTouch(*p.xy(2, 2), button='scrolldown')) is True
+    assert p.w.on_touch_down(
+        FakeTouch(*p.xy(2, 2), button='scrollup')) is True
+    assert focus == [1, -1]                     # as on the camera view
+    assert p.w.zoom == 1.0 and p.calls == []
+    p.mods = {'ctrl'}                           # Ctrl + wheel still zooms
+    p.w.on_touch_down(FakeTouch(*p.xy(2, 2), button='scrolldown'))
+    assert p.w.zoom > 1.0 and focus == [1, -1]
 
 
 def test_changing_labware_clears_the_shown_selection():
@@ -235,3 +262,227 @@ def test_a_collapsed_section_can_still_be_opened_after_garbage_collection():
     gc.collect()
     sec.open = True
     assert sec._body.parent is sec
+
+
+def test_a_click_waits_out_the_double_click_window_before_toggling():
+    p = Plate()
+    p.w.click_delay_s = 0.28
+    p.click(2, 2)
+    assert p.calls == []                 # nothing yet: might be a double
+    p.w._fire_pending()                  # the window passed
+    assert p.calls == [([(2, 2)], True)]
+
+
+def test_a_double_click_cancels_the_waiting_toggle_and_only_moves():
+    p = Plate()
+    p.w.click_delay_s = 0.28
+    p.click(2, 2)
+    p.click(2, 2, double=True)
+    p.w._fire_pending()
+    assert p.calls == [] and p.moves == [(2, 2)] and p.active == set()
+
+
+def test_a_click_on_another_well_applies_the_waiting_one_first():
+    p = Plate()
+    p.w.click_delay_s = 0.28
+    p.click(0, 0)
+    p.click(0, 1)
+    p.w._fire_pending()
+    assert p.calls == [([(0, 0)], True), ([(0, 1)], True)]
+
+
+# --------------------------------------------- second marking (opt-outs)
+
+def test_mark_mode_edits_the_flagged_wells_and_leaves_the_selection_alone():
+    p = Plate()
+    p.drag((0, 0), (1, 1))
+    flags = []
+
+    def _flag(wells, on):
+        flags.append((list(wells), on))
+        cur = set(p.w.flagged_wells)
+        p.w.flagged_wells = cur | set(wells) if on else cur - set(wells)
+
+    p.w.on_wells_flag = _flag
+    p.w.mark_mode = True
+    n_calls = len(p.calls)
+    p.click(0, 0)                       # an on well, not flagged yet: flag
+    p.click(0, 0)                       # now flagged: unflag
+    p.drag((0, 0), (0, 1))
+    assert flags == [([(0, 0)], True), ([(0, 0)], False),
+                     ([(0, 0), (0, 1)], True)]
+    assert len(p.calls) == n_calls and len(p.active) == 4
+    p.w.mark_mode = False
+    p.click(1, 1)
+    assert (1, 1) not in p.active       # back to normal on/off
+
+
+# ------------------------------------------------------- zoom and pan
+
+def test_wheel_zoom_keeps_the_point_under_the_cursor_in_place():
+    p = Plate()
+    p.mods = {'ctrl'}
+    sx, sy = p.xy(3, 7)
+    before = p.w._screen_to_mm(sx, sy)
+    for _ in range(6):
+        assert p.w.on_touch_down(FakeTouch(sx, sy, button='scrolldown')) is True
+    assert p.w.zoom == pytest.approx(1.25 ** 6)
+    assert p.w._screen_to_mm(sx, sy) == pytest.approx(before, abs=1e-6)
+    assert p.calls == []                # the wheel never toggles a well
+
+
+def test_zooming_out_stops_at_the_whole_plate():
+    p = Plate()
+    fit = p.w._plate_draw_rect()
+    p.w.zoom_by(8.0, anchor=p.xy(1, 1))
+    p.mods = {'ctrl'}
+    for _ in range(40):
+        p.w.on_touch_down(FakeTouch(*p.w.center, button='scrollup'))
+    assert p.w.zoom == 1.0 and p.w._plate_draw_rect() == pytest.approx(fit)
+
+
+def test_clicks_still_land_on_the_right_well_when_zoomed_in():
+    p = Plate()
+    p.w.zoom_by(5.0, anchor=p.xy(4, 6))
+    p.click(4, 6)
+    p.click(4, 7)
+    assert p.active == {(4, 6), (4, 7)}
+
+
+def test_follow_keeps_the_stage_position_in_the_middle():
+    p = Plate()
+    p.w.follow_stage = True
+    p.w.set_marker_plate_mm(18.0, 27.0)         # C3 center
+    p.w.zoom_to_stage()
+    assert p.w.zoom > 1.0
+    assert p.xy(3, 2) == pytest.approx(p.w.center, abs=1e-6)
+    p.w.set_marker_plate_mm(63.0, 9.0)          # stage moves to B8
+    assert p.xy(1, 7) == pytest.approx(p.w.center, abs=1e-6)
+
+
+def test_right_drag_pans_and_stops_following():
+    p = Plate()
+    p.w.follow_stage = True
+    p.w.set_marker_plate_mm(18.0, 27.0)
+    p.w.zoom_to_stage()
+    x0, y0 = p.xy(3, 2)
+    t = FakeTouch(x0, y0, button='right')
+    p.w.on_touch_down(t)
+    t.x, t.y = x0 + 50, y0 - 30
+    p.w.on_touch_move(t)
+    p.w.on_touch_up(t)
+    assert p.xy(3, 2) == pytest.approx((x0 + 50, y0 - 30), abs=1e-6)
+    assert p.w.follow_stage is False and p.calls == []
+
+
+def test_zoomed_in_double_click_goes_to_the_exact_point():
+    p = Plate()
+    points = []
+    p.w.on_point_double_click = lambda x, y, well: points.append((x, y, well))
+    p.click(2, 2, double=True)                  # whole plate: well center
+    assert p.moves == [(2, 2)] and points == []
+    p.w.zoom_to_span(p.w._well_center_mm(2, 2), 10.0)
+    assert p.w.precise
+    sx, sy = p.xy(2, 2)
+    px_per_mm = p.w._plate_draw_rect()[2] / p.w._plate_dims()[0]
+    p.w.on_touch_down(FakeTouch(sx + 2.0 * px_per_mm, sy + 1.0 * px_per_mm,
+                                double=True))
+    # 2 mm right of and 1 mm above (toward row A) the C3 center
+    assert points[0][:2] == pytest.approx((18.0 + 2.0, 18.0 - 1.0), abs=1e-6)
+    assert points[0][2] == (2, 2) and p.moves == [(2, 2)] and p.calls == []
+
+
+def test_changing_labware_shows_the_whole_plate_again():
+    p = Plate()
+    p.w.zoom_by(6.0, anchor=p.xy(1, 1))
+    p.w.set_labware(None)
+    assert p.w.zoom == 1.0 and p.w.view_center_mm is None
+
+
+def test_live_image_corners_are_stored_from_the_plate_corner():
+    p = Plate()
+    lw = p.w._lw()
+    p.w.set_live_image(object(), [(-1, -1), (1, -1), (1, 1), (-1, 1)])
+    assert p.w.live_corners_mm[0] == pytest.approx(
+        (lw.a1_offset_x - 1, lw.a1_offset_y - 1))
+    p.w.set_live_image(None, None)
+    assert p.w.live_corners_mm is None and p.w.live_texture is None
+
+
+# --------------------------------------------- point clicks (edit mode)
+
+def test_in_point_mode_a_click_reports_the_point_and_leaves_the_wells():
+    p = Plate()
+    got = []
+    p.w.on_point_click = lambda x, y, well: got.append((x, y, well))
+    p.w.point_click_mode = True
+    sx, sy = p.xy(2, 3)
+    px_per_mm = p.w._plate_draw_rect()[2] / p.w._plate_dims()[0]
+    t = FakeTouch(sx + 1.5 * px_per_mm, sy - 1.0 * px_per_mm)
+    assert p.w.on_touch_down(t) is True
+    assert t.grab_current is None and p.calls == []      # no well toggled
+    (x, y, well), = got
+    sp = p.w._spacing()
+    assert well == (2, 3)
+    assert (x, y) == pytest.approx((3 * sp[0] + 1.5, 2 * sp[1] + 1.0),
+                                   abs=1e-6)
+
+
+def test_in_point_mode_a_double_click_still_drives_the_stage_only():
+    p = Plate()
+    got = []
+    p.w.on_point_click = lambda x, y, well: got.append(well)
+    p.w.point_click_mode = True
+    p.click(1, 1, double=True)
+    assert got == [] and p.moves == [(1, 1)] and p.calls == []
+
+
+def test_out_of_point_mode_clicks_switch_wells_as_before():
+    p = Plate()
+    got = []
+    p.w.on_point_click = lambda x, y, well: got.append(well)
+    p.click(1, 1)
+    assert got == [] and (1, 1) in p.active
+
+
+# ------------------------------------------------- mirrored plate map
+
+def test_mirrored_map_draws_column_1_on_the_right():
+    p = Plate()
+    a1, a12 = p.xy(0, 0), p.xy(0, 11)
+    assert a1[0] < a12[0]
+    p.w.flip_x = True
+    f1, f12 = p.xy(0, 0), p.xy(0, 11)
+    assert f1[0] > f12[0]                       # A1 now on the right
+    assert f1[1] == pytest.approx(a1[1])        # rows are not touched
+    # mirror image of where it was, about the middle of the plate picture
+    x, _, w, _ = p.w._plate_draw_rect()
+    assert f1[0] == pytest.approx(2 * x + w - a1[0])
+
+
+def test_clicks_drags_and_zoom_still_hit_what_is_drawn_when_mirrored():
+    p = Plate()
+    p.w.flip_x = True
+    p.click(2, 9)
+    assert p.active == {(2, 9)}
+    p.drag((0, 0), (1, 2))
+    assert {(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)} <= p.active
+    p.mods = {'ctrl'}
+    sx, sy = p.xy(5, 3)
+    before = p.w._screen_to_mm(sx, sy)
+    for _ in range(5):
+        p.w.on_touch_down(FakeTouch(sx, sy, button='scrolldown'))
+    assert p.w.zoom > 1.0                       # the cursor point stays put
+    assert p.w._screen_to_mm(sx, sy) == pytest.approx(before, abs=1e-6)
+    p.mods = set()
+    p.click(5, 3)
+    assert (5, 3) in p.active
+
+
+def test_screen_and_plate_coordinates_round_trip_when_mirrored():
+    p = Plate()
+    p.w.flip_x = True
+    p.w.zoom_by(4.0, anchor=p.xy(3, 3))
+    for mm in ((10.0, 12.0), (100.5, 70.25)):
+        assert p.w._screen_to_mm(*p.w._mm_to_screen(*mm)) == \
+            pytest.approx(mm, abs=1e-6)

@@ -45,8 +45,43 @@ except Exception:  # pragma: no cover
 CHANNELS = ['BF', 'PC', 'DF', 'BLUE', 'GREEN', 'RED']
 LED_CHANNEL_MAP = {'BLUE': 0, 'GREEN': 1, 'RED': 2, 'BF': 3, 'PC': 4, 'DF': 5}
 
-SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             'data', 'lvp_custom_settings.json')
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+# The settings file that lives with the program: the starting point for a
+# Windows account that has no settings of its own yet. Only the account
+# that installed the program can write there.
+SHARED_SETTINGS_PATH = os.path.join(APP_DIR, 'data',
+                                    'lvp_custom_settings.json')
+
+
+def user_data_dir() -> str:
+    """This Windows account's own LumaViewPro folder (roaming profile)."""
+    base = os.environ.get('APPDATA') or os.path.expanduser('~')
+    return os.path.join(base, 'LumaViewPro')
+
+
+def user_documents_dir() -> str:
+    """Where this account's data goes when no folder has been chosen and
+    the program folder cannot be written to."""
+    return os.path.join(os.path.expanduser('~'), 'Documents', 'LumaViewPro')
+
+
+def dir_writable(path: str) -> bool:
+    """True when files can be created in ``path`` (made if missing)."""
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, f'.write_test_{os.getpid()}')
+        with open(probe, 'w'):
+            pass
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+
+# Every account keeps its own settings. LUMAVIEW_SETTINGS overrides the
+# place (the simulator points it at its own copy of the data folder).
+SETTINGS_PATH = os.environ.get('LUMAVIEW_SETTINGS') or \
+    os.path.join(user_data_dir(), 'settings.json')
 SHADING_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            'data', 'shading')
 
@@ -139,17 +174,38 @@ def saturated_fraction(img: np.ndarray, significant_bits: int) -> float:
 
 
 def save_settings(payload: dict) -> None:
+    """Write this account's settings. Written to a second file first and
+    swapped in, so a crash mid-write cannot leave a broken file (which
+    would reset every setting at the next launch)."""
     os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
-    with open(SETTINGS_PATH, 'w', encoding='utf-8') as f:
+    tmp = SETTINGS_PATH + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(payload, f, indent=2)
+    os.replace(tmp, SETTINGS_PATH)
 
 
 def load_settings() -> dict:
+    """This account's settings; an account without any starts from the
+    settings stored with the program (instrument set-up, channels), minus
+    the folders, which are each user's own choice."""
     try:
         with open(SETTINGS_PATH, 'r', encoding='utf-8') as f:
             return json.load(f)
     except Exception:
+        pass
+    if os.path.abspath(SETTINGS_PATH) == os.path.abspath(SHARED_SETTINGS_PATH):
         return {}
+    try:
+        with open(SHARED_SETTINGS_PATH, 'r', encoding='utf-8') as f:
+            d = json.load(f)
+    except Exception:
+        return {}
+    # The account that owns the program folder is the one whose settings
+    # these were: it keeps everything. Anyone else chooses their own.
+    if not dir_writable(os.path.dirname(SHARED_SETTINGS_PATH)):
+        d.pop('output_dir', None)
+        d.pop('protocol_dir', None)
+    return d
 
 
 class ScopeHW:
@@ -408,6 +464,51 @@ class ScopeHW:
                 return
         if wait:
             self._wait_axis(axis)
+
+    def park(self, timeout_s: float = 30.0,
+             lock_timeout_s: float = 5.0) -> bool:
+        """Leave the microscope ready for the next user: objective lowered
+        all the way first and confirmed down (so nothing can catch during
+        the XY move), then the stage at the center of its travel, where
+        the objectives are easiest to reach. The stage is not moved if
+        the objective cannot be confirmed down."""
+        if not self.stage_ok():
+            return False
+        # Never wait forever for a lock held by a stuck hardware thread:
+        # give up, and the park guard process parks after we exit.
+        if not self.lock.acquire(timeout=lock_timeout_s):
+            return False
+        try:
+            import park_guard
+            return park_guard.park(self.stage, timeout_s=timeout_s)
+        finally:
+            self.lock.release()
+
+    def xy_settled(self) -> bool:
+        """True when neither X nor Y is still travelling to its target."""
+        if not self.stage_ok():
+            return True
+        try:
+            return bool(self.stage.target_status('X')) and \
+                bool(self.stage.target_status('Y'))
+        except Exception:
+            return True
+
+    def get_pos_now(self, lock_timeout_s: float = 1.0):
+        """(x, y, z) read from the stage right now, or None when the
+        stage is busy or not connected (never blocks for long)."""
+        if not self.stage_ok():
+            return None
+        if not self.lock.acquire(timeout=lock_timeout_s):
+            return None
+        try:
+            return (float(self.stage.current_pos('X')),
+                    float(self.stage.current_pos('Y')),
+                    float(self.stage.current_pos('Z')))
+        except Exception:
+            return None
+        finally:
+            self.lock.release()
 
     def home_and_center(self, status_cb=None) -> bool:
         """Startup calibration: objective fully lowered, XY homed against
@@ -913,9 +1014,10 @@ def zstack_planes(center_z_um: float, cs: ChannelSettings,
     zc = cs.zstack
     if not (zc.enabled or force_stack) or abs(zc.range_um) < 1e-6:
         return np.array([z0], dtype=np.float64)
-    half = abs(zc.range_um) / 2.0
-    step = max(abs(zc.step_um), 0.1)
-    return np.arange(z0 - half, z0 + half + 1e-6, step, dtype=np.float64)
+    # Symmetric about the center, which is always one of the planes.
+    # Returned bottom to top; acquisitions run it top to bottom.
+    offs = experiment.stack_offsets(zc.range_um, max(abs(zc.step_um), 0.1))
+    return z0 + np.array(offs[::-1], dtype=np.float64)
 
 
 def field_structure(img: np.ndarray) -> float:
@@ -1495,8 +1597,9 @@ def run_z_stack(hw: ScopeHW,
         cs = channel_settings.get(ch)
         if cs is None:
             continue
+        # Top of the range first, stepping down through the center.
         zs = zstack_planes(center_z_um, cs, use_channel_z_offsets,
-                           force_stack=True)
+                           force_stack=True)[::-1]
         hw.set_channel(ch, cs)
         _status(f'Z-stack {ch}: {len(zs)} slices '
                 f'({zs[0]:.1f} to {zs[-1]:.1f} um)')
@@ -1516,6 +1619,52 @@ def run_z_stack(hw: ScopeHW,
     _status(f'Z-stack finished -> {out_dir}')
 
 
+def run_z_planes(hw: ScopeHW,
+                 channel_settings: dict[str, ChannelSettings],
+                 channels: list[str],
+                 planes_um: list[float],
+                 shading: ShadingCorrector | None,
+                 out_dir: str,
+                 cancel: threading.Event,
+                 status_cb=None,
+                 settle_s: float = 0.1,
+                 return_z_um: float | None = None) -> None:
+    """Acquire each channel at exactly the given Z planes, in the order
+    given (a stack set by its begin and end). The planes are absolute:
+    no chromatic offset is added. Z returns to ``return_z_um`` at the
+    end (default: the first plane)."""
+    def _status(msg):
+        if status_cb:
+            status_cb(msg)
+
+    zs = [max(float(z), 0.0) for z in planes_um]
+    if not zs:
+        return
+    for ch in channels:
+        if cancel.is_set():
+            break
+        cs = channel_settings.get(ch)
+        if cs is None:
+            continue
+        hw.set_channel(ch, cs)
+        _status(f'Z-stack {ch}: {len(zs)} slices '
+                f'({zs[0]:.1f} to {zs[-1]:.1f} um)')
+        for j, z in enumerate(zs):
+            if cancel.is_set():
+                break
+            hw.move_z(z)
+            frame = hw.grab_settled(settle_s=settle_s)
+            if frame is None:
+                continue
+            if shading is not None and shading.enabled:
+                frame = shading.apply(frame, ch, z)
+            save_image(os.path.join(out_dir, f'zstack_{ch}_{j:03d}_'
+                                             f'{z:.1f}um.tiff'), frame)
+    hw.move_z(zs[0] if return_z_um is None else float(return_z_um))
+    hw.leds_off()
+    _status(f'Z-stack finished -> {out_dir}')
+
+
 def measure_image_shift(img_a: np.ndarray, img_b: np.ndarray,
                         downsample_to: int = 512):
     """Translation of img_b relative to img_a in full-res pixels via phase
@@ -1531,10 +1680,58 @@ def measure_image_shift(img_a: np.ndarray, img_b: np.ndarray,
     a -= a.mean()
     b -= b.mean()
     try:
-        (sx, sy), resp = cv2.phaseCorrelate(a, b)
+        # Hanning window: without it the frame edges dominate the
+        # correlation and bias the measured shift.
+        win = cv2.createHanningWindow((a.shape[1], a.shape[0]), cv2.CV_32F)
+        (sx, sy), resp = cv2.phaseCorrelate(a, b, win)
     except Exception:
         return None
     return sx * f, sy * f, float(resp)
+
+
+def locate_patch(img_a: np.ndarray, point_xy: tuple[float, float],
+                 img_b: np.ndarray, expected_xy: tuple[float, float],
+                 patch_px: int = 96, search_frac: float = 0.15,
+                 work_size: int = 1024):
+    """Find where the neighbourhood of ``point_xy`` in ``img_a`` ended up
+    in ``img_b``, searching around ``expected_xy``.
+
+    Used to check a "bring this point to the center" stage move: unlike a
+    whole-frame correlation it stays reliable when the two frames barely
+    overlap, because only the small patch around the clicked point has to
+    be visible in both. Returns (x, y, score) in full-resolution pixels
+    of ``img_b`` (score: normalized correlation, 1 = perfect) or None."""
+    if cv2 is None or img_a is None or img_b is None:
+        return None
+    if img_a.shape != img_b.shape or img_a.ndim != 2 or img_a.size == 0:
+        return None
+    f = max(min(img_a.shape) // work_size, 1)
+    a = img_a[::f, ::f].astype(np.float32)
+    b = img_b[::f, ::f].astype(np.float32)
+    h, w = a.shape
+    half = max(min(patch_px // 2, h // 4, w // 4), 4)
+    px, py = point_xy[0] / f, point_xy[1] / f
+    # Patch around the point, slid inward where the point is near an edge.
+    x0 = int(round(min(max(px - half, 0), w - 2 * half)))
+    y0 = int(round(min(max(py - half, 0), h - 2 * half)))
+    tmpl = a[y0:y0 + 2 * half, x0:x0 + 2 * half]
+    if float(tmpl.std()) < 1e-3:
+        return None                              # featureless
+    off_x, off_y = px - x0, py - y0              # point inside the patch
+    r = int(search_frac * min(h, w))
+    ex, ey = expected_xy[0] / f, expected_xy[1] / f
+    sx0 = int(round(min(max(ex - off_x - r, 0), w - 2 * half)))
+    sy0 = int(round(min(max(ey - off_y - r, 0), h - 2 * half)))
+    sx1 = int(round(min(max(ex - off_x + r + 2 * half, sx0 + 2 * half), w)))
+    sy1 = int(round(min(max(ey - off_y + r + 2 * half, sy0 + 2 * half), h)))
+    search = b[sy0:sy1, sx0:sx1]
+    try:
+        res = cv2.matchTemplate(search, tmpl, cv2.TM_CCOEFF_NORMED)
+        _, score, _, loc = cv2.minMaxLoc(res)
+    except Exception:
+        return None
+    return ((sx0 + loc[0] + off_x) * f, (sy0 + loc[1] + off_y) * f,
+            float(score))
 
 
 def channel_settings_to_dict(cs: dict[str, ChannelSettings]) -> dict:
@@ -1576,6 +1773,10 @@ class PlateCalibration:
         self.rotation_deg: float | None = None
         self.measured_spacing_x_mm: float | None = None
         self.measured_spacing_y_mm: float | None = None
+        # Measured well size in the labware's own plate units (what the
+        # map draws and the sampling fills).
+        self.measured_well_x_mm: float | None = None
+        self.measured_well_y_mm: float | None = None
 
     @staticmethod
     def _build_targets(lw) -> list[CalTarget]:
@@ -1633,22 +1834,53 @@ class PlateCalibration:
                            for t in self.targets[:4]]
         c_a1 = (m12 + m3 + m6 + m9) / 4.0
         self.a1_center_stage_um = (float(c_a1[0]), float(c_a1[1]))
-        rx = lw.well_size_x_mm / 2.0
-        ry = lw.well_size_y_mm / 2.0
-        ex = (m3 - m9) / (2 * rx)
-        ey = (m6 - m12) / (2 * ry)
+        # Only the DIRECTIONS of the plate axes come from the A1 marks.
+        # The stage reads true micrometres, so one plate millimetre is
+        # 1000 um whatever the size of the well turns out to be (scaling
+        # by measured/catalogue well size sent the stage to the wrong
+        # row for a plate with smaller wells than the definition).
+        dx, dy = m3 - m9, m6 - m12
+        lx, ly = float(np.linalg.norm(dx)), float(np.linalg.norm(dy))
+        if lx < 1.0 or ly < 1.0:
+            return False
+        ex, ey = dx / lx * 1000.0, dy / ly * 1000.0
+        # Targets are defined with the catalogue well radius; aim at the
+        # rim of the well as measured instead.
+        kx = (lx / 2000.0) / (lw.well_size_x_mm / 2.0)
+        ky = (ly / 2000.0) / (lw.well_size_y_mm / 2.0)
+        self._rim_scale = (kx, ky)
         self.matrix = [[float(ex[0]), float(ey[0])],
                        [float(ex[1]), float(ey[1])]]
         return True
 
-    def estimate_stage_for(self, target: CalTarget,
-                           fallback_transform) -> tuple[float, float] | None:
+    def estimate_stage_for(self, target: CalTarget, fallback_transform,
+                           signs: tuple[float, float] = (1.0, 1.0)
+                           ) -> tuple[float, float] | None:
         """Best-known stage position for a target: its own mark, else the
-        current (possibly partial) solve, else the caller's transform."""
+        current (possibly partial) solve, else the nominal plate offset
+        from the nearest target already marked (``signs`` = stage axis
+        directions), else the caller's transform."""
         if target.marked_stage_um is not None:
             return target.marked_stage_um
         if self.matrix is not None and self.a1_center_stage_um is not None:
-            return self.plate_mm_to_stage_um(*target.plate_mm)
+            lw = self.labware
+            kx, ky = getattr(self, '_rim_scale', (1.0, 1.0))
+            px, py = target.plate_mm
+            i = self.targets.index(target)
+            if i == 4:      # last well of the first row, 9 o'clock rim
+                px += lw.well_size_x_mm / 2.0 * (1.0 - kx)
+            elif i == 5:    # last well of the first column, 12 o'clock rim
+                py += lw.well_size_y_mm / 2.0 * (1.0 - ky)
+            return self.plate_mm_to_stage_um(px, py)
+        marked = [t for t in self.targets if t.marked_stage_um is not None]
+        if marked:
+            ref = min(marked, key=lambda t: math.hypot(
+                t.plate_mm[0] - target.plate_mm[0],
+                t.plate_mm[1] - target.plate_mm[1]))
+            return (ref.marked_stage_um[0] + (target.plate_mm[0]
+                                              - ref.plate_mm[0]) * 1000.0 * signs[0],
+                    ref.marked_stage_um[1] + (target.plate_mm[1]
+                                              - ref.plate_mm[1]) * 1000.0 * signs[1])
         if fallback_transform is not None:
             lw = self.labware
             rel = (target.plate_mm[0] - lw.a1_offset_x_mm,
@@ -1669,45 +1901,123 @@ class PlateCalibration:
         c_a1 = (m12 + m3 + m6 + m9) / 4.0
         self.a1_center_stage_um = (float(c_a1[0]), float(c_a1[1]))
 
-        # Plate-frame nominal vectors from the A1 center (mm):
-        rx = lw.well_size_x_mm / 2.0
-        ry = lw.well_size_y_mm / 2.0
+        # Everything comes from the marks; the catalogue well size is
+        # not used. The well across (3 minus 9 o'clock) and down (6 minus
+        # 12 o'clock) give the well size and the plate axes. The center
+        # of the last well of the first row is its 9 o'clock mark plus
+        # half the well across; the center of the last well of the first
+        # column is its 12 o'clock mark plus half the well down.
+        across, down = m3 - m9, m6 - m12
+        l_across = float(np.linalg.norm(across))
+        l_down = float(np.linalg.norm(down))
+        if l_across < 1.0 or l_down < 1.0:
+            return False
         last_col = lw.cols - 1
         last_row = lw.rows - 1
-        n_row = np.array([last_col * lw.spacing_x_mm - rx, 0.0])
-        n_col = np.array([0.0, last_row * lw.spacing_y_mm - ry])
-        v_row = m_row - c_a1
-        v_col = m_col - c_a1
-        if last_col == 0 or last_row == 0 or abs(n_row[0]) < 1e-9 or abs(n_col[1]) < 1e-9:
-            # Degenerate (single-row/column labware): axis-aligned fallback
-            # from the A1 edge marks only.
-            ex = (m3 - m9)
-            ey = (m6 - m12)
-            M = np.column_stack([ex / (2 * rx), ey / (2 * ry)])
+        c_row = m_row + across / 2.0
+        c_col = m_col + down / 2.0
+        # Column k of the matrix: stage um per plate mm along that axis,
+        # so that well (row, col) of the definition lands on the measured
+        # well centers, evenly spaced between A1 and the far wells.
+        if last_col > 0 and lw.spacing_x_mm:
+            mx = (c_row - c_a1) / (last_col * lw.spacing_x_mm)
         else:
-            N = np.column_stack([n_row, n_col])    # plate-frame
-            V = np.column_stack([v_row, v_col])    # stage-frame
-            try:
-                M = V @ np.linalg.inv(N)
-            except np.linalg.LinAlgError:
-                return False
+            mx = across / l_across * 1000.0
+        if last_row > 0 and lw.spacing_y_mm:
+            my = (c_col - c_a1) / (last_row * lw.spacing_y_mm)
+        else:
+            my = down / l_down * 1000.0
+        M = np.column_stack([mx, my])
+        if abs(float(np.linalg.det(M))) < 1e-6:
+            return False
         self.matrix = [[float(M[0, 0]), float(M[0, 1])],
                        [float(M[1, 0]), float(M[1, 1])]]
 
-        # Measured quantities for display / labware refinement.
         scale_x = float(np.linalg.norm(M[:, 0]))   # um per plate-mm along x
         scale_y = float(np.linalg.norm(M[:, 1]))
-        d_x = float(np.linalg.norm(m3 - m9)) / scale_x if scale_x > 0 else 0.0
-        d_y = float(np.linalg.norm(m6 - m12)) / scale_y if scale_y > 0 else 0.0
-        self.measured_well_diameter_mm = (d_x + d_y) / 2.0
+        # Well size and pitch in real millimetres (for display)...
+        self.measured_well_diameter_mm = (l_across + l_down) / 2000.0
         self.rotation_deg = float(np.degrees(np.arctan2(M[1, 0], M[0, 0])))
-        if last_col > 0 and scale_x > 0:
-            row_len_mm = float(np.linalg.norm(v_row)) / scale_x
-            self.measured_spacing_x_mm = (row_len_mm + d_x / 2.0) / last_col
-        if last_row > 0 and scale_y > 0:
-            col_len_mm = float(np.linalg.norm(v_col)) / scale_y
-            self.measured_spacing_y_mm = (col_len_mm + d_y / 2.0) / last_row
+        if last_col > 0:
+            self.measured_spacing_x_mm = \
+                float(np.linalg.norm(c_row - c_a1)) / 1000.0 / last_col
+        if last_row > 0:
+            self.measured_spacing_y_mm = \
+                float(np.linalg.norm(c_col - c_a1)) / 1000.0 / last_row
+        # ...and the well size in the definition's plate units (for the
+        # map and for filling a well with sites).
+        self.measured_well_x_mm = l_across / scale_x
+        self.measured_well_y_mm = l_down / scale_y
         return True
+
+    def scale_ok(self, tolerance: float = 0.03) -> bool:
+        """The measured geometry is taken as it is: the catalogue pitch
+        and well size are not a condition. Only what no plate of this
+        class can be is refused: rows and columns spaced in a different
+        proportion from the class (a mark on the wrong well does that),
+        or wells that would overlap."""
+        if self.matrix is None:
+            return True
+        if self.complete:
+            return not self.scale_problems(tolerance)
+        M = np.asarray(self.matrix, dtype=np.float64)
+        sx = float(np.linalg.norm(M[:, 0]))
+        sy = float(np.linalg.norm(M[:, 1]))
+        return sy > 0 and abs(sx / sy - 1.0) <= tolerance
+
+    def scale_problems(self, tolerance: float = 0.03
+                       ) -> list[tuple[int, str]]:
+        """(target index, explanation) for a far mark that cannot be on
+        the well it is meant for, judged from the measurements alone."""
+        if self.matrix is None or not self.complete:
+            return []
+        lw = self.labware
+        M = np.asarray(self.matrix, dtype=np.float64)
+        # (target, far-well index, catalogue pitch, measured um per
+        # catalogue mm, measured well in catalogue mm, well namer)
+        axes = [(4, lw.cols - 1, lw.spacing_x_mm,
+                 float(np.linalg.norm(M[:, 0])), self.measured_well_x_mm,
+                 lambda k: lw.get_well_name(0, k)),
+                (5, lw.rows - 1, lw.spacing_y_mm,
+                 float(np.linalg.norm(M[:, 1])), self.measured_well_y_mm,
+                 lambda k: lw.get_well_name(k, 0))]
+        out = []
+        # Wells cannot overlap: the pitch must be larger than the well.
+        for idx, last, pitch, scale, well, name_of in axes:
+            if last > 0 and pitch and well and well >= pitch:
+                out.append((idx, (
+                    f'{self.targets[idx].label} was confirmed only '
+                    f'{last * pitch * scale / 1e6:.1f} mm from A1, which '
+                    f'would make the wells overlap')))
+        if out:
+            return out
+        (_, last_x, pitch_x, sx, _, _), (_, last_y, pitch_y, sy, _, _) = axes
+        if last_x <= 0 or last_y <= 0 or not pitch_x or not pitch_y \
+                or sx <= 0 or sy <= 0:
+            return []
+        # Rows and columns of one plate class keep their proportion
+        # (equal pitch on a standard plate). The two far marks check
+        # each other; no absolute size is assumed.
+        if abs(sx / sy - 1.0) <= tolerance:
+            return []
+        # Which of the two? The one whose pitch is further from the
+        # catalogue value is the likelier slip (a hint, nothing more).
+        bad, good = (axes[0], axes[1]) if abs(sx - 1000.0) >= \
+            abs(sy - 1000.0) else (axes[1], axes[0])
+        idx, last, pitch, scale, _, name_of = bad
+        label = self.targets[idx].label
+        wells = last * scale / good[3]     # in pitches of the other axis
+        k = int(round(wells))
+        real = pitch * scale / 1000.0
+        other = good[2] * good[3] / 1000.0
+        if 0 < k != last and abs(wells - k) < 0.2:
+            text = (f'{label} was confirmed {wells:.1f} wells from A1. '
+                    f'That is well {name_of(k) if k < last else "beyond " + name_of(last)}, '
+                    f'not {name_of(last)}')
+        else:
+            text = (f'{label} gives a well pitch of {real:.2f} mm, but the '
+                    f'other direction measures {other:.2f} mm')
+        return [(idx, text)]
 
     # ------------------------------------------------------- transforms
 
@@ -1743,6 +2053,8 @@ class PlateCalibration:
             'rotation_deg': self.rotation_deg,
             'measured_spacing_x_mm': self.measured_spacing_x_mm,
             'measured_spacing_y_mm': self.measured_spacing_y_mm,
+            'measured_well_x_mm': self.measured_well_x_mm,
+            'measured_well_y_mm': self.measured_well_y_mm,
             'marks': [t.marked_stage_um for t in self.targets],
         }
 
@@ -1754,6 +2066,8 @@ class PlateCalibration:
         self.rotation_deg = d.get('rotation_deg')
         self.measured_spacing_x_mm = d.get('measured_spacing_x_mm')
         self.measured_spacing_y_mm = d.get('measured_spacing_y_mm')
+        self.measured_well_x_mm = d.get('measured_well_x_mm')
+        self.measured_well_y_mm = d.get('measured_well_y_mm')
         marks = d.get('marks') or []
         for t, m in zip(self.targets, marks):
             t.marked_stage_um = tuple(m) if m else None

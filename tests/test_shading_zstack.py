@@ -164,7 +164,7 @@ def test_z_stack_acquisition_applies_the_plane_at_each_slice(shading, tmp_path,
     monkeypatch.setattr(acq, 'save_image', lambda p, img: None)
     acq.run_z_stack(scope, {'PC': cs}, ['PC'], 50.0, shading, str(tmp_path),
                     acq.threading.Event(), use_channel_z_offsets=False)
-    assert seen == [40.0, 50.0, 60.0]
+    assert seen == [60.0, 50.0, 40.0]        # top of the range first
 
 
 def _pc(range_um=20.0, step_um=10.0, offset=0.0, enabled=True):
@@ -199,7 +199,7 @@ def test_shading_planes_are_the_acquisition_planes(shading, tmp_path,
     monkeypatch.setattr(acq, 'save_image', lambda p, img: None)
     acq.run_z_stack(scope, {'PC': cs}, ['PC'], focus, shading, str(tmp_path),
                     acq.threading.Event())
-    np.testing.assert_allclose(seen, planes)
+    np.testing.assert_allclose(seen, planes[::-1])   # acquired top first
 
 
 def test_a_channel_without_a_stack_is_one_plane_at_its_offset():

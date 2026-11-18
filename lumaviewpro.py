@@ -91,7 +91,12 @@ def _ensure_lvp_logger():
 _ensure_lvp_logger()
 
 import numpy as np
+from kivy.config import Config
+# Right/middle mouse buttons pan the plate map; without this Kivy turns a
+# right-click into a simulated second finger and leaves a red dot behind.
+Config.set('input', 'mouse', 'mouse,disable_multitouch')
 from kivy.app import App
+from kivy.base import ExceptionHandler, ExceptionManager
 from kivy.clock import Clock
 from kivy.properties import StringProperty, NumericProperty, BooleanProperty, ListProperty
 from kivy.uix.boxlayout import BoxLayout
@@ -102,6 +107,7 @@ from kivy.factory import Factory
 import plate_navigator
 import acquisition as acq
 import experiment
+import online_processing
 from experiment_wizard import ExperimentWizardMixin
 
 # LED current ceiling for the sliders/fields (mA).
@@ -136,13 +142,73 @@ CHANNEL_LUTS = {
     'LONG': (1.0, 0.0, 1.0),   # longer ex/em (if fitted) -> magenta
 }
 
-CAPTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'captures')
-PROTOCOLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             'data', 'protocols')
+# Folders used until the user chooses their own: with the program for the
+# account that can write there, else in the user's Documents.
+if acq.dir_writable(os.path.join(acq.APP_DIR, 'data')):
+    CAPTURES_DIR = os.path.join(acq.APP_DIR, 'captures')
+    PROTOCOLS_DIR = os.path.join(acq.APP_DIR, 'data', 'protocols')
+else:
+    CAPTURES_DIR = os.path.join(acq.user_documents_dir(), 'captures')
+    PROTOCOLS_DIR = os.path.join(acq.user_documents_dir(), 'protocols')
 
 # Basler daA3840-45um sensor pixel pitch is 2.0 um; divide by objective
 # magnification for the default sample-plane scale (editable in the UI).
 DEFAULT_UM_PER_PX = 0.5   # 2.0 um / 4x objective
+
+OBJECTIVES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'objectives.json')
+CAMERA_PIXEL_UM = 2.0     # sensor pixel pitch, unbinned
+# Travel used to take up XY drive backlash before a measured move.
+XY_BACKLASH_UM = 100.0
+# Lumascope tube lens focal length (data/scopes.json: 47.8 mm on most
+# models). Image scale = pixel pitch * objective focal length / this.
+TUBE_FOCAL_MM = 47.8
+
+
+LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+# Written on a clean shutdown after the stage was parked; the park guard
+# process parks the stage itself when the app ends without leaving it.
+PARKED_FLAG = os.path.join(LOGS_DIR, 'parked.flag')
+
+
+class _LogAndContinue(ExceptionHandler):
+    """An error in a button handler or a scheduled callback used to close
+    the whole application (and, with it, any experiment being set up).
+    Record the traceback in logs/errors.log, show it in the status bar and
+    keep running."""
+
+    _last = None
+    _repeats = 0
+
+    def handle_exception(self, exc):
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            return ExceptionManager.RAISE
+        import traceback
+        text = ''.join(traceback.format_exception(
+            type(exc), exc, exc.__traceback__))
+        # The same error every frame must not flood the log.
+        if text == self._last:
+            self._repeats += 1
+        else:
+            self._last, self._repeats = text, 0
+        if self._repeats < 3:
+            try:
+                os.makedirs(LOGS_DIR, exist_ok=True)
+                with open(os.path.join(LOGS_DIR, 'errors.log'), 'a',
+                          encoding='utf-8') as f:
+                    f.write(f'=== {time.strftime("%Y-%m-%d %H:%M:%S")}\n'
+                            f'{text}\n')
+            except Exception:
+                pass
+            print(text, flush=True)
+        app = App.get_running_app()
+        if app is not None:
+            app.status_msg = (f'ERROR: {type(exc).__name__}: {exc}  '
+                              f'(details in logs/errors.log)')
+        return ExceptionManager.PASS
+
+
+ExceptionManager.add_handler(_LogAndContinue())
 
 
 class LumaViewProMainLayout(BoxLayout):
@@ -178,11 +244,22 @@ class LumaViewProApp(ExperimentWizardMixin, App):
     shading_on = BooleanProperty(False)
     surface_info = StringProperty('Surface: no anchor')
     worker_busy = BooleanProperty(False)
+    map_big = BooleanProperty(False)      # plate map fills the image area
+    pos_edit_mode = StringProperty('')    # map clicks: '', 'move' or 'add'
+    zman_info = StringProperty('')        # manual z-stack: what will be run
+    map_flip_x = BooleanProperty(True)    # plate map drawn left-right mirrored
+    # Settings are kept per Windows account.
+    user_name = StringProperty(os.environ.get('USERNAME') or 'this user')
+    settings_path = StringProperty(acq.SETTINGS_PATH)
     labware_options = ListProperty(['96-well plate'])
+    objective_name = StringProperty('')
+    objective_options = ListProperty([])
     labware_name = StringProperty('96-well plate')
     builtin_labware_names = ListProperty([])
     cal_active = BooleanProperty(False)
     cal_label = StringProperty('')
+    cal_progress = StringProperty('')
+    protocol_loaded = StringProperty('')
     cal_info = StringProperty('Plate not calibrated')
     use_surface_on = BooleanProperty(True)
     use_z_offsets_on = BooleanProperty(True)
@@ -248,6 +325,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         self.stage_y_um = 0.0
         self.stage_z_um = 0.0  # NumericProperties; values reset here
 
+        self._load_objectives()
+
         # Labware + plate calibration
         self.labware_lib = labware_defs.LabwareLibrary()
         self.builtin_labware_names = list(self.labware_lib.builtins)
@@ -262,6 +341,13 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         self.protocol_positions: list[dict] = []
         self._pos_review_index = 0
         self.travel_clearance_um = 500.0
+
+        # Global z-stack plan (setup wizard): lens data for the suggested
+        # step, and the opt-outs. zstack_optout maps a well name to the
+        # channels that are NOT stacked there ('*' = no channel is).
+        self.zplan: dict = {'na': None, 'mag': None, 'rate': 1.0,
+                            'override_um': None, 'channels_off': []}
+        self.zstack_optout: dict[str, list[str]] = {}
 
         self._load_persisted()
 
@@ -279,8 +365,11 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         plate = self.root.ids.get('plate_map')
         if plate:
             plate.on_well_double_click = self.on_well_double_click
+            plate.on_point_double_click = self.on_plate_point_double_click
             plate.on_well_selected = self.on_well_selected
             plate.on_wells_toggle = self.on_wells_toggled
+            plate.on_focus_scroll = self.on_focus_scroll
+            plate.on_point_click = self.on_plate_point_click
             plate.set_labware(self.current_labware)
         self.labware_options = self.labware_lib.names()
         self.labware_name = self.current_labware.name
@@ -321,6 +410,9 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             return False
         if self._text_input_focused():
             return False
+        if key in (13, 271) and self.cal_active:
+            self.cal_mark()         # Enter = confirm the calibration point
+            return True
         mult = 10.0 if 'shift' in (modifiers or []) else 1.0
         s = self.xy_step_um * mult
         if key == 276:    self.jog('X', -s)
@@ -407,6 +499,9 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                 stg.connect()
             self.hw.stage = stg
             self.stage_connected = bool(getattr(stg, 'driver', False))
+            # Only for the real motor board, never a simulated stage.
+            if self.stage_connected and                     type(stg).__module__ == 'motorboard':
+                self._start_park_guard()
         except Exception as e:
             self._set_status(f'Stage error: {e}')
 
@@ -417,6 +512,35 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         else:
             self._set_status('Ready (no stage)')
         Clock.schedule_once(lambda dt: setattr(self, 'initializing', False), 0)
+
+    def _start_park_guard(self):
+        """Start the separate process that parks the stage (objective
+        down, then stage centered) if this application ever ends without
+        doing so itself: a crash, or a frozen window that gets killed."""
+        if getattr(self, '_park_guard', None) is not None:
+            return
+        try:
+            import subprocess
+            here = os.path.dirname(os.path.abspath(__file__))
+            os.makedirs(LOGS_DIR, exist_ok=True)
+            try:
+                os.remove(PARKED_FLAG)
+            except OSError:
+                pass
+            flags = 0
+            if os.name == 'nt':
+                # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: it must
+                # outlive this process and its console window.
+                flags = 0x00000008 | 0x00000200
+            self._park_guard = subprocess.Popen(
+                [sys.executable, os.path.join(here, 'park_guard.py'),
+                 str(os.getpid()), PARKED_FLAG,
+                 os.path.join(LOGS_DIR, 'park_guard.log')],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, close_fds=True,
+                creationflags=flags, cwd=here)
+        except Exception as e:
+            print(f'[LumaViewPro] park guard NOT started: {e}', flush=True)
 
     # ------------------------------------------------- live view pipeline
 
@@ -466,6 +590,11 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                 frame, tint=tint, significant_bits=self.significant_bits,
                 clip_level=(acq.saturation_level(self.significant_bits)
                             if self.clip_overlay_on else None))
+            # The plate map draws the same texture: repaint it too.
+            plate = self.root.ids.get('plate_map')
+            if plate is not None and plate.live_texture is not None:
+                plate.canvas.ask_update()
+            self._preview_when_resting(frame, ch)
 
     def _position_poller(self):
         while True:
@@ -491,7 +620,183 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         rel = self.stage_to_plate_rel(self.stage_x_um, self.stage_y_um)
         if rel is None:
             return
+        viewport = self.root.ids.get('main_camera_viewport')
+        corners = self._live_image_corners_rel()
+        plate.set_live_image(viewport.texture if viewport and corners
+                             else None, corners)
         plate.set_marker_plate_mm(rel[0], rel[1])
+
+    def _live_image_corners_rel(self):
+        """Where the corners of the live image (top-left, top-right,
+        bottom-right, bottom-left) are on the plate, in mm from the A1
+        center; None when there is no live image to place.
+
+        With the image motion calibrated, each corner is placed where the
+        stage would have to be to bring it to the center, so the image is
+        drawn with its real orientation and scale. Without it, the image
+        is drawn upright at the scale given by the objective."""
+        f = self.latest_frame
+        if f is None or (self.worker_busy and self._mosaic is not None):
+            return None
+        h, w = f.shape[:2]
+        return self._image_corners_rel(self.stage_x_um, self.stage_y_um,
+                                       w, h)
+
+    def _image_corners_rel(self, x_um: float, y_um: float, w: int, h: int):
+        """Plate position (mm from the A1 center) of the corners of a
+        ``w`` x ``h`` pixel image taken with the stage at (x_um, y_um)."""
+        px = ((-w / 2.0, -h / 2.0), (w / 2.0, -h / 2.0),
+              (w / 2.0, h / 2.0), (-w / 2.0, h / 2.0))
+        inv = None
+        A = self._img_cal_matrix()
+        if A is not None:
+            try:
+                inv = np.linalg.inv(A)
+            except np.linalg.LinAlgError:
+                inv = None
+        out = []
+        if inv is not None:
+            for p in px:
+                s = -(inv @ np.asarray(p))
+                rel = self.stage_to_plate_rel(x_um + float(s[0]),
+                                              y_um + float(s[1]))
+                if rel is None:
+                    return None
+                out.append(rel)
+            return out
+        c = self.stage_to_plate_rel(x_um, y_um)
+        if c is None:
+            return None
+        mm_per_px = self.effective_um_per_px() / 1000.0
+        return [(c[0] + p[0] * mm_per_px, c[1] + p[1] * mm_per_px)
+                for p in px]
+
+    # ------------------------------------- previews left on the plate map
+
+    PREVIEW_PX = 192          # longer side of a preview left on the map
+    PREVIEW_REST_S = 2.0      # live view at rest this long leaves one
+
+    def _preview_rgb(self, frame, ch: str):
+        """Small display copy of a frame in its channel colour (uint8,
+        h x w x 3), scaled like the live display. Thread safe."""
+        if frame is None or frame.ndim != 2 or frame.size == 0:
+            return None
+        h, w = frame.shape[:2]
+        f = max(max(w, h) // self.PREVIEW_PX, 1)
+        small = frame[::f, ::f]
+        if self.autoscale_on:
+            lo, hi = float(small.min()), float(small.max())
+            g = ((small.astype(np.float32) - lo) * (255.0 / (hi - lo))
+                 if hi > lo else np.zeros(small.shape, np.float32))
+        else:
+            g = small.astype(np.float32) / float(
+                2 ** max(self.significant_bits - 8, 0))
+        g = np.clip(g, 0, 255)
+        tint = CHANNEL_LUTS.get(ch, (1.0, 1.0, 1.0))
+        return np.stack([(g * t).astype(np.uint8) for t in tint[:3]],
+                        axis=-1)
+
+    def leave_preview(self, ch: str, frame, x_um: float, y_um: float):
+        """Leave (or renew) the preview of an image at the stage position
+        it was taken at. May be called from the acquisition thread."""
+        try:
+            rgb = self._preview_rgb(frame, ch)
+        except Exception:
+            return
+        if rgb is None:
+            return
+        h, w = frame.shape[:2]
+
+        def _add(dt):
+            plate = self._plate_map()
+            if plate is None or self.no_plate_on:
+                return
+            corners = self._image_corners_rel(x_um, y_um, w, h)
+            if corners:
+                plate.add_snapshot(rgb, corners)
+        Clock.schedule_once(_add, 0)
+
+    def clear_map_previews(self):
+        plate = self._plate_map()
+        if plate is not None:
+            plate.clear_snapshots()
+
+    def _preview_when_resting(self, frame, ch: str):
+        """Called for every live frame: once the stage has been still
+        with the light on for PREVIEW_REST_S, the frame stays on the map
+        (again after each further move or refocus)."""
+        if self.worker_busy or ch not in CHANNELS or \
+                self.live_channel not in CHANNELS:
+            self._rest = None
+            return
+        key = (round(self.stage_x_um), round(self.stage_y_um),
+               round(self.stage_z_um), ch)
+        now = time.time()
+        rest = getattr(self, '_rest', None)
+        if rest is None or rest['key'] != key:
+            self._rest = {'key': key, 'since': now, 'done': False}
+        elif not rest['done'] and now - rest['since'] >= self.PREVIEW_REST_S:
+            rest['done'] = True
+            self.leave_preview(ch, frame, self.stage_x_um, self.stage_y_um)
+
+    def _plate_map(self):
+        return self.root.ids.get('plate_map') if self.root else None
+
+    def set_map_big(self, big: bool):
+        """Show the plate map in the image area (large) or in its panel.
+        Large, the camera view makes way for it: the live image is drawn
+        on the map at its real place, size and channel colour."""
+        ids = self.root.ids if self.root else {}
+        plate, home = ids.get('plate_map'), ids.get('plate_map_home')
+        holder, viewport = ids.get('big_map_holder'), \
+            ids.get('main_camera_viewport')
+        if None in (plate, home, holder, viewport) or \
+                bool(big) == self.map_big:
+            return
+        plate = getattr(plate, '__self__', plate)   # keep it alive unparented
+        if plate.parent is not None:
+            plate.parent.remove_widget(plate)
+        if big:
+            viewport.size_hint_x, viewport.width = None, 0
+            viewport.opacity = 0
+            holder.size_hint_x = 1
+            holder.add_widget(plate)
+            # Zooming in then goes to the image, and the view stays with
+            # it as the stage moves (a right-drag pan releases it).
+            plate.follow_stage = True
+        else:
+            holder.size_hint_x, holder.width = None, 0
+            viewport.size_hint_x = 1
+            viewport.opacity = 1
+            home.add_widget(plate)
+        plate.wheel_focus = bool(big)
+        self.map_big = bool(big)
+        # The same plate point stays in the middle at the new size.
+        Clock.schedule_once(lambda dt: (plate.redraw(),
+                                        self._update_plate_marker()), 0)
+
+    def toggle_map_flip(self):
+        """Mirror the plate map left to right (the picture only), and
+        remember the choice for this user."""
+        self.map_flip_x = not self.map_flip_x
+        self._persist()
+        self._set_status('Plate map: column 1 on the '
+                         + ('right (mirrored)' if self.map_flip_x else 'left'))
+
+    def plate_zoom(self, what: str):
+        """Zoom buttons under the plate map: in, out, fit, stage."""
+        plate = self._plate_map()
+        if plate is None:
+            return
+        if what == 'in':
+            plate.zoom_by(1.5)
+        elif what == 'out':
+            plate.zoom_by(1.0 / 1.5)
+        elif what == 'fit':
+            plate.zoom_fit()
+        elif what == 'stage':
+            plate.follow_stage = True
+            plate.zoom_to_stage()
 
     # -------------------------------------------- plate <-> stage transform
 
@@ -755,10 +1060,19 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self._set_status('Calibration needs the stage')
             return
         self.cal_wizard = PlateCalibration(self.current_labware)
+        self._cal_rejected = {}
         self.cal_active = True
-        self._cal_show_current(move=False)
+        self._cal_log(f'--- start, labware {self.current_labware.name}')
         self._set_status('Calibration: drive the FOV center to the marked '
-                         'position, then press Mark')
+                         'position, then press CONFIRM THIS POINT (or Enter)')
+        # Show the well being calibrated, with the live image on it, and
+        # keep the stage position in the middle as it moves between rims.
+        plate = self._plate_map()
+        if plate is not None and plate.marker_plate_mm is not None:
+            plate.follow_stage = True
+            plate.zoom_to_span(plate.marker_plate_mm,
+                               max(plate._well_size()) * 1.6)
+        self._cal_show_current(move=True)
 
     def _cal_show_current(self, move: bool = True):
         wiz = self.cal_wizard
@@ -766,27 +1080,86 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             return
         t = wiz.current
         n = len(wiz.targets)
-        done = '*' if t.marked_stage_um is not None else ''
-        self.cal_label = f'[{wiz.index + 1}/{n}] {t.label} {done}'
+        done = '  - CONFIRMED' if t.marked_stage_um is not None else ''
+        self.cal_label = f'Point {wiz.index + 1} of {n}: {t.label}{done}'
+        self.cal_progress = self._cal_progress_text()
         plate = self.root.ids.get('plate_map') if self.root else None
         if plate:
             plate.set_target_plate_mm(t.plate_mm)
         if move:
+            # Drive to where the target is expected: from the marks made
+            # so far, else the previous calibration / A1 anchor, else the
+            # plate-centered-on-the-stage assumption.
             est = wiz.estimate_stage_for(
-                t, self.plate_rel_to_stage
-                if (self.plate_cal or self.a1_stage_um) else None)
-            if est is not None:
-                self._bg(self.hw.move_xy, est[0], est[1])
+                t, self.plate_rel_to_stage,
+                (self.plate_sign_x, self.plate_sign_y))
+            if est is None:
+                return
+            if not acq.in_stage_bounds(*est):
+                self._set_status(f'{t.label}: expected position is outside '
+                                 f'the stage travel - jog there by hand')
+                return
+            self._bg(self.hw.move_xy, est[0], est[1])
+
+    def _cal_missing(self) -> list[int]:
+        wiz = self.cal_wizard
+        return [] if wiz is None else [
+            i for i, t in enumerate(wiz.targets) if t.marked_stage_um is None]
+
+    def _cal_progress_text(self) -> str:
+        wiz = self.cal_wizard
+        if wiz is None:
+            return ''
+        missing = self._cal_missing()
+        n = len(wiz.targets)
+        text = f'{n - len(missing)} of {n} points confirmed.'
+        if missing:
+            text += ' Still to confirm: ' + ', '.join(
+                wiz.targets[i].label for i in missing) + '.'
+        return text
+
+    def _cal_goto_missing(self, why: str) -> bool:
+        """Go to the first point that has not been confirmed; False when
+        every point is confirmed."""
+        wiz = self.cal_wizard
+        missing = self._cal_missing()
+        if wiz is None or not missing:
+            return False
+        wiz.index = missing[0]
+        self._cal_show_current(move=True)
+        self._set_status(
+            f'{why}{len(missing)} point{"s" if len(missing) != 1 else ""} '
+            f'not confirmed yet - going to {wiz.current.label}. Center the '
+            f'rim, then press CONFIRM THIS POINT (or Enter).')
+        return True
 
     def cal_mark(self):
-        """Record the current stage position for the shown target and
-        advance to the next one."""
+        """Confirm the shown target: record where the stage is now, then
+        go on to the next one."""
         wiz = self.cal_wizard
         if wiz is None:
             return
-        wiz.mark_current(self.stage_x_um, self.stage_y_um)
-        self._set_status(f'Marked {wiz.current.label}')
-        if wiz.index == 3:
+        if not self.hw.xy_settled() and \
+                getattr(self, '_cal_moving_warned', None) != wiz.index:
+            # Ask once per point; a second press confirms regardless, so
+            # a stage that never reports "arrived" cannot block the user.
+            self._cal_moving_warned = wiz.index
+            self._cal_log(f'confirm pressed at {wiz.current.label} while '
+                          f'the stage reported moving - asked to repeat')
+            self._set_status('The stage reports it is still moving. Wait '
+                             'for it to stop, then press CONFIRM again.')
+            return
+        self._cal_moving_warned = None
+        # Read the stage itself: the displayed position is refreshed only
+        # twice a second and may lag a jog made just before the press.
+        now = self.hw.get_pos_now()
+        x, y = (now[0], now[1]) if now is not None else \
+            (self.stage_x_um, self.stage_y_um)
+        wiz.mark_current(x, y)
+        self._cal_log(f'marked {wiz.current.label} at ({x:.0f}, {y:.0f})')
+        self._set_status(f'Confirmed {wiz.current.label}')
+        if all(t.marked_stage_um is not None for t in wiz.targets[:4]) \
+                and wiz.matrix is None:
             # All four A1 edges marked: provisional solve enables
             # auto-driving to the two long-range targets.
             wiz.provisional_solve()
@@ -795,22 +1168,44 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             return
         if wiz.next():
             self._cal_show_current(move=True)
+            return
+        # Last target marked but an earlier one was stepped over: go back
+        # to it instead of leaving the calibration silently unfinished.
+        self._cal_goto_missing('')
 
     def cal_next(self):
-        if self.cal_wizard and self.cal_wizard.next():
+        """Skip to the next point WITHOUT confirming the current one."""
+        wiz = self.cal_wizard
+        if wiz is None:
+            return
+        t = wiz.current
+        skipped = t.marked_stage_um is None
+        self._cal_log(f'skip pressed at {t.label} '
+                      f'({"not confirmed" if skipped else "confirmed"})')
+        if wiz.next():
             self._cal_show_current(move=True)
+            if skipped:
+                self._set_status(
+                    f'{t.label} was skipped, NOT confirmed. A point only '
+                    f'counts when you press CONFIRM THIS POINT (or Enter).')
+        elif not self._cal_goto_missing('That was the last point. '):
+            self.cal_finish()
 
     def cal_prev(self):
         if self.cal_wizard and self.cal_wizard.prev():
+            self._cal_log(f'back to {self.cal_wizard.current.label}')
             self._cal_show_current(move=True)
 
     def cal_cancel(self):
         self.cal_wizard = None
         self.cal_active = False
         self.cal_label = ''
+        self.cal_progress = ''
+        self._cal_log('canceled')
         plate = self.root.ids.get('plate_map') if self.root else None
         if plate:
             plate.set_target_plate_mm(None)
+            plate.zoom_fit()
         self._set_status('Calibration canceled')
 
     def cal_finish(self):
@@ -818,25 +1213,194 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         if wiz is None:
             return
         if not wiz.complete:
-            self._set_status('Calibration: not all positions are marked yet')
+            self._cal_log('finish pressed with points missing')
+            self._cal_goto_missing('Cannot finish: ')
             return
-        if not wiz.solve():
-            self._set_status('Calibration solve FAILED - review the marks')
+        try:
+            solved = wiz.solve()
+        except Exception as e:
+            self._cal_log(f'solve raised {type(e).__name__}: {e}')
+            solved = False
+        if not solved:
+            self._cal_log('solve FAILED, marks: ' + str(
+                [t.marked_stage_um for t in wiz.targets]))
+            self._set_status('Calibration solve FAILED - two marks may be '
+                             'at the same place. Use Previous to re-mark.')
             return
+        problems = wiz.scale_problems()
+        if problems:
+            idx, text = problems[0]
+            mark = wiz.targets[idx].marked_stage_um
+            before = getattr(self, '_cal_rejected', {}).get(idx)
+            if before is not None and math.hypot(
+                    mark[0] - before[0], mark[1] - before[1]) < 300.0:
+                self._cal_log(f'accepted on the second confirmation: {text}')
+            else:
+                # A plate cannot be stretched: this mark is on another
+                # well (or the definition is for another plate). Take the
+                # mark back and drive to where the well should be.
+                self._cal_rejected = {idx: mark}
+                label = wiz.targets[idx].label
+                wiz.targets[idx].marked_stage_um = None
+                wiz.matrix = None
+                wiz.provisional_solve()
+                wiz.index = idx
+                self._cal_log(f'NOT ACCEPTED: {text}')
+                self._cal_show_current(move=True)
+                self._set_status(f'Calibration NOT accepted: {text}. '
+                                 f'Confirm {label} again.')
+                self._info_popup(
+                    'Calibration NOT accepted',
+                    f'{text}.\n\nThe stage is going to where {label} '
+                    f'should be. Bring that rim to the image center and '
+                    f'confirm it again.\n\n(If this plate really is spaced '
+                    f'like that, confirm at the same place a second time '
+                    f'to accept it.)')
+                return
+        # Positions, the AF point and the focus points belong to the
+        # plate: carry them over to where the plate is now.
+        anchored = self._plate_anchored_snapshot()
         self.plate_cal = wiz
+        self._plate_anchored_restore(anchored)
         self.cal_wizard = None
         self.cal_active = False
-        self.cal_label = ''
+        self.cal_label = 'CALIBRATION COMPLETE'
+        self.cal_progress = 'All 6 points confirmed.'
         plate = self.root.ids.get('plate_map') if self.root else None
         if plate:
             plate.set_target_plate_mm(None)
+            plate.zoom_fit()
+            # Previews were placed with the old plate position.
+            plate.clear_snapshots()
         self._refresh_cal_info()
+        self._cal_log('complete: ' + self.cal_info)
+        self._set_status('Plate calibrated: ' + self.cal_info)
         self._persist()
         self._update_plate_marker()
-        self._set_status('Plate calibrated: ' + self.cal_info)
+        # Positions and selected wells are drawn through the calibration.
+        self._refresh_positions()
+        self._refresh_surface_info()
+        self._cal_done_popup()
+
+    def _info_popup(self, title: str, text: str):
+        try:
+            from kivy.metrics import dp
+            from kivy.uix.button import Button
+            box = BoxLayout(orientation='vertical', spacing=dp(8),
+                            padding=dp(10))
+            msg = Label(text=text, halign='center', valign='middle')
+            msg.bind(size=lambda w, s: setattr(w, 'text_size', s))
+            ok = Button(text='OK', size_hint_y=None, height=dp(36))
+            box.add_widget(msg)
+            box.add_widget(ok)
+            popup = Popup(title=title, content=box, size_hint=(None, None),
+                          size=(dp(460), dp(320)))
+            ok.bind(on_press=popup.dismiss)
+            popup.open()
+        except Exception:
+            pass
+
+    def _cal_done_popup(self):
+        """Unmissable confirmation that the calibration was accepted."""
+        try:
+            from kivy.metrics import dp
+            from kivy.uix.button import Button
+            box = BoxLayout(orientation='vertical', spacing=dp(8),
+                            padding=dp(10))
+            msg = Label(text='The plate is calibrated.\n\n'
+                        + self.cal_info.replace('Calibrated: ', '')
+                        .replace(', ', '\n'), halign='center')
+            msg.bind(size=lambda w, s: setattr(w, 'text_size', s))
+            ok = Button(text='OK', size_hint_y=None, height=dp(36))
+            box.add_widget(msg)
+            box.add_widget(ok)
+            popup = Popup(title='Plate calibration complete', content=box,
+                          size_hint=(None, None), size=(dp(420), dp(280)))
+            ok.bind(on_press=popup.dismiss)
+            popup.open()
+        except Exception:
+            pass
+
+    # ------------------------------ things that are fixed to the plate
+
+    def _plate_located(self) -> bool:
+        """True when the plate position is measured, not just assumed."""
+        return (self.plate_cal is not None
+                and self.plate_cal.matrix is not None) or \
+            bool(self.a1_stage_um)
+
+    def _plate_anchored_snapshot(self):
+        """Plate coordinates (mm from the A1 center) of every position,
+        the AF point and the focus points; None when they cannot be tied
+        to the plate (no plate, or the plate was never located).
+        A configuration loaded before calibrating supplies its own."""
+        pending, self._pending_plate_rel = \
+            getattr(self, '_pending_plate_rel', None), None
+        if self.no_plate_on:
+            return None
+        if pending:
+            return pending
+        if not self._plate_located():
+            return None
+        rel = self.stage_to_plate_rel
+        a = self.surface.anchor_xy
+        return {
+            'positions': [rel(p['x_um'], p['y_um'])
+                          for p in self.protocol_positions],
+            'anchor': rel(a[0], a[1]) if a else None,
+            'points': [rel(p[0], p[1]) for p in self.surface.points],
+        }
+
+    def _plate_anchored_restore(self, snap) -> None:
+        """Put positions, AF point and focus points back at their plate
+        coordinates using the current plate transform."""
+        if not snap:
+            return
+        to_stage = self.plate_rel_to_stage
+        rels = snap.get('positions') or []
+        if len(rels) == len(self.protocol_positions):
+            for p, r in zip(self.protocol_positions, rels):
+                if r is not None:
+                    p['x_um'], p['y_um'] = [float(v) for v in to_stage(*r)]
+        if snap.get('anchor') and self.surface.anchor_xy:
+            self.surface.anchor_xy = tuple(
+                float(v) for v in to_stage(*snap['anchor']))
+        rels = snap.get('points') or []
+        if len(rels) == len(self.surface.points):
+            self.surface.points = [
+                (*[float(v) for v in to_stage(*r)], *p[2:])
+                if r is not None else p
+                for p, r in zip(self.surface.points, rels)]
+
+    def _cal_log(self, msg: str):
+        """Append to logs/calibration.log (what was marked, the result)."""
+        try:
+            os.makedirs(LOGS_DIR, exist_ok=True)
+            with open(os.path.join(LOGS_DIR, 'calibration.log'), 'a',
+                      encoding='utf-8') as f:
+                f.write(f'{time.strftime("%Y-%m-%d %H:%M:%S")}  {msg}\n')
+        except Exception:
+            pass
+
+    def well_size_mm(self) -> tuple[float, float]:
+        """Well size (x, y) in plate mm: as measured by the plate
+        calibration, else from the labware definition."""
+        c = self.plate_cal
+        if c is not None and c.matrix is not None and \
+                c.measured_well_x_mm and c.measured_well_y_mm:
+            return float(c.measured_well_x_mm), float(c.measured_well_y_mm)
+        lw = self.current_labware
+        return lw.well_size_x_mm, lw.well_size_y_mm
 
     def _refresh_cal_info(self):
         c = self.plate_cal
+        plate = self.root.ids.get('plate_map') if self.root else None
+        if plate is not None:
+            measured = c is not None and c.matrix is not None and \
+                c.measured_well_x_mm and c.measured_well_y_mm
+            plate.well_size_override = self.well_size_mm() if measured \
+                else None
+            plate.redraw()
         if c is None or c.matrix is None:
             self.cal_info = 'Plate not calibrated'
             return
@@ -1170,6 +1734,58 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         self.base_um_per_px = self._f(text, self.base_um_per_px)
         self._persist()
 
+    def _load_objectives(self):
+        """Objective list (Etaluma data/objectives.json): magnification,
+        focal length, NA and autofocus step suggestions per lens."""
+        import json
+        self.objectives = {}
+        try:
+            with open(OBJECTIVES_PATH, encoding='utf-8') as f:
+                self.objectives = json.load(f)
+        except Exception:
+            pass
+        self.objective_options = list(self.objectives)
+
+    def objective_na(self) -> float | None:
+        obj = self.objectives.get(self.objective_name)
+        return float(obj['aperture']) if obj and obj.get('aperture') else None
+
+    def set_objective(self, name: str):
+        """Select the objective in use: sets the image scale from its
+        focal length and pre-fills the lens-dependent wizard fields."""
+        obj = self.objectives.get(name)
+        if obj is None or name == self.objective_name:
+            return
+        previous = self.objective_name
+        self.objective_name = name
+        self.base_um_per_px = round(
+            CAMERA_PIXEL_UM * float(obj['focal_length']) / TUBE_FOCAL_MM, 4)
+        # A measured pixel-to-stage mapping belongs to the previous lens.
+        self.img_cal = None
+        self.zplan['na'] = None
+        ids = self.root.ids if self.root else {}
+        if ids:
+            ids.um_per_px_input.text = str(self.base_um_per_px)
+            if obj.get('AF_max'):
+                ids.wiz_coarse_step.text = f"{float(obj['AF_max']):g}"
+            if obj.get('AF_range'):
+                ids.wiz_fine_range.text = f"{float(obj['AF_range']) / 2.0:g}"
+            if obj.get('z_fine'):
+                ids.wiz_fine_step.text = f"{float(obj['z_fine']):g}"
+        self._persist()
+        note = ''
+        laid = getattr(self, 'positions_objective', '')
+        if self.protocol_positions and laid and laid != name:
+            note = (f' The positions were laid out for {laid}: generate '
+                    f'them again (wizard step 6) so the fields fit this '
+                    f'lens.')
+        self._set_status(
+            f'Objective {name}: NA {obj.get("aperture", "?")}, image scale '
+            f'{self.base_um_per_px:g} um/px. Re-run "Auto-calibrate '
+            f'centering" for this lens.' + note)
+        if previous and self.wiz_active:
+            self._wiz_refresh_info()
+
     def snap_image(self):
         frame = self.latest_frame
         if frame is None:
@@ -1180,6 +1796,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         path = os.path.join(self._out_base(),
                             f'snap_{ch}_{time.strftime("%Y%m%d_%H%M%S")}.tiff')
         acq.save_image(path, frame)
+        if ch in CHANNELS:
+            self.leave_preview(ch, frame, self.stage_x_um, self.stage_y_um)
         self._set_status(f'Saved {os.path.basename(path)}')
 
     # --------------------------------------------------- stage navigation
@@ -1253,10 +1871,49 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             os.makedirs(base, exist_ok=True)
         return base
 
+    def _dir_note(self, path: str) -> str:
+        """' (saved for <user>)', or a warning when nothing can be written
+        there now. The choice is kept either way (a network drive may
+        simply not be connected yet)."""
+        if acq.dir_writable(path):
+            return f' (saved for {self.user_name})'
+        return (f' - CANNOT WRITE THERE NOW (drive not connected, or no '
+                f'permission); the choice is still saved for '
+                f'{self.user_name}')
+
     def set_output_dir(self, text: str):
         self.output_dir = text.strip() or CAPTURES_DIR
         self._persist()
-        self._set_status(f'Protocol data directory: {self.output_dir}')
+        self._set_status(f'Protocol data directory: {self.output_dir}'
+                         + self._dir_note(self.output_dir))
+
+    def browse_dir(self, which: str):
+        """Pick the data ('output') or autosave ('protocol') folder in the
+        Windows folder window."""
+        current = self.output_dir if which == 'output' else self.protocol_dir
+        try:
+            import tkinter
+            from tkinter import filedialog
+            root = tkinter.Tk()
+            root.withdraw()
+            root.attributes('-topmost', True)
+            path = filedialog.askdirectory(
+                parent=root, mustexist=False,
+                initialdir=current if os.path.isdir(current) else None,
+                title='Folder for the image data' if which == 'output'
+                else 'Folder for autosaved and saved protocols')
+            root.destroy()
+        except Exception as e:
+            self._set_status(f'Folder window not available ({e}): type the '
+                             f'path and press Set')
+            return
+        if not path:
+            return
+        path = os.path.normpath(path)
+        if which == 'output':
+            self.set_output_dir(path)
+        else:
+            self.set_protocol_dir(path)
 
     def open_output_dir(self):
         try:
@@ -1359,9 +2016,142 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         if self.wiz_active:
             self._wiz_refresh_info()
 
+    # ------------------ moving and adding positions, designations kept
+
+    def _designated_positions(self) -> list[dict]:
+        """The positions with their well and tile/point tag written in,
+        so that moving one does not change what it is called."""
+        if self.no_plate_on:
+            # Free positions: the wizard still tells the places that were
+            # added by hand (no tag yet) from the sites it generated.
+            return [dict(p) for p in self.protocol_positions]
+        well_of = (lambda p: self._pos_well_name(p['x_um'], p['y_um'])) \
+            if self._use_wells() else None
+        return experiment.assign_designations(self.protocol_positions,
+                                              well_of)
+
+    def _edit_target_well(self, x_um: float, y_um: float):
+        """(ok, well name or None) for a point that is to hold a position."""
+        if self.pos_review_active:
+            self._set_status('Finish the position review first')
+            return False, None
+        if not acq.in_stage_bounds(x_um, y_um):
+            self._set_status('That point is outside the stage travel')
+            return False, None
+        if not self._use_wells():
+            return True, None
+        rc = self._pos_well(x_um, y_um)
+        inside = False
+        if rc is not None:
+            # Inside the well itself (as measured by the calibration),
+            # with a little margin - not merely nearest to it.
+            lw = self.current_labware
+            rel = self.stage_to_plate_rel(x_um, y_um)
+            dx = rel[0] - rc[1] * (lw.spacing_x_mm or 0.0)
+            dy = rel[1] - rc[0] * (lw.spacing_y_mm or 0.0)
+            hx, hy = (v / 2.0 * 1.1 for v in self.well_size_mm())
+            if getattr(lw, 'shape', 'round') == 'square':
+                inside = abs(dx) <= hx and abs(dy) <= hy
+            else:
+                inside = (dx / hx) ** 2 + (dy / hy) ** 2 <= 1.0
+        if not inside:
+            self._set_status('That point is not inside a well')
+            return False, None
+        return True, self.current_labware.get_well_name(*rc)
+
+    def _edit_z_of(self, z_here: float | None):
+        """Focus for a moved or added position: the focus surface where
+        there is one, else the focus the stage is at now (when the point
+        is where the stage is), else what the position had."""
+        drift = self.surface.drift_um
+
+        def z_of(x, y, old):
+            z = self.surface.z_at(x, y)
+            if z is not None:
+                return z - drift
+            return old if z_here is None else z_here
+        return z_of
+
+    def pos_move_to(self, x_um: float, y_um: float,
+                    z_here: float | None = None):
+        """Move the nearest position of the well at (x_um, y_um) there; a
+        tile scan moves as a whole, centered on the point. The well and
+        the tile/point tags stay as they are."""
+        ok, well = self._edit_target_well(x_um, y_um)
+        if not ok:
+            return
+        new, what = experiment.move_in_well(
+            self._designated_positions(), well, x_um, y_um,
+            z_of=self._edit_z_of(z_here))
+        if not what:
+            self._set_status(f'{well or "There"} holds no position to move: '
+                             f'switch the well on, or add a point')
+            return
+        self.protocol_positions = new
+        self._persist()
+        self._refresh_positions()
+        self._set_status(f'{what} moved; it keeps its name')
+
+    def pos_add_at(self, x_um: float, y_um: float,
+                   z_here: float | None = None):
+        """Add a point that takes the name of the well it is dropped in
+        and the next point tag there (B3_P1, B3_P2, ...)."""
+        ok, well = self._edit_target_well(x_um, y_um)
+        if not ok:
+            return
+        z = self._edit_z_of(z_here)(
+            x_um, y_um, self.stage_z_um - self.surface.drift_um)
+        self.protocol_positions, point = experiment.add_point(
+            self._designated_positions(), well, x_um, y_um, z)
+        self._persist()
+        self._refresh_positions()
+        self._set_status(f'Point {point["name"]} added '
+                         f'({len(self.protocol_positions)} positions)')
+
+    def pos_move_here(self):
+        """Move the nearest position (or tile scan) of this well to where
+        the stage is now."""
+        self.pos_move_to(self.stage_x_um, self.stage_y_um,
+                         z_here=self.stage_z_um - self.surface.drift_um)
+
+    def set_pos_edit(self, mode: str):
+        """Clicks on the plate map move ('move') or add ('add') positions
+        instead of switching wells on and off; the same mode again, or
+        '', goes back to normal."""
+        self.pos_edit_mode = '' if mode == self.pos_edit_mode else mode
+        plate = self._plate_map()
+        if plate is not None:
+            plate.point_click_mode = bool(self.pos_edit_mode)
+        self._set_status({
+            'move': 'Click in a well: its position (or the center of its '
+                    'tile scan) moves to the click. Zoom in first (Ctrl + '
+                    'wheel). A double-click still drives the stage.',
+            'add': 'Click in a well: a point is added there, named after '
+                   'the well. Zoom in first (Ctrl + wheel). A double-click '
+                   'still drives the stage.',
+        }.get(self.pos_edit_mode, 'Map clicks switch wells on and off again'))
+
+    def on_plate_point_click(self, rel_x_mm: float, rel_y_mm: float,
+                             well=None):
+        """A single click on the plate map while a position edit mode is
+        on (mm from the A1 center)."""
+        target = self.plate_rel_to_stage(rel_x_mm, rel_y_mm)
+        if target is None:
+            self._set_status('Calibrate the plate first (or "Set A1 = here")')
+            return
+        if self.pos_edit_mode == 'move':
+            self.pos_move_to(float(target[0]), float(target[1]))
+        elif self.pos_edit_mode == 'add':
+            self.pos_add_at(float(target[0]), float(target[1]))
+
     def position_add_here(self):
         """Add the current stage position (and focus) as a protocol
-        interaction point."""
+        interaction point. With a plate it takes the name of the well and
+        the next point tag in it."""
+        if not self.no_plate_on:
+            self.pos_add_at(self.stage_x_um, self.stage_y_um,
+                            z_here=self.stage_z_um - self.surface.drift_um)
+            return
         drift = self.surface.drift_um
         well = self._pos_well_name(self.stage_x_um, self.stage_y_um)
         name = well or f'P{len(self.protocol_positions) + 1:02d}'
@@ -1466,7 +2256,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         self.protocol_dir = text.strip() or PROTOCOLS_DIR
         self._refresh_protocol_files()
         self._persist()
-        self._set_status(f'Protocol autosave directory: {self.protocol_dir}')
+        self._set_status(f'Protocol autosave directory: {self.protocol_dir}'
+                         + self._dir_note(self.protocol_dir))
 
     def _protocol_payload(self, name: str) -> dict:
         ids = self.root.ids if self.root else {}
@@ -1495,9 +2286,34 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             'use_z_offsets': self.use_z_offsets_on,
             'no_plate': self.no_plate_on,
             'af_every_n': int(self.af_every_n),
+            'zplan': self.zplan,
+            'zstack_optout': self.zstack_optout,
+            'compose_on': bool(self.compose_on),
+            'stitch_on': bool(self.stitch_on),
+            'objective_name': self.objective_name,
+            'positions_objective': getattr(self, 'positions_objective', ''),
             'travel_clearance_um': self.travel_clearance_um,
             'output_dir': self.output_dir,
+            # Where everything is on the PLATE (mm from the A1 center),
+            # so the configuration can be reused after the plate has been
+            # taken off and put back: calibrate, and it all follows.
+            'plate_rel': self._plate_anchored_snapshot_keep(),
         }
+
+    def _plate_anchored_snapshot_keep(self):
+        pending = getattr(self, '_pending_plate_rel', None)
+        snap = self._plate_anchored_snapshot()
+        self._pending_plate_rel = pending
+        return snap
+
+    def update_protocol(self):
+        """Save the current state over the configuration that was loaded
+        (or last saved), without asking for a new name."""
+        if not self.protocol_loaded:
+            self._set_status('Nothing to update: load or save a '
+                             'configuration first')
+            return
+        self.save_protocol(self.protocol_loaded)
 
     def _write_protocol(self, name: str) -> bool:
         import json
@@ -1527,6 +2343,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         self.af_apply_fields()
         if self._write_protocol(name):
             self.protocol_name = name
+            self.protocol_loaded = '' if name.startswith('_') else name
             self._refresh_protocol_files()
             self._set_status(f'Protocol "{name}" saved to {self.protocol_dir}')
         else:
@@ -1567,9 +2384,15 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self.use_z_offsets_on = bool(d.get('use_z_offsets', True))
             self.no_plate_on = bool(d.get('no_plate', False))
             self.af_every_n = max(int(d.get('af_every_n', 1)), 1)
+            self.zplan.update(d.get('zplan') or {})
+            self.zstack_optout = dict(d.get('zstack_optout') or {})
+            self.compose_on = bool(d.get('compose_on', False))
+            self.stitch_on = bool(d.get('stitch_on', False))
+            self.positions_objective = (d.get('positions_objective')
+                                        or d.get('objective_name') or '')
             self.travel_clearance_um = float(d.get('travel_clearance_um', 500.0))
-            if d.get('output_dir'):
-                self.output_dir = d['output_dir']
+            # The data folder is the user's own setting: a loaded
+            # configuration (perhaps someone else's) does not change it.
             lw_name = d.get('labware_name')
             if lw_name and self.labware_lib.get(lw_name) is None and \
                     d.get('labware_def'):
@@ -1582,17 +2405,37 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                     pass
             if lw_name and self.labware_lib.get(lw_name) is not None:
                 self.select_labware(lw_name)
+            # Place everything by its plate coordinates: now if the plate
+            # is already calibrated, otherwise when it is.
+            self._pending_plate_rel = None
+            snap = d.get('plate_rel')
+            located = self._plate_located()
+            if snap and not self.no_plate_on:
+                if located:
+                    self._plate_anchored_restore(snap)
+                else:
+                    self._pending_plate_rel = snap
             ids = self.root.ids
             ids.protocol_cycles_input.text = str(d.get('cycles', '1'))
             ids.protocol_interval_input.text = str(d.get('interval_min', '5'))
-            self.protocol_name = name
+            self.protocol_name = 'protocol1' if name.startswith('_') else name
+            self.protocol_loaded = '' if name.startswith('_') else name
             self._sync_channel_fields()
             self._sync_af_fields()
             self._refresh_surface_info()
             self._refresh_positions()
             self._persist()
-            self._set_status(f'Protocol "{name}" loaded - calibrate the '
-                             f'plate, then run "Review positions"')
+            self._set_status(
+                f'"{name}" loaded. ' + (
+                    'Positions placed on the calibrated plate. '
+                    if (snap and located) else
+                    'Calibrate the plate next: the positions will follow '
+                    'it. ') + 'Then use "Update focus" (wizard step 7).'
+                + (f' NOTE: it was set up with {self.positions_objective}; '
+                   f'the objective selected now is '
+                   f'{self.objective_name or "not set"}.'
+                   if self.positions_objective and
+                   self.positions_objective != self.objective_name else ''))
         except Exception as e:
             self._set_status(f'Protocol load failed: {e}')
 
@@ -1648,6 +2491,35 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self._set_status(f'At {name}')
         self._bg(_move)
 
+    def on_plate_point_double_click(self, rel_x_mm: float, rel_y_mm: float,
+                                    well=None):
+        """Double-click on the zoomed-in plate navigator: move the stage
+        to the exact point clicked (mm from the A1 center)."""
+        where = (f'point in {self.current_labware.get_well_name(*well)}'
+                 if well is not None else 'point on the plate')
+        if well is not None:
+            self.selected_well_str = self.current_labware.get_well_name(*well)
+        if not self.stage_connected:
+            self._set_status(f'{where}: stage not connected')
+            return
+        target = self.plate_rel_to_stage(rel_x_mm, rel_y_mm)
+        if target is None:
+            self._set_status('Calibrate the plate first (or "Set A1 = here")')
+            return
+        tx, ty = target
+        if not acq.in_stage_bounds(tx, ty):
+            self._set_status(f'{where}: outside the stage travel')
+            return
+        self._set_status(f'Moving to {where}...')
+        def _move():
+            self.hw.move_xy(tx, ty)
+            if self.use_surface_on:
+                z = self.surface.z_at(tx, ty)
+                if z is not None:
+                    self.hw.move_z(z)
+            self._set_status(f'At {where}')
+        self._bg(_move)
+
     def _img_cal_matrix(self):
         """Current px-shift-per-stage-um 2x2 (binning compensated), or None."""
         if not self.img_cal or not self.img_cal.get('A'):
@@ -1661,18 +2533,28 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         return A * (cal_bin / cur_bin)
 
     def _image_cal_sync(self, ch: str) -> bool:
-        """Blocking pixel->stage calibration (two 100 um probe moves)."""
-        D = 100.0
+        """Blocking pixel->stage calibration from two probe moves.
+
+        The probes are about an eighth of the field of view (large enough
+        to measure precisely, small enough that the frames still overlap
+        well). Drive backlash is taken up first and every measured move
+        runs in the same direction, so lost motion does not end up in the
+        measured scale."""
+        D = float(min(max(0.12 * min(self._fov_um()), 50.0), 1000.0))
+        B = XY_BACKLASH_UM
         self.hw.set_channel(ch, self._cs(ch))
+        self.hw.move_xy_rel(-B, -B)
+        self.hw.move_xy_rel(B, B)     # both axes now loaded in +
         time.sleep(0.3)
         f0 = self.hw.grab_fresh(2.0)
         self.hw.move_xy_rel(D, 0)
-        time.sleep(0.1)
+        time.sleep(0.2)
         f1 = self.hw.grab_fresh(2.0)
         self.hw.move_xy_rel(0, D)
-        time.sleep(0.1)
+        time.sleep(0.2)
         f2 = self.hw.grab_fresh(2.0)
-        self.hw.move_xy_rel(-D, -D)   # return to start
+        self.hw.move_xy_rel(-D - B, -D - B)   # back to the start,
+        self.hw.move_xy_rel(B, B)             # arriving in + again
         sx = acq.measure_image_shift(f0, f1)
         sy = acq.measure_image_shift(f1, f2)
         if (sx is None or sy is None or sx[2] < 0.1 or sy[2] < 0.1 or
@@ -1684,6 +2566,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         except Exception:
             cur_bin = 1
         self.img_cal = {'A': A, 'binning': cur_bin}
+        self._lens_measured_at = time.time()
         self._persist()
         return True
 
@@ -1707,18 +2590,32 @@ class LumaViewProApp(ExperimentWizardMixin, App):
 
     def on_image_double_click(self, dx_px: float, dy_px: float):
         """Double-click on the live image: bring the clicked point to the
-        center. Auto-calibrates the pixel->stage mapping on first use, then
-        closes the loop: measures the actual image shift and applies up to
-        three corrective trims until the click lands centered."""
+        center.
+
+        The whole move is planned up front from the calibrated
+        pixel->stage mapping and made as ONE straight vector move. The
+        result is then checked once by finding the clicked spot itself in
+        the new frame; if it is measurably off center, a single small trim
+        follows. There is no further iteration, so the stage never hunts.
+        The mapping is calibrated automatically on first use."""
         if not self.stage_connected or self.worker_busy:
             return
+        if getattr(self, '_centering', False):
+            return          # one centering move at a time
+        self._centering = True
         ch = self.live_channel if self.live_channel in CHANNELS else self.selected_channel
         target_px = np.array([-dx_px, -dy_px])   # required content shift
 
         def _job():
+            try:
+                _center()
+            finally:
+                self._centering = False
+
+        def _center():
             if self._img_cal_matrix() is None:
                 self._set_status('First double-click: calibrating image '
-                                 'motion (0.1 mm probe moves)...')
+                                 'motion (two short probe moves)...')
                 if not self._image_cal_sync(ch):
                     self._set_status('Centering calibration FAILED - light a '
                                      'featured field and try again')
@@ -1729,27 +2626,28 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             except np.linalg.LinAlgError:
                 self._set_status('Centering: calibration degenerate - recalibrate')
                 return
-            self._set_status(f'Centering: dx={stage[0]:.0f}, dy={stage[1]:.0f} um')
-            remaining = target_px.copy()
-            move = stage
-            for i in range(3):
-                f0 = self.hw.grab_fresh(1.0)
-                self.hw.move_xy_rel(float(move[0]), float(move[1]))
-                time.sleep(0.12)
-                f1 = self.hw.grab_fresh(1.0)
-                s = acq.measure_image_shift(f0, f1)
-                if s is None or s[2] < 0.1:
-                    break   # can't verify (dark/featureless) - open loop done
-                remaining = remaining - np.array([s[0], s[1]])
-                if np.linalg.norm(remaining) <= 4:
-                    break
-                try:
-                    move = np.linalg.solve(A, remaining)
-                except np.linalg.LinAlgError:
-                    break
-                if np.linalg.norm(move) > np.linalg.norm(stage) * 1.5:
-                    break   # diverging - stop rather than wander
-            self._set_status('Centered')
+            f0 = self.hw.grab_fresh(1.0)
+            self.hw.move_xy_rel(float(stage[0]), float(stage[1]))
+            time.sleep(0.2)                      # let the stage settle
+            f1 = self.hw.grab_fresh(1.0)
+            note = ''
+            if f0 is not None and f1 is not None and f0.ndim == 2:
+                h, w = f0.shape
+                cx, cy = w / 2.0, h / 2.0
+                found = acq.locate_patch(f0, (cx + dx_px, cy + dy_px),
+                                         f1, (cx, cy))
+                if found is not None and found[2] >= 0.6:
+                    resid = np.array([found[0] - cx, found[1] - cy])
+                    err = float(np.linalg.norm(resid))
+                    if 3.0 < err < 0.12 * min(h, w):
+                        try:
+                            trim = np.linalg.solve(A, -resid)
+                            self.hw.move_xy_rel(float(trim[0]), float(trim[1]))
+                            note = f' (trimmed {err:.0f} px)'
+                        except np.linalg.LinAlgError:
+                            pass
+            self._set_status(f'Centered: moved dx={stage[0]:.0f}, '
+                             f'dy={stage[1]:.0f} um{note}')
         self._bg(_job)
 
     def toggle_invert(self, which: str):
@@ -2310,6 +3208,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         """Overlay a captured tile into the on-the-fly mosaic preview
         (shown in the viewport while the scan runs). Worker-thread safe:
         the canvas reference is swapped atomically."""
+        self.leave_preview(ch, frame, x_um, y_um)   # and on the plate map
         try:
             h, w = frame.shape[:2]
             f = max(w // 160, 1)
@@ -2446,9 +3345,279 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             Clock.schedule_once(lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
         self._bg(_job, busy_job=True)
 
+    # ------------------------- manual z-stack: begin, end and interval
+
+    def _zman_fields(self) -> tuple[float | None, float | None, float]:
+        ids = self.root.ids
+
+        def num(widget_id):
+            text = ids[widget_id].text.strip()
+            try:
+                return float(text)
+            except ValueError:
+                return None
+        step = num('zstack_step_input')
+        return num('zman_begin_input'), num('zman_end_input'), \
+            abs(step) if step else 0.0
+
+    def zman_set(self, which: str):
+        """Take the present focus position as the begin or the end."""
+        ids = self.root.ids
+        ids['zman_begin_input' if which == 'begin'
+            else 'zman_end_input'].text = f'{self.stage_z_um:.1f}'
+        self.zman_refresh()
+
+    def zman_goto(self, which: str):
+        begin, end, _ = self._zman_fields()
+        z = begin if which == 'begin' else end
+        if z is None or not self.stage_connected:
+            return
+        self._bg(self.hw.move_z, max(float(z), 0.0))
+
+    def _lens_section(self, channels: list[str]) -> tuple[float, str, float]:
+        """(optical section um, the channel it is for, NA) for this lens:
+        the thinnest section among the channels, so none is undersampled."""
+        na = self._wiz_na()
+        scale = self.effective_um_per_px()
+        section, ch = min(
+            (experiment.optical_section_um(
+                na, experiment.CHANNEL_WAVELENGTH_NM.get(c, 550.0), 1.0,
+                scale), c) for c in channels)
+        return section, ch, na
+
+    def zman_optimise(self, sampling: float = 1.0):
+        """Set the interval from the optical section (depth of field) of
+        the lens in use: 1 = one section per step, 2.3 = Nyquist."""
+        section, ch, na = self._lens_section([self.selected_channel])
+        step = experiment.stack_step_um(section, sampling)
+        self.root.ids.zstack_step_input.text = f'{step:.2f}'
+        self.apply_channel_fields()
+        self.zman_refresh()
+        self._set_status(
+            f'Step {step:.2f} um: optical section {section:.2f} um for '
+            f'{self.objective_name or "this lens"} (NA {na:g}, {ch}) at '
+            f'{sampling:g}x sampling')
+
+    def zman_refresh(self, *_):
+        """Show what the begin / end / interval fields amount to."""
+        if not self.root or 'zman_begin_input' not in self.root.ids:
+            return
+        begin, end, step = self._zman_fields()
+        section, ch, na = self._lens_section([self.selected_channel])
+        lens = (f'Optical section {section:.2f} um ({ch}, NA {na:g}, '
+                f'{self.objective_name or "no objective selected"}).')
+        if begin is None or end is None:
+            self.zman_info = ('Focus to one end of the sample and press '
+                              '"Begin = here", then the other end and '
+                              '"End = here". ' + lens)
+            return
+        if step <= 0:
+            self.zman_info = 'Type an interval, or press Optimise. ' + lens
+            return
+        planes = experiment.stack_between(begin, end, step)
+        real = abs(planes[1] - planes[0]) if len(planes) > 1 else 0.0
+        self.zman_info = (
+            f'{len(planes)} planes from {begin:.1f} to {end:.1f} um '
+            f'({abs(end - begin):.1f} um), every {real:.2f} um. ' + lens
+            + (' The interval is wider than the optical section: planes '
+               'are skipped.' if real > section * 1.05 else ''))
+
+    def run_zstack_between(self, all_channels: bool = False):
+        """Z-stack from Begin to End at the interval, here, for the
+        selected channel or for every channel marked for the protocol."""
+        if not (self.stage_connected and self.camera_connected):
+            self._set_status('Z-stack needs stage + camera')
+            return
+        begin, end, step = self._zman_fields()
+        if begin is None or end is None:
+            self._set_status('Set the begin and the end of the stack first')
+            return
+        if step <= 0:
+            self._set_status('Type an interval, or press Optimise')
+            return
+        self.apply_channel_fields()
+        channels = ([ch for ch in CHANNELS
+                     if self.channel_settings[ch].enabled]
+                    if all_channels else [self.selected_channel])
+        if not channels:
+            self._set_status('No channels marked "Use in protocol"')
+            return
+        planes = experiment.stack_between(begin, end, step)
+        out_dir = acq.timestamp_dir(self._out_base(), 'zstack')
+        back = self.stage_z_um
+
+        def _job():
+            acq.run_z_planes(self.hw, self.channel_settings, channels,
+                             planes, self.shading if self.shading_on else None,
+                             out_dir, self.worker.cancel,
+                             status_cb=self._set_status, return_z_um=back)
+            Clock.schedule_once(lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
+        self._bg(_job, busy_job=True)
+
+    def zman_to_range(self):
+        """Use the begin / end span and the interval as this channel's
+        centered z-stack (the one protocols run around each position's
+        focus)."""
+        begin, end, step = self._zman_fields()
+        if begin is None or end is None or step <= 0:
+            self._set_status('Set begin, end and interval first')
+            return
+        ids = self.root.ids
+        ids.zstack_range_input.text = f'{abs(end - begin):g}'
+        ids.zstack_enabled_chk.active = True
+        self.apply_channel_fields()
+        self._set_status(
+            f'{self.selected_channel}: protocols stack {abs(end - begin):g} '
+            f'um around each position\'s focus, every {step:g} um')
+
     # ------------------------------------------------- timelapse protocol
 
-    def run_protocol(self):
+    def _processing_done_popup(self, base_dir: str, summary: str,
+                               videos: list[str]):
+        """Say what the online processing made, and where the movies
+        are (the status bar alone is easy to miss after a long run)."""
+        try:
+            from kivy.metrics import dp
+            from kivy.uix.button import Button
+            folder = os.path.join(base_dir, 'videos') if videos else base_dir
+            text = f'{summary}\n\n'
+            if videos:
+                text += 'Movies:\n' + '\n'.join(
+                    os.path.basename(v) for v in videos) + \
+                    '\n\n(.mp4 for viewing, .avi opens in ImageJ/Fiji)\n\n'
+            elif self.stitch_on or self.compose_on:
+                text += ('No movie: a movie needs at least two completed '
+                         'timepoints.\n\n')
+            text += folder
+            box = BoxLayout(orientation='vertical', spacing=dp(8),
+                            padding=dp(10))
+            msg = Label(text=text, halign='center', valign='middle')
+            msg.bind(size=lambda w, s: setattr(w, 'text_size', s))
+            row = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(6))
+            open_b = Button(text='Open the folder')
+            ok = Button(text='OK')
+            row.add_widget(open_b)
+            row.add_widget(ok)
+            box.add_widget(msg)
+            box.add_widget(row)
+            popup = Popup(title='Online processing finished', content=box,
+                          size_hint=(None, None), size=(dp(560), dp(360)))
+
+            def _open(*_):
+                try:
+                    os.startfile(folder)
+                except Exception as e:
+                    self._set_status(f'Open folder failed: {e}')
+            open_b.bind(on_press=_open)
+            ok.bind(on_press=popup.dismiss)
+            popup.open()
+        except Exception:
+            pass
+
+    def _lens_report(self) -> tuple[list[str], list[str]]:
+        """What is known about the objective against the moves the
+        protocol will make: (lines that are in order, problems)."""
+        name = self.objective_name
+        fov = self._fov_um()
+        lines, problems = [], []
+        if name:
+            lines.append(f'Objective selected: {name}. Field of view '
+                         f'{fov[0] / 1000:.3f} x {fov[1] / 1000:.3f} mm.')
+        else:
+            problems.append('No objective is selected.')
+        laid = getattr(self, 'positions_objective', '')
+        if self.protocol_positions and laid:
+            if laid != name:
+                problems.append(f'The positions were laid out for {laid}. '
+                                f'Generate them again (wizard step 6).')
+            else:
+                lines.append('The positions were laid out for this lens.')
+        verdict, text = experiment.lens_fit(
+            experiment.tile_step_um(self.protocol_positions), fov)
+        (problems if verdict in ('gaps', 'dense') else lines).append(text)
+        measured = None
+        A = self._img_cal_matrix()
+        if A is not None:
+            n = float(np.linalg.norm(A[:, 0]))
+            measured = 1.0 / n if n > 0 else None
+        verdict, text = experiment.lens_scale_check(
+            measured, self.effective_um_per_px())
+        if measured:
+            at = getattr(self, '_lens_measured_at', None)
+            text += (f' (measured at {time.strftime("%H:%M", time.localtime(at))})'
+                     if at else ' (measured in an earlier session: press '
+                                '"Measure the lens" to check it now)')
+        (problems if verdict == 'wrong' else lines).append(text)
+        return lines, problems
+
+    def _objective_gate(self):
+        """Last check before a run: the objective, and whether the stage
+        moves between tiles fit its field of view. The run starts only
+        from this window."""
+        from kivy.metrics import dp
+        from kivy.uix.button import Button
+        box = BoxLayout(orientation='vertical', spacing=dp(8), padding=dp(10))
+        msg = Label(halign='left', valign='top')
+        msg.bind(size=lambda w, s: setattr(w, 'text_size', s))
+        row = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(6))
+        measure = Button(text='Measure the lens')
+        cancel = Button(text='Cancel')
+        run = Button(text='RUN')
+        for b in (measure, cancel, run):
+            row.add_widget(b)
+        box.add_widget(msg)
+        box.add_widget(row)
+        popup = Popup(title='Check the objective before the run',
+                      content=box, size_hint=(None, None),
+                      size=(dp(600), dp(400)), auto_dismiss=False)
+
+        def fill(note: str = ''):
+            lines, problems = self._lens_report()
+            msg.text = '\n\n'.join(
+                lines + ['PROBLEM: ' + p for p in problems]
+                + ([note] if note else [])
+                + ['"Measure the lens" moves the stage about an eighth of '
+                   'a field and back, and needs a lit field with something '
+                   'in it.'])
+            run.disabled = not self.objective_name
+            run.text = ('Run anyway' if problems else
+                        f'{self.objective_name} is fitted: RUN')
+            run.background_color = (0.75, 0.2, 0.17, 1) if problems \
+                else (0.1, 0.6, 0.35, 1)
+
+        def do_measure(*_):
+            if self.worker_busy:
+                return
+            ch = self.live_channel if self.live_channel in CHANNELS \
+                else self.selected_channel
+            measure.disabled = run.disabled = True
+            msg.text = 'Measuring the image scale...'
+
+            def _job():
+                try:
+                    ok = self._image_cal_sync(ch)
+                except Exception as e:
+                    ok = False
+                    self._set_status(f'Lens measurement error: {e}')
+
+                def _done(dt):
+                    measure.disabled = False
+                    fill('' if ok else 'MEASUREMENT FAILED: light a field '
+                         'with visible features, focus, and try again.')
+                Clock.schedule_once(_done, 0)
+            self._bg(_job, busy_job=True)
+
+        def do_run(*_):
+            popup.dismiss()
+            self.run_protocol(confirmed=True)
+
+        measure.bind(on_press=do_measure)
+        cancel.bind(on_press=popup.dismiss)
+        run.bind(on_press=do_run)
+        fill()
+        popup.open()
+
+    def run_protocol(self, confirmed: bool = False):
         """Timelapse protocol over all stored positions.
 
         Every cycle: optionally re-reference focus at the AF anchor (the
@@ -2467,6 +3636,14 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         channels = [ch for ch in CHANNELS if self.channel_settings[ch].enabled]
         if not channels:
             self._set_status('No channels marked "Use in protocol"')
+            return
+        if self.worker_busy:
+            self._set_status('Another job is running')
+            return
+        if not confirmed:
+            # The objective is checked here, at the last moment before
+            # anything moves; the run starts from that window.
+            self._objective_gate()
             return
         do_af = (self.af_each_cycle_on and
                  self.surface.anchor_xy is not None)
@@ -2497,6 +3674,32 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         except Exception:
             pass
         cancel = self.worker.cancel
+
+        # Online compositing / stitching: told about every completed
+        # position, it works on its own thread from the saved files.
+        proc = None
+        if self.compose_on or self.stitch_on:
+            if online_processing.available():
+                A = self._img_cal_matrix()
+                scale = max(self.effective_um_per_px(), 1e-6)
+                stacked = [self.channel_settings[ch] for ch in channels
+                           if self.channel_settings[ch].zstack.enabled]
+                proc = online_processing.OnlineProcessor(
+                    base_dir, positions, channels,
+                    compose=self.compose_on, stitch=self.stitch_on,
+                    # A is the image shift per um of stage travel; a tile
+                    # sits on the canvas the opposite way.
+                    px_per_um=(-A if A is not None else np.eye(2) / scale),
+                    um_per_px=scale,
+                    z_step_um=stacked[0].zstack.step_um if stacked else 0.0,
+                    cycles=cycles, status_cb=self._set_status,
+                    done_cb=lambda summary, videos: Clock.schedule_once(
+                        lambda dt: self._processing_done_popup(
+                            base_dir, summary, videos), 0))
+            else:
+                self._set_status('Online processing needs the tifffile and '
+                                 'opencv-python packages - running without')
+        t_run = time.time()
 
         def _job():
             for cyc in range(cycles):
@@ -2533,9 +3736,11 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                         break
 
                 drift = self.surface.drift_um
-                for p in positions:
+                for pi, p in enumerate(positions):
                     if cancel.is_set():
                         break
+                    files: dict = {}
+                    complete = True
                     base_z = None
                     if self.use_surface_on and self.surface.points and \
                             self.surface.current_z is not None:
@@ -2552,10 +3757,17 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                         if cancel.is_set():
                             break
                         cs = self.channel_settings[ch]
-                        # One plane (focus + the channel's chromatic
-                        # offset), or the channel's z-stack around it.
-                        planes = acq.zstack_planes(base_z, cs,
-                                                   self.use_z_offsets_on)
+                        # The channel's z-stack, centered on the focus
+                        # surface (plus the chromatic offset) and taken
+                        # from the top of the range down - or that one
+                        # center plane where the well opted out.
+                        opt = self.zstack_optout.get(p['well'] or '', ())
+                        if '*' in opt or ch in opt:
+                            planes = [base_z + (cs.z_offset_um if
+                                                self.use_z_offsets_on else 0.0)]
+                        else:
+                            planes = acq.zstack_planes(
+                                base_z, cs, self.use_z_offsets_on)[::-1]
                         self.hw.set_channel(ch, cs)
                         for zi, z in enumerate(planes, 1):
                             if cancel.is_set():
@@ -2567,14 +3779,26 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                             frame = self.hw.grab_settled(
                                 settle_s=0.2 if zi == 1 else 0.1)
                             if frame is None:
+                                complete = False
                                 continue
                             if self.shading_on:
                                 frame = self.shading.apply(frame, ch, z)
-                            acq.save_image(os.path.join(
+                            path = os.path.join(
                                 out_dir, experiment.file_name(
-                                    p['well'], p['site'], zi, ch, cyc + 1)),
-                                frame)
+                                    p['well'], p['site'], zi, ch, cyc + 1))
+                            acq.save_image(path, frame)
+                            files.setdefault(ch, []).append(path)
+                            # The image stays on the plate map where it
+                            # was taken (middle plane of a z-stack).
+                            if zi == (len(planes) + 1) // 2:
+                                self.leave_preview(ch, frame, p['x_um'],
+                                                   p['y_um'])
                     self.hw.leds_off()
+                    # All colours and planes of this position are on
+                    # disk: it can be composited, and it counts toward
+                    # its well's stitch.
+                    if proc is not None and complete and not cancel.is_set():
+                        proc.position_done(pi, cyc + 1, files, t0 - t_run)
                 self._persist()
 
                 if cyc < cycles - 1:
@@ -2590,6 +3814,10 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                         break
             Clock.schedule_once(lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
             self._set_status(f'Protocol finished -> {base_dir}')
+            if proc is not None:
+                # Videos need every timepoint, so they are made now; the
+                # processing thread reports when it is through.
+                proc.finish()
         self._bg(_job, busy_job=True)
 
     # -------------------------------------------------------- persistence
@@ -2601,6 +3829,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             'plate_sign_x': self.plate_sign_x,
             'plate_sign_y': self.plate_sign_y,
             'base_um_per_px': self.base_um_per_px,
+            'objective_name': self.objective_name,
             'img_sign_x': self.img_sign_x,
             'img_sign_y': self.img_sign_y,
             'af_config': {
@@ -2626,14 +3855,25 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             'clip_overlay_on': self.clip_overlay_on,
             'shading_focus_z': self.shading_focus_z,
             'protocol_dir': self.protocol_dir,
+            'map_flip_x': bool(self.map_flip_x),
             'protocol_optin_v2': True,
             'no_plate_on': self.no_plate_on,
             'af_every_n': int(self.af_every_n),
+            'zplan': self.zplan,
+            'zstack_optout': self.zstack_optout,
+            'compose_on': bool(self.compose_on),
+            'stitch_on': bool(self.stitch_on),
         }
         try:
             acq.save_settings(payload)
-        except Exception:
-            pass
+            self._settings_save_failed = False
+        except Exception as e:
+            # Say so (once): settings that cannot be saved are the ones
+            # that "revert" at the next launch.
+            if not getattr(self, '_settings_save_failed', False):
+                self._settings_save_failed = True
+                self._set_status(f'SETTINGS NOT SAVED to {acq.SETTINGS_PATH} '
+                                 f'({type(e).__name__}: {e})')
         self._autosave_protocol()
 
     def _load_persisted(self):
@@ -2641,6 +3881,13 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         if not d:
             self.shading.load_all()
             return
+        # The user's folders first and on their own: a problem with any
+        # other setting below must not put them back to the defaults.
+        if isinstance(d.get('output_dir'), str) and d['output_dir'].strip():
+            self.output_dir = d['output_dir']
+        if isinstance(d.get('protocol_dir'), str) and d['protocol_dir'].strip():
+            self.protocol_dir = d['protocol_dir']
+        self.map_flip_x = bool(d.get('map_flip_x', True))
         try:
             self.channel_settings = acq.channel_settings_from_dict(
                 d.get('channel_settings', {}))
@@ -2649,6 +3896,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self.plate_sign_x = float(d.get('plate_sign_x', 1.0))
             self.plate_sign_y = float(d.get('plate_sign_y', 1.0))
             self.base_um_per_px = float(d.get('base_um_per_px', DEFAULT_UM_PER_PX))
+            if d.get('objective_name') in self.objectives:
+                self.objective_name = d['objective_name']
             self.img_sign_x = float(d.get('img_sign_x', 1.0))
             self.img_sign_y = float(d.get('img_sign_y', 1.0))
             af = d.get('af_config', {})
@@ -2667,15 +3916,33 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                     cal.get('labware_name') == self.current_labware.name:
                 pc = PlateCalibration(self.current_labware)
                 pc.from_dict(cal)
-                self.plate_cal = pc
+                # Re-solve from the stored marks, so a calibration made
+                # by an earlier version gets the current (measured-well)
+                # solution; one that cannot be right is not used.
+                if pc.complete:
+                    pc.solve()
+                if pc.scale_ok():
+                    self.plate_cal = pc
+                else:
+                    self._cal_log('stored calibration dropped at launch: '
+                                  + '; '.join(t for _, t in
+                                              pc.scale_problems())
+                                  or 'row and column pitch do not agree')
             self.use_surface_on = bool(d.get('use_surface_on', True))
             self.use_z_offsets_on = bool(d.get('use_z_offsets_on', True))
             self.no_plate_on = bool(d.get('no_plate_on', False))
             self.af_every_n = max(int(d.get('af_every_n', 1)), 1)
+            self.zplan.update(d.get('zplan') or {})
             self.af_each_cycle_on = bool(d.get('af_each_cycle_on', True))
-            self.output_dir = d.get('output_dir') or CAPTURES_DIR
-            self.protocol_positions = [dict(p) for p
-                                       in d.get('protocol_positions', [])]
+            self.compose_on = bool(d.get('compose_on', False))
+            self.stitch_on = bool(d.get('stitch_on', False))
+            # Every launch starts with an empty plate: no selected wells,
+            # positions, z-stack opt-outs or focus map from the last run.
+            # (Instrument settings and the plate calibration are kept; a
+            # saved configuration brings its own back when loaded.)
+            self.protocol_positions = []
+            self.zstack_optout = {}
+            self.surface.clear_points()
             self.travel_clearance_um = float(d.get('travel_clearance_um', 500.0))
             self.img_cal = d.get('img_cal')
             self.af_channel = d.get('af_channel', 'BF')
@@ -2686,29 +3953,78 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self.clip_overlay_on = bool(d.get('clip_overlay_on', True))
             fz = d.get('shading_focus_z')
             self.shading_focus_z = float(fz) if fz is not None else None
-            self.protocol_dir = d.get('protocol_dir') or PROTOCOLS_DIR
             # One-time migration: protocol membership became opt-in; clear
             # any enables carried over from older settings files.
             if not d.get('protocol_optin_v2'):
                 for cs in self.channel_settings.values():
                     cs.enabled = False
+        except Exception as e:
+            # Not silent: the rest of the settings after the failing one
+            # keep their defaults for this session.
+            try:
+                import traceback
+                os.makedirs(LOGS_DIR, exist_ok=True)
+                with open(os.path.join(LOGS_DIR, 'errors.log'), 'a',
+                          encoding='utf-8') as f:
+                    f.write(f'{time.strftime("%Y-%m-%d %H:%M:%S")}  settings '
+                            f'not fully loaded ({type(e).__name__}: {e})\n'
+                            f'{traceback.format_exc()}\n')
+            except Exception:
+                pass
+        self._keep_last_session()
+        self.shading.load_all()
+
+    def _keep_last_session(self):
+        """The previous run's working state stays loadable as the
+        configuration "_last_session" (the live autosave is about to be
+        overwritten by this run's empty plate)."""
+        try:
+            import json
+            import shutil
+            src = os.path.join(self.protocol_dir, '_autosave.json')
+            with open(src, 'r', encoding='utf-8') as f:
+                if json.load(f).get('positions'):
+                    shutil.copyfile(src, os.path.join(
+                        self.protocol_dir, '_last_session.json'))
         except Exception:
             pass
-        self.shading.load_all()
 
     # ---------------------------------------------------------- fail safe
 
     def on_stop(self):
-        """Fail safe on application exit: cancel any acquisition, turn every
-        LED off, and stop/disconnect the camera."""
+        """Tidy, fail-safe shutdown: cancel any acquisition, turn every LED
+        off, park the stage (objective fully lowered, stage centered for
+        lens access), then stop/disconnect the camera."""
+        if getattr(self, '_shutdown_done', False):
+            return
+        self._shutdown_done = True
         try:
             self.worker.request_cancel()
+            job = self.worker._thread
+            if job is not None and job.is_alive():
+                job.join(10.0)      # let it stop moving before we park
         except Exception:
             pass
         try:
             self.hw.leds_off()
         except Exception:
             pass
+        parked = False
+        if self.stage_connected:
+            print('[LumaViewPro] Parking: lowering the objective and '
+                  'centering the stage...', flush=True)
+            try:
+                parked = self.hw.park()
+            except Exception:
+                pass
+            if parked:
+                # Tell the park guard there is nothing left for it to do.
+                try:
+                    os.makedirs(LOGS_DIR, exist_ok=True)
+                    with open(PARKED_FLAG, 'w', encoding='utf-8') as f:
+                        f.write(str(os.getpid()))
+                except Exception:
+                    pass
         cam = self.hw.camera
         if cam is not None:
             try:
@@ -2723,9 +4039,19 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self._persist()
         except Exception:
             pass
-        print('[LumaViewPro] Fail-safe shutdown complete (LEDs off, camera stopped).',
-              flush=True)
+        print('[LumaViewPro] Shutdown complete (LEDs off, camera stopped, '
+              + ('objective lowered and stage centered' if parked
+                 else 'stage NOT parked') + ').', flush=True)
 
 
 if __name__ == '__main__':
-    LumaViewProApp().run()
+    _app = LumaViewProApp()
+    try:
+        _app.run()
+    finally:
+        # However the main loop ended, leave the microscope safe. If even
+        # this cannot run (process killed), the park guard does it.
+        try:
+            _app.on_stop()
+        except Exception:
+            pass

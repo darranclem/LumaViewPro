@@ -1,9 +1,10 @@
 from __future__ import annotations
 import math
 import numpy as np
-from kivy.graphics import Color, Line, Rectangle, Ellipse
+from kivy.graphics import (Color, Line, Rectangle, Ellipse, Mesh,
+                           StencilPush, StencilUse, StencilUnUse, StencilPop)
 from kivy.graphics.texture import Texture
-from kivy.properties import BooleanProperty, StringProperty
+from kivy.properties import BooleanProperty, NumericProperty, StringProperty
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.image import Image
 from kivy.uix.scrollview import ScrollView
@@ -17,14 +18,20 @@ class DragAwareScrollView(ScrollView):
 
     def on_touch_down(self, touch):
         button = getattr(touch, 'button', None) or ''
-        if self.collide_point(*touch.pos) and not button.startswith('scroll'):
+        # The mouse wheel goes to a child marked ``captures_scroll`` (the
+        # plate map zooms with it) instead of scrolling the panel.
+        want = 'captures_scroll' if button.startswith('scroll') \
+            else 'captures_drag'
+        if self.collide_point(*touch.pos):
             touch.push()
             touch.apply_transform_2d(self.to_local)
             try:
                 for w in self.walk(restrict=True):
-                    if (getattr(w, 'captures_drag', False)
+                    if (getattr(w, want, False)
                             and w.collide_point(*touch.pos)):
-                        return w.on_touch_down(touch)
+                        if w.on_touch_down(touch) or want == 'captures_drag':
+                            return True
+                        break       # wheel not used by the child: scroll
             finally:
                 touch.pop()
         return super().on_touch_down(touch)
@@ -334,9 +341,34 @@ class WellPlateMapWidget(Widget):
     one action to every well whose center is inside it: the action a click
     on the starting well would have had (start on an on well = turn off,
     otherwise turn on); Shift forces on, Ctrl forces off.
+
+    View: ``zoom`` 1 shows the whole plate; Ctrl + mouse wheel zooms about
+    the cursor (the wheel alone focuses when the map is the main view),
+    a right- or middle-button drag pans, and ``follow_stage``
+    keeps the stage position in the middle. The live camera image is
+    drawn on the plate at its true size and place (``set_live_image``).
+    Once a well is drawn large (``precise``), a double-click goes to the
+    exact point clicked instead of the well center.
     """
 
+    zoom = NumericProperty(1.0)
+    follow_stage = BooleanProperty(False)
+    # Draw the plate mirrored left to right (column 1 on the right): the
+    # plate as it lies on this microscope. Only the picture is mirrored;
+    # wells, positions and the live image all go through the same
+    # mapping, so every click still lands on what is drawn there.
+    flip_x = BooleanProperty(False)
+    captures_scroll = True
+    MAX_ZOOM = 400.0
+    ZOOM_STEP = 1.25
+    PRECISE_WELL_PX = 60.0     # well drawn at least this wide = precise
+
     DRAG_THRESHOLD_PX = 6.0
+    # A single click acts after this delay, so that a double-click (move
+    # the stage) is recognised first and never toggles the well. Without
+    # it the work done on the first click delayed the second one past the
+    # double-click window. 0 = act at once.
+    CLICK_DELAY_S = 0.28
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -351,9 +383,36 @@ class WellPlateMapWidget(Widget):
         self.on_well_selected = None      # callable(row, col, x_mm, y_mm)
         self.active_wells: set[tuple[int, int]] = set()
         self.on_wells_toggle = None       # callable(wells, turn_on)
+        # A second, independent well marking (drawn struck through), e.g.
+        # wells opted out of z-stacks. While mark_mode is on, clicks and
+        # rectangles edit this marking through on_wells_flag instead.
+        self.flagged_wells: set[tuple[int, int]] = set()
+        self.on_wells_flag = None         # callable(wells, flag_on)
+        self.mark_mode = False
         self._drag: dict | None = None
-        self._last_toggle: tuple[tuple[int, int], bool] | None = None
-        self.bind(pos=self.redraw, size=self.redraw)
+        self._last_toggle: tuple | None = None   # (well, turned_on, callback)
+        self._pending: tuple | None = None       # (well, turn_on, cb, event)
+        self.click_delay_s = self.CLICK_DELAY_S
+        self.view_center_mm: tuple[float, float] | None = None
+        self.live_texture = None
+        self.live_corners_mm: list[tuple[float, float]] | None = None
+        self.snapshots: list[dict] = []
+        self.on_point_double_click = None  # callable(x_mm, y_mm, well|None)
+        # Ctrl + wheel zooms. The wheel alone focuses (as on the camera
+        # view) while wheel_focus is on, i.e. when the map is the main
+        # view; otherwise it is left to the panel to scroll.
+        self.on_focus_scroll = None        # callable(direction)
+        self.wheel_focus = False
+        # While point_click_mode is on, a single click reports the exact
+        # point (on_point_click(x_mm, y_mm, well|None), mm from the A1
+        # center) instead of switching a well; used to move or add
+        # positions. A double-click still goes to the stage callbacks.
+        self.on_point_click = None
+        self.point_click_mode = False
+        self._pending_point = None
+        self._pan: dict | None = None
+        self.bind(pos=self.redraw, size=self.redraw, zoom=self.redraw,
+                  flip_x=self.redraw)
 
     @property
     def captures_drag(self) -> bool:
@@ -377,6 +436,9 @@ class WellPlateMapWidget(Widget):
         return sx, sy
 
     def _well_size(self) -> tuple[float, float]:
+        # The size measured by the plate calibration, when there is one.
+        if getattr(self, 'well_size_override', None):
+            return self.well_size_override
         lw = self._lw()
         wx = getattr(lw, 'well_size_x_mm', None)
         wy = getattr(lw, 'well_size_y_mm', None)
@@ -393,41 +455,189 @@ class WellPlateMapWidget(Widget):
         self.labware = labware
         self.selected_well = None
         self.active_wells = set()
+        self.flagged_wells = set()
         self._last_toggle = None
-        self.redraw()
+        self.view_center_mm = None
+        self.live_corners_mm = None
+        self.snapshots = []
+        if self.zoom != 1.0:
+            self.zoom = 1.0        # redraws
+        else:
+            self.redraw()
 
     # ------------------------------------------------------------ mapping
 
-    def _plate_draw_rect(self) -> tuple[float, float, float, float]:
-        """(x, y, w, h) of the plate outline inside the widget, keeping the
-        physical aspect ratio."""
+    def _fit_size(self) -> tuple[float, float]:
+        """Plate size on screen at zoom 1 (whole plate visible)."""
         pad = 8.0
         pl, pw = self._plate_dims()
         avail_w = max(self.width - 2 * pad, 10.0)
         avail_h = max(self.height - 2 * pad, 10.0)
         aspect = pl / pw
         if avail_w / avail_h > aspect:
-            h = avail_h
-            w = h * aspect
+            return avail_h * aspect, avail_h
+        return avail_w, avail_w / aspect
+
+    def _plate_draw_rect(self) -> tuple[float, float, float, float]:
+        """(x, y, w, h) of the plate outline, keeping the physical aspect
+        ratio. At zoom 1 it is centered in the widget; zoomed in, it is
+        placed so that ``view_center_mm`` is in the middle (most of the
+        plate is then outside the widget and clipped)."""
+        w, h = self._fit_size()
+        w, h = w * self.zoom, h * self.zoom
+        if self.zoom <= 1.0 or self.view_center_mm is None:
+            return (self.x + (self.width - w) / 2.0,
+                    self.y + (self.height - h) / 2.0, w, h)
+        pl, pw = self._plate_dims()
+        cx, cy = self.view_center_mm
+        return (self.center_x - self._vx(cx) / pl * w,
+                self.center_y - h + cy / pw * h, w, h)
+
+    def _vx(self, mm_x: float) -> float:
+        """Plate x as drawn (from the left edge of the picture); its own
+        inverse."""
+        return self._plate_dims()[0] - mm_x if self.flip_x else mm_x
+
+    # --------------------------------------------------------- zoom / pan
+
+    @property
+    def precise(self) -> bool:
+        """True when a well is drawn large enough to point inside it."""
+        pl, _ = self._plate_dims()
+        return self._well_size()[0] / pl * self._plate_draw_rect()[2] \
+            >= self.PRECISE_WELL_PX
+
+    def _set_view_center(self, mm_x: float, mm_y: float):
+        pl, pw = self._plate_dims()
+        self.view_center_mm = (min(max(mm_x, 0.0), pl),
+                               min(max(mm_y, 0.0), pw))
+
+    def set_view(self, zoom: float, center_mm=None):
+        """Set zoom and (optionally) the plate point shown in the middle."""
+        zoom = min(max(float(zoom), 1.0), self.MAX_ZOOM)
+        if center_mm is not None:
+            self._set_view_center(*center_mm)
+        if zoom <= 1.0:
+            self.view_center_mm = None
+        elif self.view_center_mm is None:
+            pl, pw = self._plate_dims()
+            self.view_center_mm = (pl / 2.0, pw / 2.0)
+        if zoom != self.zoom:
+            self.zoom = zoom       # redraws
         else:
-            w = avail_w
-            h = w / aspect
-        x = self.x + (self.width - w) / 2.0
-        y = self.y + (self.height - h) / 2.0
-        return x, y, w, h
+            self.redraw()
+
+    def zoom_by(self, factor: float, anchor=None):
+        """Zoom in (>1) or out (<1). ``anchor`` is the screen point that
+        stays put (the cursor); while following the stage, or with no
+        anchor, the middle of the view stays put."""
+        new = min(max(self.zoom * factor, 1.0), self.MAX_ZOOM)
+        if self.follow_stage and self.marker_plate_mm is not None:
+            self.set_view(new, self.marker_plate_mm)
+            return
+        if anchor is None:
+            anchor = self.center
+        mm = self._screen_to_mm(*anchor)
+        fw, fh = self._fit_size()
+        pl, pw = self._plate_dims()
+        side = -1.0 if self.flip_x else 1.0
+        cx = mm[0] - side * (anchor[0] - self.center_x) / (fw * new / pl)
+        cy = mm[1] + (anchor[1] - self.center_y) / (fh * new / pw)
+        self.set_view(new, (cx, cy))
+
+    def zoom_fit(self):
+        """Show the whole plate."""
+        self.set_view(1.0)
+
+    def zoom_to_span(self, center_mm, span_mm: float):
+        """Center on a plate point with ``span_mm`` filling the smaller
+        side of the widget."""
+        fw, _ = self._fit_size()
+        pl, _ = self._plate_dims()
+        px_per_mm = fw / pl
+        side = max(min(self.width, self.height), 10.0)
+        self.set_view(side / (max(span_mm, 1e-3) * px_per_mm), center_mm)
+
+    def zoom_to_stage(self, fields: float = 4.0):
+        """Center on the stage position, with the camera field of view
+        about 1/``fields`` of the view (one well if the field of view is
+        not known)."""
+        if self.marker_plate_mm is None:
+            return
+        if self.live_corners_mm:
+            xs = [p[0] for p in self.live_corners_mm]
+            ys = [p[1] for p in self.live_corners_mm]
+            span = max(max(xs) - min(xs), max(ys) - min(ys)) * fields
+        else:
+            span = max(self._well_size()) * 1.6
+        self.zoom_to_span(self.marker_plate_mm, span)
+
+    def set_live_image(self, texture, corners_rel_mm):
+        """Show the camera image on the plate. ``corners_rel_mm``: where
+        the image's top-left, top-right, bottom-right and bottom-left
+        corners are on the plate, relative to the A1 center (None hides
+        the image). Does not redraw: follow with set_marker_plate_mm."""
+        if texture is None or not corners_rel_mm:
+            self.live_texture = self.live_corners_mm = None
+            return
+        lw = self._lw()
+        self.live_texture = texture
+        self.live_corners_mm = [(lw.a1_offset_x + x, lw.a1_offset_y + y)
+                                for x, y in corners_rel_mm]
+
+    # Preview images left on the plate wherever an image was taken or the
+    # live view rested. A new one replaces those it lands on.
+    MAX_SNAPSHOTS = 600
+
+    def add_snapshot(self, rgb: np.ndarray, corners_rel_mm) -> bool:
+        """Leave a preview on the plate. ``rgb``: uint8 (h, w, 3), first
+        row = top of the image. ``corners_rel_mm``: its top-left,
+        top-right, bottom-right and bottom-left corners on the plate,
+        relative to the A1 center. Must be called on the UI thread."""
+        if rgb is None or not corners_rel_mm or rgb.ndim != 3:
+            return False
+        lw = self._lw()
+        corners = [(lw.a1_offset_x + x, lw.a1_offset_y + y)
+                   for x, y in corners_rel_mm]
+        cx = sum(p[0] for p in corners) / 4.0
+        cy = sum(p[1] for p in corners) / 4.0
+        # Size of the image on the plate: an older preview whose center
+        # is within a quarter of it is the same place and is replaced.
+        span = min(math.hypot(corners[1][0] - corners[0][0],
+                              corners[1][1] - corners[0][1]),
+                   math.hypot(corners[3][0] - corners[0][0],
+                              corners[3][1] - corners[0][1]))
+        h, w = rgb.shape[:2]
+        try:
+            tex = Texture.create(size=(w, h), colorfmt='rgb')
+            tex.blit_buffer(np.ascontiguousarray(rgb[::-1]).tobytes(),
+                            colorfmt='rgb', bufferfmt='ubyte')
+        except Exception:
+            return False
+        self.snapshots = [s for s in self.snapshots if math.hypot(
+            s['center'][0] - cx, s['center'][1] - cy) > span * 0.25]
+        self.snapshots.append({'center': (cx, cy), 'corners': corners,
+                               'texture': tex})
+        del self.snapshots[:-self.MAX_SNAPSHOTS]
+        self.redraw()
+        return True
+
+    def clear_snapshots(self):
+        self.snapshots = []
+        self.redraw()
 
     def _mm_to_screen(self, mm_x: float, mm_y: float) -> tuple[float, float]:
         """Plate mm (origin = plate top-left corner, +y down) -> screen."""
         x, y, w, h = self._plate_draw_rect()
         pl, pw = self._plate_dims()
-        sx = x + (mm_x / pl) * w
+        sx = x + (self._vx(mm_x) / pl) * w
         sy = y + h - (mm_y / pw) * h
         return sx, sy
 
     def _screen_to_mm(self, sx: float, sy: float) -> tuple[float, float]:
         x, y, w, h = self._plate_draw_rect()
         pl, pw = self._plate_dims()
-        mm_x = (sx - x) / w * pl
+        mm_x = self._vx((sx - x) / w * pl)
         mm_y = (y + h - sy) / h * pw
         return mm_x, mm_y
 
@@ -453,7 +663,14 @@ class WellPlateMapWidget(Widget):
         lw = self._lw()
         self.marker_plate_mm = (lw.a1_offset_x + x_mm_from_a1,
                                 lw.a1_offset_y + y_mm_from_a1)
+        if self.follow_stage and self.zoom > 1.0 and self._pan is None:
+            self._set_view_center(*self.marker_plate_mm)
         self.redraw()
+
+    def on_follow_stage(self, instance, value):
+        if value and self.marker_plate_mm is not None and self.zoom > 1.0:
+            self._set_view_center(*self.marker_plate_mm)
+            self.redraw()
 
     def set_target_plate_mm(self, plate_mm: tuple[float, float] | None):
         """Show/clear the guided calibration target (plate top-left origin)."""
@@ -478,24 +695,73 @@ class WellPlateMapWidget(Widget):
         well_rx = (wx_mm / 2.0) / pl * w
         well_ry = (wy_mm / 2.0) / pw * h
         shape = getattr(lw, 'shape', 'round')
+        left, right = self.x, self.right
+        bottom, top = self.y, self.top
         with self.canvas:
+            # Clip to the widget: a zoomed-in plate is larger than it.
+            StencilPush()
+            Rectangle(pos=self.pos, size=self.size)
+            StencilUse()
             # Plate body
             Color(0.13, 0.15, 0.19, 1)
             Rectangle(pos=(x, y), size=(w, h))
             Color(0.45, 0.5, 0.58, 1)
             Line(rectangle=(x, y, w, h), width=1.2)
-            # A1 corner chamfer marker (top-left)
-            Line(points=[x, y + h - 14, x + 14, y + h], width=1.2)
+            # A1 corner chamfer marker (top-left; top-right when mirrored)
+            if self.flip_x:
+                Line(points=[x + w, y + h - 14, x + w - 14, y + h], width=1.2)
+            else:
+                Line(points=[x, y + h - 14, x + 14, y + h], width=1.2)
+            # Previews left behind, oldest first (newer ones on top)
+            for s in self.snapshots:
+                pts = [self._mm_to_screen(*p) for p in s['corners']]
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                if (max(xs) < left or min(xs) > right or
+                        max(ys) < bottom or min(ys) > top):
+                    continue
+                tl, tr, br, bl = pts
+                tc = s['texture'].tex_coords       # BL, BR, TR, TL
+                Color(1, 1, 1, 1)
+                Mesh(vertices=[bl[0], bl[1], tc[0], tc[1],
+                               br[0], br[1], tc[2], tc[3],
+                               tr[0], tr[1], tc[4], tc[5],
+                               tl[0], tl[1], tc[6], tc[7]],
+                     indices=[0, 1, 2, 3], mode='triangle_fan',
+                     texture=s['texture'])
+            # Live camera image, at its true size and place on the plate
+            box = None
+            if self.live_texture is not None and self.live_corners_mm:
+                tl, tr, br, bl = [self._mm_to_screen(*p)
+                                  for p in self.live_corners_mm]
+                tc = self.live_texture.tex_coords   # BL, BR, TR, TL
+                Color(1, 1, 1, 1)
+                Mesh(vertices=[bl[0], bl[1], tc[0], tc[1],
+                               br[0], br[1], tc[2], tc[3],
+                               tr[0], tr[1], tc[4], tc[5],
+                               tl[0], tl[1], tc[6], tc[7]],
+                     indices=[0, 1, 2, 3], mode='triangle_fan',
+                     texture=self.live_texture)
+                box = [*tl, *tr, *br, *bl, *tl]
             # Wells
             for r in range(lw.rows):
                 for c in range(lw.cols):
                     mmx, mmy = self._well_center_mm(r, c)
                     sx, sy = self._mm_to_screen(mmx, mmy)
+                    if (sx + well_rx < left or sx - well_rx > right or
+                            sy + well_ry < bottom or sy - well_ry > top):
+                        continue        # outside the zoomed view
                     if (r, c) in self.active_wells:
                         Color(0.1, 0.75, 0.45, 0.55)
                         fill = Rectangle if shape == 'square' else Ellipse
                         fill(pos=(sx - well_rx, sy - well_ry),
                              size=(2 * well_rx, 2 * well_ry))
+                    if (r, c) in self.flagged_wells:
+                        Color(1.0, 0.3, 0.25, 1)
+                        Line(points=[sx - well_rx, sy - well_ry,
+                                     sx + well_rx, sy + well_ry], width=1.4)
+                        Line(points=[sx - well_rx, sy + well_ry,
+                                     sx + well_rx, sy - well_ry], width=1.4)
                     if self.selected_well == (r, c):
                         Color(0.1, 0.8, 1.0, 1)
                     else:
@@ -523,13 +789,23 @@ class WellPlateMapWidget(Widget):
                     Color(0.95, 0.75, 0.1, 0.9)
                     Line(points=[sx - 4, sy, sx, sy + 4, sx + 4, sy, sx, sy - 4,
                                  sx - 4, sy], width=1.1)
-            # Stage position marker
+            # Stage position marker: the field-of-view outline, plus the
+            # cross and circle while the outline is too small to see.
+            if box is not None:
+                Color(0.15, 1.0, 0.35, 1)
+                Line(points=box, width=1.1)
             if self.marker_plate_mm is not None:
                 sx, sy = self._mm_to_screen(*self.marker_plate_mm)
                 Color(0.15, 1.0, 0.35, 1)
-                Line(points=[sx - 7, sy, sx + 7, sy], width=1.4)
-                Line(points=[sx, sy - 7, sx, sy + 7], width=1.4)
-                Line(circle=(sx, sy, 5), width=1.2)
+                small = box is None or max(
+                    abs(box[4] - box[0]), abs(box[5] - box[1])) < 40
+                if small:
+                    Line(points=[sx - 7, sy, sx + 7, sy], width=1.4)
+                    Line(points=[sx, sy - 7, sx, sy + 7], width=1.4)
+                    Line(circle=(sx, sy, 5), width=1.2)
+                else:
+                    Line(points=[sx - 5, sy, sx + 5, sy], width=1.0)
+                    Line(points=[sx, sy - 5, sx, sy + 5], width=1.0)
             # Calibration target marker
             if self.target_plate_mm is not None:
                 sx, sy = self._mm_to_screen(*self.target_plate_mm)
@@ -539,6 +815,9 @@ class WellPlateMapWidget(Widget):
                 Line(points=[sx + 4, sy, sx + 12, sy], width=1.6)
                 Line(points=[sx, sy - 12, sx, sy - 4], width=1.6)
                 Line(points=[sx, sy + 4, sx, sy + 12], width=1.6)
+            StencilUnUse()
+            Rectangle(pos=self.pos, size=self.size)
+            StencilPop()
 
     # --------------------------------------------------------------- input
 
@@ -594,17 +873,76 @@ class WellPlateMapWidget(Widget):
     def on_touch_down(self, touch):
         if not self.collide_point(*touch.pos):
             return super().on_touch_down(touch)
-        if (getattr(touch, 'button', None) or '').startswith('scroll'):
+        button = getattr(touch, 'button', None) or ''
+        if button.startswith('scroll'):
+            if 'ctrl' in self._modifiers():
+                # Kivy reports wheel-forward as 'scrolldown': zoom in.
+                self.zoom_by(self.ZOOM_STEP if button == 'scrolldown'
+                             else 1.0 / self.ZOOM_STEP, anchor=touch.pos)
+                return True
+            if self.wheel_focus and self.on_focus_scroll is not None:
+                # Same direction as on the camera view.
+                self.on_focus_scroll(1 if button == 'scrolldown' else -1)
+                return True
             return False
-        well = self._nearest_well(*self._screen_to_mm(touch.x, touch.y))
+        if button in ('right', 'middle'):
+            if self.zoom > 1.0 and self.view_center_mm is not None:
+                self._pan = {'start': touch.pos,
+                             'center': self.view_center_mm}
+                touch.grab(self)
+            return True
+        mm = self._screen_to_mm(touch.x, touch.y)
+        well = self._nearest_well(*mm)
+
+        if touch.is_double_tap and self._pending_point is not None:
+            # The first click of this double-click was not a point edit.
+            self._pending_point.cancel()
+            self._pending_point = None
+        if self.point_click_mode and self.on_point_click is not None \
+                and not touch.is_double_tap:
+            pl, pw = self._plate_dims()
+            if 0.0 <= mm[0] <= pl and 0.0 <= mm[1] <= pw:
+                lw = self._lw()
+                args = (mm[0] - lw.a1_offset_x, mm[1] - lw.a1_offset_y, well)
+                if self._pending_point is not None:
+                    self._pending_point.cancel()
+                    self._pending_point = None
+                if self.click_delay_s > 0:
+                    from kivy.clock import Clock
+
+                    def _fire(dt, args=args):
+                        self._pending_point = None
+                        self.on_point_click(*args)
+                    self._pending_point = Clock.schedule_once(
+                        _fire, self.click_delay_s)
+                else:
+                    self.on_point_click(*args)
+            return True
 
         if touch.is_double_tap:
+            if self.precise and self.on_point_double_click is not None:
+                # Zoomed in: go to the exact point, not the well center.
+                pl, pw = self._plate_dims()
+                if 0.0 <= mm[0] <= pl and 0.0 <= mm[1] <= pw:
+                    if self._pending is not None:
+                        self._pending[3].cancel()
+                        self._pending = None
+                    elif self._last_toggle and self._last_toggle[0] == well:
+                        self._last_toggle[2]([well], not self._last_toggle[1])
+                    self._last_toggle = None
+                    lw = self._lw()
+                    self.on_point_double_click(mm[0] - lw.a1_offset_x,
+                                               mm[1] - lw.a1_offset_y, well)
+                return True
             if well is None:
                 return True
-            # The first click of the double-click toggled this well: put
-            # it back, a double-click only moves the stage.
-            if self._last_toggle and self._last_toggle[0] == well:
-                self.on_wells_toggle([well], not self._last_toggle[1])
+            # A double-click only moves the stage: drop the first click's
+            # pending toggle, or undo it if it has already been applied.
+            if self._pending is not None:
+                self._pending[3].cancel()
+                self._pending = None
+            elif self._last_toggle and self._last_toggle[0] == well:
+                self._last_toggle[2]([well], not self._last_toggle[1])
             self._last_toggle = None
             self.selected_well = well
             self.redraw()
@@ -618,19 +956,36 @@ class WellPlateMapWidget(Widget):
                 self._select(well)
             return True
 
+        self._fire_pending()        # an earlier click on another well
+        marking = self.mark_mode and self.on_wells_flag is not None
+        current = self.flagged_wells if marking else self.active_wells
         mods = self._modifiers()
         if 'shift' in mods:
             remove = False
         elif 'ctrl' in mods:
             remove = True
         else:
-            remove = well is not None and well in self.active_wells
+            remove = well is not None and well in current
         self._drag = {'start': touch.pos, 'cur': touch.pos, 'well': well,
-                      'remove': remove, 'moved': False}
+                      'remove': remove, 'moved': False,
+                      'cb': self.on_wells_flag if marking
+                      else self.on_wells_toggle}
         touch.grab(self)
         return True
 
     def on_touch_move(self, touch):
+        if touch.grab_current is self and self._pan is not None:
+            fw, fh = self._fit_size()
+            pl, pw = self._plate_dims()
+            p = self._pan
+            self.follow_stage = False
+            self._set_view_center(
+                p['center'][0] - (-1.0 if self.flip_x else 1.0)
+                * (touch.x - p['start'][0]) / (fw * self.zoom / pl),
+                p['center'][1] + (touch.y - p['start'][1])
+                / (fh * self.zoom / pw))
+            self.redraw()
+            return True
         if touch.grab_current is not self or self._drag is None:
             return super().on_touch_move(touch)
         d = self._drag
@@ -646,6 +1001,9 @@ class WellPlateMapWidget(Widget):
         if touch.grab_current is not self:
             return super().on_touch_up(touch)
         touch.ungrab(self)
+        if self._pan is not None:
+            self._pan = None
+            return True
         d, self._drag = self._drag, None
         self.canvas.after.clear()
         if d is None:
@@ -654,14 +1012,28 @@ class WellPlateMapWidget(Widget):
             wells = self.wells_in_screen_rect(*d['start'], *d['cur'])
             self._last_toggle = None
             if wells:
-                self.on_wells_toggle(wells, not d['remove'])
+                d['cb'](wells, not d['remove'])
         elif d['well'] is not None:
             well = d['well']
             self._select(well)
             turn_on = not d['remove']
-            self._last_toggle = (well, turn_on)
-            self.on_wells_toggle([well], turn_on)
+            if self.click_delay_s > 0:
+                from kivy.clock import Clock
+                self._pending = (well, turn_on, d['cb'], Clock.schedule_once(
+                    lambda dt: self._fire_pending(), self.click_delay_s))
+            else:
+                self._last_toggle = (well, turn_on, d['cb'])
+                d['cb']([well], turn_on)
         return True
+
+    def _fire_pending(self):
+        """Apply the single click that was waiting out the double-click
+        window."""
+        p, self._pending = self._pending, None
+        if p is not None:
+            p[3].cancel()
+            self._last_toggle = (p[0], p[1], p[2])
+            p[2]([p[0]], p[1])
 
 
 class InteractiveScaledPlateCanvas(Widget):

@@ -7,7 +7,18 @@ Custom control application for an Etaluma Lumascope microscope, built on top of 
 - **Do not launch `lumaviewpro.py` on the microscope PC without asking.** It connects to the real stage, LEDs and camera and homes the stage at startup.
 - To exercise the app without hardware, use the simulator: `.venv\Scripts\python luma_sim.py` (mocks camera, stage and LED board).
 - `hw_debug.py` also talks to real hardware.
-- The user tests on the real microscope themselves; a simulator run is not required before handing over a change. The simulator's mocks are older than the app (stage and camera show as not connected), so it only checks that the UI builds. If you do run it, run it from a copy of the repo so it cannot overwrite `data/current.json`.
+- The user tests on the real microscope themselves; a simulator run is not required before handing over a change. The simulator's mocks are older than the app (stage and camera show as not connected), so it only checks that the UI builds. If you do run it, run it from a copy of the repo, and set `protocol_dir` in the copy's `data/lvp_custom_settings.json` to a folder inside the copy: the setting is an absolute path, so an unmodified copy writes protocols and the autosave into the real `data/protocols`.
+
+## Settings (per Windows account)
+
+- Each account's settings are in `%APPDATA%\LumaViewPro\settings.json` (`acquisition.SETTINGS_PATH`). An account without one starts from `data/lvp_custom_settings.json`, which is no longer written by the app.
+- Only the account that owns the program folder can write to it; other accounts get default data and protocol folders under their `Documents\LumaViewPro`.
+- `luma_sim.py` sets `LUMAVIEW_SETTINGS` to the `data/lvp_custom_settings.json` beside it, so a simulator run in a copy uses the copy's settings.
+
+## Logs (read these before guessing at a hardware-side problem)
+
+- `logs/LVP_Log/lumaviewpro.log`: the stock drivers log every stage move and LED/camera call with thread and time; it shows what the user actually did in a run.
+- `logs/calibration.log` (every plate-calibration button press and mark), `logs/errors.log` (exceptions caught by the app), `logs/park_guard.log`.
 
 ## Environment
 
@@ -26,6 +37,8 @@ The custom app is a handful of top-level files; most work happens here:
 - `labware_defs.py`, `labware.py`: plate definitions and custom labware
 - `experiment.py`: pure planning logic (imaging sites per well, focus map points, focus surface interpolation, file naming)
 - `experiment_wizard.py`: the experiment setup wizard, mixed into the app class; its panel is in `lumaviewpro.kv`
+- `online_processing.py`: composites, stitched tile scans and timelapse videos made on a background thread while a protocol runs (needs `tifffile`); `run_protocol` reports each completed position to it
+- `park_guard.py`: separate process started by the app once the real stage is connected; if the app ends without parking (crash, killed), it lowers the objective, confirms it is down, then centers the stage. `ScopeHW.park()` uses the same routine.
 - `image_utils.py`, `luma_sim.py`, `hw_debug.py`
 
 `modules/`, `drivers/`, `ui/`, `rest/`, `scripts/` and most of `tests/` come from upstream LumaViewPro. Avoid editing them unless the task is about them.
@@ -45,10 +58,10 @@ The custom app is a handful of top-level files; most work happens here:
 - `tests/` holds over 800 upstream test files. Do not run the whole suite; run the specific files for the code you changed.
 - Pass `--noconftest`: the upstream `tests/conftest.py` imports `modules.scope_session`, which currently fails (`modules/protocol.py` imports `FilePath`, which `modules/api_surface.py` no longer defines). Example:
   `.venv\Scripts\python -m pytest --noconftest tests/test_af_global_vcurve_fit.py`
-- Tests for this fork's own code: `test_af_global_vcurve_fit.py`, `test_image_controls.py`, `test_labware_designer.py`, `test_shading_zstack.py`, `test_plate_well_selection.py`, `test_experiment_plan.py`.
+- Tests for this fork's own code: `test_af_global_vcurve_fit.py`, `test_image_controls.py`, `test_labware_designer.py`, `test_shading_zstack.py`, `test_plate_well_selection.py`, `test_experiment_plan.py`, `test_online_processing.py`, `test_user_settings.py`.
 
 ## Git
 
 - `pull.rebase` and `rebase.autoStash` are on: `git pull` before work, commit, `git push` after.
-- Machine-specific state is ignored and must stay untracked: `data/af_template.npy`, `data/protocols/_autosave.json`, `data/current.json`, `run.bat`.
+- Machine-specific state is ignored and must stay untracked: `data/af_template.npy`, `data/protocols/_autosave.json`, `data/protocols/_last_session.json`, `data/current.json`, `run.bat`.
 - Pushing to `origin/main` after a completed change is the normal workflow here.
