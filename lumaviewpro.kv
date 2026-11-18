@@ -888,6 +888,9 @@ LumaViewProMainLayout:
                                 text: 'Online stitch: ' + ('ON' if app.stitch_on else 'off')
                                 background_color: ACCENT if app.stitch_on else PANEL2
                                 on_press: app.toggle_online('stitch')
+                        FlatButton:
+                            text: 'Save as: ' + app.save_format_label(app.save_format)
+                            on_press: app.cycle_save_format()
                         AccentButton:
                             text: 'Run protocol (timelapse)'
                             on_press: app.run_protocol()

@@ -338,6 +338,162 @@ class WellWriter:
                 'filters': None, 'dimension_separator': '/'})
 
 
+SAVE_FORMATS = ('ome-tiff', 'zarr', 'single')
+SAVE_FORMAT_LABEL = {'ome-tiff': 'one OME-TIFF per well / stack',
+                     'zarr': 'one OME-Zarr per well / stack',
+                     'single': 'single-page TIFFs (one per image)'}
+
+
+def storable(frame) -> np.ndarray | None:
+    """``frame`` as a well file takes it (2-D uint8 or uint16), or None
+    when it is something else (a colour frame): floats from a correction
+    are rounded and clipped to 16 bits."""
+    frame = np.asarray(frame)
+    if frame.ndim != 2:
+        return None
+    if frame.dtype in (np.uint8, np.uint16):
+        return frame
+    if frame.dtype.kind in 'fiu':
+        return np.clip(np.rint(frame), 0, 65535).astype(np.uint16)
+    return None
+
+
+def _write_single(path: str, img) -> None:
+    tifffile.imwrite(path, img)
+
+
+def _bare(folder: str) -> str:
+    """``folder`` without a trailing separator."""
+    return folder.rstrip('/').rstrip(os.sep)
+
+
+class RunSaver:
+    """Where a protocol run's frames go: one file per well (``fmt``
+    'ome-tiff' or 'zarr'), or single-page TIFFs as before ('single').
+
+    With a per-well format, ``keep_planes`` also writes each frame as a
+    single-page TIFF below ``<base_dir>/_processing_planes`` for the online
+    processing, which reads planes back by path; ``remove_planes()`` deletes
+    that folder once the processing is through. The per-well files are the
+    data of record."""
+
+    PLANES_DIR = '_processing_planes'
+
+    def __init__(self, base_dir: str, fmt: str, *, um_per_px: float = 0.0,
+                 z_step_um: float = 0.0, keep_planes: bool = False,
+                 info: dict | None = None, single_writer=None, name_of=None):
+        if fmt not in SAVE_FORMATS:
+            raise ValueError(f'format must be one of {SAVE_FORMATS}, not {fmt!r}')
+        self.base_dir = base_dir
+        self.fmt = fmt
+        self.um_per_px = um_per_px
+        self.z_step_um = z_step_um
+        self.keep_planes = keep_planes
+        self.info = dict(info or {})
+        self._single = single_writer or _write_single
+        self._name = name_of
+        self.writers: dict[str, WellWriter] = {}
+        self.fallback = 0
+
+    def _single_path(self, folder: str, well, site, z_index, channel, timepoint) -> str:
+        os.makedirs(folder, exist_ok=True)
+        if self._name is not None:
+            name = self._name(well, site, z_index, channel, timepoint)
+        else:
+            name = '_'.join(([str(well)] if well else []) + [
+                str(site), f'Z{int(z_index):03d}', str(channel), f't{int(timepoint):04d}']) + '.tiff'
+        return os.path.join(folder, name)
+
+    def save(self, frame, *, well: str | None, site: str, z_index: int,
+             channel: str, timepoint: int, x_um=None, y_um=None, z_um=None,
+             t_s=None, exposure_ms=None) -> str | None:
+        """Save one frame (``z_index`` and ``timepoint`` count from 1, as
+        in the file names). Returns the path of a single-page file holding
+        this frame, when one was written (always for 'single'; with
+        ``keep_planes``; or for a frame a well file cannot hold)."""
+        folder = os.path.join(self.base_dir, well or 'positions')
+        if self.fmt == 'single':
+            path = self._single_path(folder, well, site, z_index, channel, timepoint)
+            self._single(path, frame)
+            return path
+        plane = storable(frame)
+        if plane is None:
+            # Not a grey image: kept as its own file, the old way.
+            self.fallback += 1
+            path = self._single_path(folder, well, site, z_index, channel, timepoint)
+            self._single(path, frame)
+            return path
+        key = well or ''
+        writer = self.writers.get(key)
+        if writer is None:
+            writer = WellWriter(well_path(self.base_dir, well, self.fmt), self.fmt,
+                                um_per_px=self.um_per_px, z_step_um=self.z_step_um,
+                                well=well, info=self.info)
+            self.writers[key] = writer
+        writer.add(plane, tile=site, z=int(z_index) - 1, channel=channel,
+                   timepoint=int(timepoint) - 1, x_um=x_um, y_um=y_um, z_um=z_um,
+                   t_s=t_s, exposure_ms=exposure_ms)
+        if not self.keep_planes:
+            return None
+        path = self._single_path(os.path.join(self.base_dir, self.PLANES_DIR, well or 'positions'),
+                                 well, site, z_index, channel, timepoint)
+        self._single(path, frame)
+        return path
+
+    def close(self) -> list[dict]:
+        """Finish every well file (their metadata is written now)."""
+        return [w.close() for w in self.writers.values()]
+
+    def remove_planes(self) -> None:
+        import shutil
+        shutil.rmtree(os.path.join(self.base_dir, self.PLANES_DIR), ignore_errors=True)
+
+
+class StackSaver:
+    """Where a live z-stack's frames go: ``<out_dir>.ome.tiff`` /
+    ``<out_dir>.zarr`` (one file for the stack; the empty folder is removed
+    at the end), or ``zstack_<colour>_<number>_<height>um.tiff`` files in
+    ``out_dir`` ('single'). Planes are numbered by stage height, lowest
+    first, within each colour."""
+
+    def __init__(self, out_dir: str, fmt: str, heights_um: dict[str, list[float]],
+                 *, um_per_px: float = 0.0, single_writer=None):
+        if fmt not in SAVE_FORMATS:
+            raise ValueError(f'format must be one of {SAVE_FORMATS}, not {fmt!r}')
+        self.out_dir = out_dir
+        self.fmt = fmt
+        self._single = single_writer or _write_single
+        self.rank = {ch: {z: i for i, z in enumerate(sorted({round(float(z), 3) for z in zs}))}
+                     for ch, zs in heights_um.items()}
+        first = sorted({round(float(z), 3) for z in next(iter(heights_um.values()), [])})
+        step = (first[-1] - first[0]) / (len(first) - 1) if len(first) > 1 else 0.0
+        self.writer = None
+        self.path = out_dir
+        if fmt != 'single':
+            self.path = _bare(out_dir) + EXTENSION[fmt]
+            self.writer = WellWriter(self.path, fmt, um_per_px=um_per_px, z_step_um=step,
+                                     info={'kind': 'z-stack',
+                                           'source': os.path.basename(_bare(out_dir))})
+
+    def save(self, frame, channel: str, number: int, z_um: float) -> None:
+        plane = storable(frame) if self.writer is not None else None
+        if plane is None:
+            os.makedirs(self.out_dir, exist_ok=True)
+            self._single(os.path.join(self.out_dir, f'zstack_{channel}_{number:03d}_{z_um:.1f}um.tiff'), frame)
+            return
+        self.writer.add(plane, tile='P1', z=self.rank[channel][round(float(z_um), 3)],
+                        channel=channel, z_um=float(z_um))
+
+    def close(self) -> str:
+        if self.writer is not None:
+            self.writer.close()
+            try:
+                os.rmdir(self.out_dir)        # only if nothing was put in it
+            except OSError:
+                pass
+        return self.path
+
+
 def _text(value) -> str:
     return (str(value).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
 

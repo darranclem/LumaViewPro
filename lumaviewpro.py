@@ -109,6 +109,7 @@ import plate_navigator
 import acquisition as acq
 import experiment
 import online_processing
+import well_file
 from experiment_wizard import ExperimentWizardMixin
 
 # LED current ceiling for the sliders/fields (mA).
@@ -300,6 +301,9 @@ class LumaViewProApp(ExperimentWizardMixin, App):
     zman_step_text = StringProperty('5')  # its interval: one for all colours
     zman_marked = StringProperty('')      # colours ticked "Use in protocol"
     zstack_dir = StringProperty('')       # live z-stacks; '' = data folder
+    # How protocol runs and z-stacks are saved: one file per well / stack
+    # ('ome-tiff' or 'zarr'), or single-page TIFFs ('single').
+    save_format = StringProperty('ome-tiff')
     lens_pos_info = StringProperty('')    # work position of the lens in use
     work_at_start_on = BooleanProperty(True)   # raise to it after homing
     map_flip_x = BooleanProperty(True)    # plate map drawn left-right mirrored
@@ -3731,6 +3735,17 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                              f'the data directory instead')
         return self._out_base()
 
+    def cycle_save_format(self):
+        """The next way of saving protocol runs and z-stacks."""
+        order = well_file.SAVE_FORMATS
+        at = order.index(self.save_format) if self.save_format in order else -1
+        self.save_format = order[(at + 1) % len(order)]
+        self._set_status('Saving as ' + well_file.SAVE_FORMAT_LABEL[self.save_format])
+        self._persist()
+
+    def save_format_label(self, fmt: str) -> str:
+        return well_file.SAVE_FORMAT_LABEL.get(fmt, fmt)
+
     def set_zstack_dir(self, text: str):
         self.zstack_dir = text.strip()
         self._persist()
@@ -3791,7 +3806,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                              planes, self.shading if self.shading_on else None,
                              out_dir, self.worker.cancel,
                              status_cb=self._set_status, return_z_um=back,
-                             order=order)
+                             order=order, save_format=self.save_format,
+                             um_per_px=self.effective_um_per_px())
             Clock.schedule_once(lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
         self._bg(_job, busy_job=True)
 
@@ -4035,15 +4051,41 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                     um_per_px=scale,
                     z_step_um=stacked[0].zstack.step_um if stacked else 0.0,
                     cycles=cycles, status_cb=self._set_status,
-                    done_cb=lambda summary, videos: Clock.schedule_once(
+                    done_cb=lambda summary, videos: (
+                        # The planes kept for the processing are no longer
+                        # needed: the well files are the data.
+                        saver.remove_planes(),
+                        Clock.schedule_once(
                         lambda dt: self._processing_done_popup(
-                            base_dir, summary, videos), 0))
+                            base_dir, summary, videos), 0)))
             else:
                 self._set_status('Online processing needs the tifffile and '
                                  'opencv-python packages - running without')
         t_run = time.time()
+        stacked_all = [self.channel_settings[ch] for ch in channels
+                       if self.channel_settings[ch].zstack.enabled]
+        # One file per well (or single-page TIFFs): see well_file.RunSaver.
+        saver = well_file.RunSaver(
+            base_dir, self.save_format,
+            um_per_px=self.effective_um_per_px(),
+            z_step_um=stacked_all[0].zstack.step_um if stacked_all else 0.0,
+            keep_planes=proc is not None,
+            info={'protocol': self.protocol_name or '',
+                  'objective': self.objective_name or ''},
+            single_writer=acq.save_image,
+            name_of=experiment.file_name)
 
         def _job():
+            try:
+                _run()
+            finally:
+                # The well files get their metadata now, whatever happened.
+                try:
+                    saver.close()
+                except Exception as e:
+                    self._set_status(f'Closing the well files failed: {e}')
+
+        def _run():
             for cyc in range(cycles):
                 t0 = time.time()
                 if cancel.is_set():
@@ -4092,8 +4134,6 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                     self._set_status(f'Timepoint {cyc + 1}/{cycles}: '
                                      f'{p["name"]}...')
                     self._safe_goto(p['x_um'], p['y_um'], base_z)
-                    out_dir = os.path.join(base_dir, p['well'] or 'positions')
-                    os.makedirs(out_dir, exist_ok=True)
                     at_z = base_z
                     for ch in channels:
                         if cancel.is_set():
@@ -4125,11 +4165,13 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                                 continue
                             if self.shading_on:
                                 frame = self.shading.apply(frame, ch, z)
-                            path = os.path.join(
-                                out_dir, experiment.file_name(
-                                    p['well'], p['site'], zi, ch, cyc + 1))
-                            acq.save_image(path, frame)
-                            files.setdefault(ch, []).append(path)
+                            path = saver.save(
+                                frame, well=p['well'], site=p['site'],
+                                z_index=zi, channel=ch, timepoint=cyc + 1,
+                                x_um=p['x_um'], y_um=p['y_um'], z_um=z,
+                                t_s=time.time() - t_run)
+                            if path is not None:
+                                files.setdefault(ch, []).append(path)
                             # The image stays on the plate map where it
                             # was taken (middle plane of a z-stack).
                             if zi == (len(planes) + 1) // 2:
@@ -4198,6 +4240,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             'shading_focus_z': self.shading_focus_z,
             'protocol_dir': self.protocol_dir,
             'zstack_dir': self.zstack_dir,
+            'save_format': self.save_format,
             'zman_mode': self.zman_mode,
             'zman_order': self.zman_order,
             'panel_widths': self.panel_widths,
@@ -4238,6 +4281,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self.protocol_dir = d['protocol_dir']
         if isinstance(d.get('zstack_dir'), str):
             self.zstack_dir = d['zstack_dir'].strip()
+        if d.get('save_format') in well_file.SAVE_FORMATS:
+            self.save_format = d['save_format']
         self.zman_mode = ('centre' if d.get('zman_mode') == 'centre'
                           else 'ends')
         self.zman_order = ('channel' if d.get('zman_order') == 'channel'

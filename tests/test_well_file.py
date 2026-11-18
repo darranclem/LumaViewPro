@@ -145,3 +145,65 @@ def test_a_protocol_runs_single_files_become_one_file_per_well(tmp_path):
     assert got['tiles']['TA2'].shape == (2, 2, 2, 24, 32)
     assert np.array_equal(got['tiles']['TA2'][1, 1, 0], frame(2, 2, True, 1))
     assert got['tile_xy']['TA2'] == (1234.0, 56.0)
+
+
+def test_a_protocol_runs_frames_go_to_one_file_per_well(tmp_path):
+    import experiment
+    saver = well_file.RunSaver(str(tmp_path), 'ome-tiff', um_per_px=0.65, z_step_um=2.0,
+                               name_of=experiment.file_name)
+    for t in (1, 2):
+        for well, site in (('B3', 'TA1'), ('B3', 'TA2'), ('C4', 'P1')):
+            for ch in ('BF', 'GREEN'):
+                for z in (1, 2):
+                    got = saver.save(frame(int(site[-1]), t, ch == 'GREEN', z), well=well, site=site,
+                                     z_index=z, channel=ch, timepoint=t, x_um=10.0, y_um=20.0, z_um=5.0 + z)
+                    assert got is None, 'no single-page file is written'
+    done = saver.close()
+    assert sorted(os.listdir(tmp_path)) == ['B3.ome.tiff', 'C4.ome.tiff']
+    assert [d['planes'] for d in done] == [16, 8]
+    b3 = well_file.read_well(str(tmp_path / 'B3.ome.tiff'))
+    assert b3['tiles']['TA2'].shape == (2, 2, 2, 24, 32)
+    assert np.array_equal(b3['tiles']['TA2'][1, 1, 1], frame(2, 2, True, 2))
+
+
+def test_planes_kept_for_online_processing_are_removed_afterwards_and_single_is_as_before(tmp_path):
+    import experiment
+    keep = well_file.RunSaver(str(tmp_path / 'a'), 'zarr', keep_planes=True, name_of=experiment.file_name)
+    path = keep.save(frame(1, 1, 0, 1), well='B3', site='TA1', z_index=1, channel='BF', timepoint=1)
+    assert path.endswith(os.path.join('_processing_planes', 'B3', 'B3_TA1_Z001_BF_t0001.tiff'))
+    assert np.array_equal(tifffile.imread(path), frame(1, 1, 0, 1))
+    # A colour frame cannot go into a well file: it is kept as its own file.
+    odd = keep.save(np.zeros((4, 4, 3), np.uint8), well='B3', site='TA1', z_index=2, channel='BF', timepoint=1)
+    assert odd.endswith(os.path.join('B3', 'B3_TA1_Z002_BF_t0001.tiff')) and keep.fallback == 1
+    keep.close()
+    keep.remove_planes()
+    assert sorted(os.listdir(tmp_path / 'a')) == ['B3', 'B3.zarr']
+    single = well_file.RunSaver(str(tmp_path / 'b'), 'single', name_of=experiment.file_name)
+    path = single.save(frame(1, 1, 0, 1), well=None, site='P1', z_index=1, channel='BF', timepoint=3)
+    assert path == os.path.join(str(tmp_path / 'b'), 'positions', 'P1_Z001_BF_t0003.tiff')
+    assert single.close() == []
+    # A float frame (after a correction) is stored rounded.
+    assert well_file.storable(np.array([[1.4, 70000.0]])).tolist() == [[1, 65535]]
+
+
+@pytest.mark.parametrize('fmt', well_file.FORMATS)
+def test_a_live_z_stack_is_one_file_and_its_folder_is_gone(tmp_path, fmt):
+    out_dir = tmp_path / 'zstack_20261118_170000'
+    out_dir.mkdir()
+    heights = [50.0, 46.0, 42.0]            # top down, as acquired
+    saver = well_file.StackSaver(str(out_dir), fmt, {'BF': heights, 'PC': heights})
+    for j, z in enumerate(heights):
+        for ci, ch in enumerate(('BF', 'PC')):
+            saver.save(frame(0, 0, ci, j, dtype=np.uint8), ch, j, z)
+    path = saver.close()
+    assert path == str(out_dir) + well_file.EXTENSION[fmt]
+    assert os.listdir(tmp_path) == [os.path.basename(path)], 'the empty folder is removed'
+    arr = well_file.read_well(path)['tiles']['P1']
+    assert arr.shape == (1, 2, 3, 24, 32)
+    assert np.array_equal(arr[0, 1, 0], frame(0, 0, 1, 2, dtype=np.uint8)), 'lowest plane first'
+    # 'single' keeps the files the stack always wrote.
+    old = tmp_path / 'zstack_old'
+    old.mkdir()
+    s = well_file.StackSaver(str(old), 'single', {'BF': heights})
+    s.save(frame(0, 0, 0, 0, dtype=np.uint8), 'BF', 0, 50.0)
+    assert s.close() == str(old) and os.listdir(old) == ['zstack_BF_000_50.0um.tiff']

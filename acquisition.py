@@ -1581,7 +1581,9 @@ def run_z_stack(hw: ScopeHW,
                 cancel: threading.Event,
                 status_cb=None,
                 settle_s: float = 0.1,
-                use_channel_z_offsets: bool = True) -> None:
+                use_channel_z_offsets: bool = True,
+                save_format: str = 'single',
+                um_per_px: float = 0.0) -> None:
     """Acquire a z-stack for each channel using its own z-stack config.
 
     The stack is centered on ``center_z_um`` plus the channel's chromatic
@@ -1591,6 +1593,13 @@ def run_z_stack(hw: ScopeHW,
         if status_cb:
             status_cb(msg)
 
+    import well_file
+    saver = well_file.StackSaver(
+        out_dir, save_format,
+        {ch: zstack_planes(center_z_um, channel_settings[ch],
+                           use_channel_z_offsets, force_stack=True)
+         for ch in channels if channel_settings.get(ch) is not None},
+        um_per_px=um_per_px, single_writer=save_image)
     for ch in channels:
         if cancel.is_set():
             break
@@ -1612,11 +1621,10 @@ def run_z_stack(hw: ScopeHW,
                 continue
             if shading is not None and shading.enabled:
                 frame = shading.apply(frame, ch, float(z))
-            save_image(os.path.join(out_dir, f'zstack_{ch}_{j:03d}_'
-                                             f'{z:.1f}um.tiff'), frame)
+            saver.save(frame, ch, j, float(z))
     hw.move_z(center_z_um)
     hw.leds_off()
-    _status(f'Z-stack finished -> {out_dir}')
+    _status(f'Z-stack finished -> {saver.close()}')
 
 
 def run_z_planes(hw: ScopeHW,
@@ -1629,7 +1637,9 @@ def run_z_planes(hw: ScopeHW,
                  status_cb=None,
                  settle_s: float = 0.1,
                  return_z_um: float | None = None,
-                 order: str = 'slice') -> int:
+                 order: str = 'slice',
+                 save_format: str = 'single',
+                 um_per_px: float = 0.0) -> int:
     """Acquire the channels at exactly the given Z planes, in the order
     given (a stack set by its begin and end, or a centre and a range).
 
@@ -1651,6 +1661,9 @@ def run_z_planes(hw: ScopeHW,
         shots = [(ch, j) for ch in chans for j in range(len(zs))]
     else:
         shots = [(ch, j) for j in range(len(zs)) for ch in chans]
+    import well_file
+    saver = well_file.StackSaver(out_dir, save_format, {ch: zs for ch in chans},
+                                 um_per_px=um_per_px, single_writer=save_image)
     saved = 0
     at_ch = at_j = None
     for ch, j in shots:
@@ -1669,13 +1682,12 @@ def run_z_planes(hw: ScopeHW,
             continue
         if shading is not None and shading.enabled:
             frame = shading.apply(frame, ch, z)
-        save_image(os.path.join(out_dir, f'zstack_{ch}_{j:03d}_'
-                                         f'{z:.1f}um.tiff'), frame)
+        saver.save(frame, ch, j, z)
         saved += 1
     hw.move_z(zs[0] if return_z_um is None else float(return_z_um))
     hw.leds_off()
     _status(f'Z-stack {"STOPPED" if cancel.is_set() else "finished"}: '
-            f'{saved} images -> {out_dir}')
+            f'{saved} images -> {saver.close()}')
     return saved
 
 
