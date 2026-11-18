@@ -247,6 +247,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
     map_big = BooleanProperty(False)      # plate map fills the image area
     pos_edit_mode = StringProperty('')    # map clicks: '', 'move' or 'add'
     zman_info = StringProperty('')        # manual z-stack: what will be run
+    lens_pos_info = StringProperty('')    # work position of the lens in use
+    work_at_start_on = BooleanProperty(True)   # raise to it after homing
     map_flip_x = BooleanProperty(True)    # plate map drawn left-right mirrored
     # Settings are kept per Windows account.
     user_name = StringProperty(os.environ.get('USERNAME') or 'this user')
@@ -348,6 +350,10 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         self.zplan: dict = {'na': None, 'mag': None, 'rate': 1.0,
                             'override_um': None, 'channels_off': []}
         self.zstack_optout: dict[str, list[str]] = {}
+        # Work position per objective: the Z at which that lens is roughly
+        # in focus, {objective name: z um}. The load position is the same
+        # for every lens: objective fully down, stage centered.
+        self.lens_work_z: dict[str, float] = {}
 
         self._load_persisted()
 
@@ -380,6 +386,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         self._sync_channel_fields()
         self._sync_af_fields()
         self._sync_shading_fields()
+        self._refresh_lens_info()
         Clock.schedule_once(lambda dt: self._start_init_thread(), 0.1)
         Clock.schedule_interval(self.update_live_feed, 1.0 / 30.0)
         threading.Thread(target=self._position_poller, daemon=True).start()
@@ -508,7 +515,16 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         # Startup calibration: objective fully lowered, XY homed against the
         # limit switches (firmware measures travel), then stage centered.
         if self.stage_connected:
-            self.hw.home_and_center(status_cb=self._set_status)
+            homed = self.hw.home_and_center(status_cb=self._set_status)
+            # Then up to where this lens was last roughly in focus.
+            z = self.lens_work_z.get(self.objective_name)
+            if homed and self.work_at_start_on and z is not None:
+                self._set_status(f'Raising {self.objective_name} to its work '
+                                 f'position (z = {z:.0f} um)...')
+                self.hw.move_z(float(z))
+                self._set_status(f'Ready: {self.objective_name} at its work '
+                                 f'position (z = {z:.0f} um). Use Coarse AF '
+                                 f'to find focus.')
         else:
             self._set_status('Ready (no stage)')
         Clock.schedule_once(lambda dt: setattr(self, 'initializing', False), 0)
@@ -1785,6 +1801,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             f'centering" for this lens.' + note)
         if previous and self.wiz_active:
             self._wiz_refresh_info()
+        self._refresh_lens_info()
+        self.zman_refresh()
 
     def snap_image(self):
         frame = self.latest_frame
@@ -1812,6 +1830,128 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         if not self.stage_connected:
             return
         self._bg(self.hw.move_xy_rel, dx_um, dy_um)
+
+    # ---------------------- load / work position per lens, coarse focus
+
+    Z_TRAVEL_UM = 14000.0
+    COARSE_AF_STEPS_EACH_WAY = 30     # "near here": this many lens steps
+
+    def _lens_af_step(self) -> float:
+        """Large autofocus step for the lens in use (objectives.json
+        AF_max: the widest step that still cannot step over the focus)."""
+        obj = self.objectives.get(self.objective_name) or {}
+        try:
+            step = float(obj.get('AF_max') or 0.0)
+        except (TypeError, ValueError):
+            step = 0.0
+        return step if step > 0 else 100.0
+
+    def _refresh_lens_info(self):
+        name = self.objective_name
+        if not name:
+            self.lens_pos_info = ('No objective selected: select it in the '
+                                  'top bar first.')
+            return
+        z = self.lens_work_z.get(name)
+        step = self._lens_af_step()
+        near = step * self.COARSE_AF_STEPS_EACH_WAY
+        self.lens_pos_info = (
+            f'{name}: work position '
+            + (f'z = {z:.0f} um' if z is not None else
+               'NOT SET (focus, then press "Work position = here")')
+            + f'. Coarse autofocus steps {step:g} um; "near here" searches '
+              f'{near:g} um each way. Load position: objective fully down, '
+              f'stage centered.')
+
+    def lens_set_work_here(self):
+        """Remember the present Z as the work position of this lens."""
+        name = self.objective_name
+        if not name:
+            self._set_status('Select the objective first')
+            return
+        self.lens_work_z[name] = round(float(self.stage_z_um), 1)
+        self._persist()
+        self._refresh_lens_info()
+        self._set_status(f'{name}: work position = z '
+                         f'{self.lens_work_z[name]:.0f} um (saved for '
+                         f'{self.user_name})')
+
+    def lens_goto_work(self):
+        z = self.lens_work_z.get(self.objective_name)
+        if z is None:
+            self._set_status(f'No work position saved for '
+                             f'{self.objective_name or "this lens"} yet')
+            return
+        if not self.stage_connected or self.worker_busy:
+            return
+        self._set_status(f'{self.objective_name}: going to the work '
+                         f'position (z = {z:.0f} um)...')
+
+        def _job():
+            self.hw.move_z(float(z))
+            self._set_status(f'{self.objective_name} at its work position '
+                             f'(z = {z:.0f} um)')
+        self._bg(_job)
+
+    def lens_goto_load(self):
+        """Objective fully down (confirmed), then the stage to the center:
+        for changing the lens or the plate."""
+        if not self.stage_connected or self.worker_busy:
+            return
+        self._set_status('Going to the load position: lowering the '
+                         'objective...')
+
+        def _job():
+            ok = self.hw.park()
+            Clock.schedule_once(lambda dt: setattr(self, 'live_channel',
+                                                   'OFF'), 0)
+            self.hw.leds_off()
+            self._set_status(
+                'Load position: objective down, stage centered' if ok else
+                'LOAD POSITION NOT REACHED: the objective could not be '
+                'confirmed down, so the stage was not moved')
+        self._bg(_job)
+
+    def coarse_af(self, whole: bool = False):
+        """Find focus here in large steps suited to the lens: around the
+        present Z, or over the whole travel. The fine autofocus range is
+        then centered on what was found."""
+        if not (self.stage_connected and self.camera_connected):
+            self._set_status('Autofocus needs stage + camera')
+            return
+        if not self.objective_name:
+            self._set_status('Select the objective first: the step is '
+                             'taken from the lens')
+            return
+        step = self._lens_af_step()
+        z0 = self.stage_z_um
+        if whole:
+            lo, hi = 0.0, self.Z_TRAVEL_UM
+        else:
+            half = step * self.COARSE_AF_STEPS_EACH_WAY
+            lo, hi = max(z0 - half, 0.0), min(z0 + half, self.Z_TRAVEL_UM)
+        cfg = AutofocusConfig(z_bottom_um=lo, z_top_um=hi, step_um=step,
+                              channel=self.af_channel)
+        self._set_status(f'Coarse autofocus ({self.objective_name}): '
+                         f'{lo:.0f} to {hi:.0f} um in {step:g} um steps...')
+
+        def _job():
+            best, ok = self._wiz_sweep(cfg)
+            if best is None:
+                self._set_status('Coarse autofocus canceled')
+                return
+            if not ok:
+                self.hw.move_z(z0)
+                self._set_status(
+                    f'No clear focus between {lo:.0f} and {hi:.0f} um. Is '
+                    f'there structure in view and is the exposure right?'
+                    + ('' if whole else ' Otherwise try "Whole travel".'))
+                return
+            self.hw.move_z(best)
+            Clock.schedule_once(lambda dt: self._wiz_fine_window(best), 0)
+            self._set_status(f'Coarse focus found at z = {best:.1f} um; '
+                             f'fine autofocus range centered on it')
+        self._bg(_job, busy_job=True)
 
     # ------------------------------------------------------- Z focus control
 
@@ -3856,6 +3996,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             'shading_focus_z': self.shading_focus_z,
             'protocol_dir': self.protocol_dir,
             'map_flip_x': bool(self.map_flip_x),
+            'lens_work_z': self.lens_work_z,
+            'work_at_start_on': bool(self.work_at_start_on),
             'protocol_optin_v2': True,
             'no_plate_on': self.no_plate_on,
             'af_every_n': int(self.af_every_n),
@@ -3888,6 +4030,13 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         if isinstance(d.get('protocol_dir'), str) and d['protocol_dir'].strip():
             self.protocol_dir = d['protocol_dir']
         self.map_flip_x = bool(d.get('map_flip_x', True))
+        self.work_at_start_on = bool(d.get('work_at_start_on', True))
+        try:
+            self.lens_work_z = {
+                str(k): min(max(float(v), 0.0), self.Z_TRAVEL_UM)
+                for k, v in (d.get('lens_work_z') or {}).items()}
+        except (TypeError, ValueError):
+            self.lens_work_z = {}
         try:
             self.channel_settings = acq.channel_settings_from_dict(
                 d.get('channel_settings', {}))

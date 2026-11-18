@@ -462,6 +462,39 @@ LumaViewProMainLayout:
                             height: '28dp'
 
                     Collapsible:
+                        title: 'LOAD / WORK POSITION, COARSE FOCUS'
+                        WrapLabel:
+                            text: app.lens_pos_info
+                            color: (0.3, 0.85, 1.0, 1)
+                        FieldRow:
+                            FlatButton:
+                                text: 'Go to load position'
+                                disabled: app.worker_busy
+                                on_press: app.lens_goto_load()
+                            FlatButton:
+                                text: 'Go to work position'
+                                disabled: app.worker_busy
+                                on_press: app.lens_goto_work()
+                        FlatButton:
+                            text: 'Work position = here (for this lens)'
+                            on_press: app.lens_set_work_here()
+                        FlatButton:
+                            text: 'Go to the work position at start-up: ' + ('ON' if app.work_at_start_on else 'off')
+                            background_color: ACCENT if app.work_at_start_on else PANEL2
+                            on_press: app.work_at_start_on = not app.work_at_start_on; app._persist()
+                        PanelLabel:
+                            text: 'Coarse autofocus here, in large steps for this lens:'
+                        FieldRow:
+                            AccentButton:
+                                text: 'STOP' if app.worker_busy else 'Coarse AF near here'
+                                background_color: RED if app.worker_busy else ACCENT
+                                on_press: app.cancel_job() if app.worker_busy else app.coarse_af(False)
+                            FlatButton:
+                                text: 'Whole travel'
+                                disabled: app.worker_busy
+                                on_press: app.coarse_af(True)
+
+                    Collapsible:
                         title: 'AUTOFOCUS'
                         PanelLabel:
                             text: 'Like a z-stack: set Bottom below, Top above'
