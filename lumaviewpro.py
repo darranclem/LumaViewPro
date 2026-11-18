@@ -98,10 +98,11 @@ Config.set('input', 'mouse', 'mouse,disable_multitouch')
 from kivy.app import App
 from kivy.base import ExceptionHandler, ExceptionManager
 from kivy.clock import Clock
-from kivy.properties import StringProperty, NumericProperty, BooleanProperty, ListProperty
+from kivy.properties import StringProperty, NumericProperty, BooleanProperty, ListProperty, ObjectProperty
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
+from kivy.uix.splitter import Splitter, SplitterStrip
 from kivy.factory import Factory
 
 import plate_navigator
@@ -213,6 +214,53 @@ ExceptionManager.add_handler(_LogAndContinue())
 
 class LumaViewProMainLayout(BoxLayout):
     pass
+
+
+class ColumnStrip(SplitterStrip):
+    """The divider between two columns of the window. Drag it to resize
+    the column beside it; double-click it for the usual width. It lights
+    up, and the mouse pointer becomes a left-right arrow, when the mouse
+    is on it. The width is remembered for the user when it is let go."""
+    hot = BooleanProperty(False)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        from kivy.core.window import Window
+        Window.bind(mouse_pos=self._on_mouse)
+
+    def _on_mouse(self, window, pos):
+        if self.get_root_window() is None:
+            return
+        hot = self.state == 'down' or self.collide_point(*self.to_widget(*pos))
+        if hot != self.hot:
+            self.hot = hot
+            try:
+                window.set_system_cursor('size_we' if hot else 'arrow')
+            except Exception:
+                pass
+
+    def on_touch_down(self, touch):
+        if touch.is_double_tap and self.collide_point(*touch.pos):
+            app = App.get_running_app()
+            if app is not None and self.parent is not None:
+                app.reset_panel_width(self.parent)
+            return True
+        return super().on_touch_down(touch)
+
+    def on_touch_up(self, touch):
+        # Not on_release: that is not sent when the mouse is let go off
+        # the strip, as it is when the column has reached its limit.
+        mine = touch.grab_current is self
+        result = super().on_touch_up(touch)
+        app = App.get_running_app()
+        if mine and app is not None:
+            app.remember_panel_widths()
+        return result
+
+
+class ColumnSplitter(Splitter):
+    """A column of the window with a ColumnStrip as its divider."""
+    strip_cls = ObjectProperty(ColumnStrip)
 
 
 class LumaViewProApp(ExperimentWizardMixin, App):
@@ -359,6 +407,9 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         # in focus, {objective name: z um}. The load position is the same
         # for every lens: objective fully down, stage centered.
         self.lens_work_z: dict[str, float] = {}
+        # Widths of the left and right columns in dp, as the user left
+        # them ({} = the usual widths).
+        self.panel_widths: dict[str, float] = {}
 
         self._load_persisted()
 
@@ -392,6 +443,11 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         self._sync_af_fields()
         self._sync_shading_fields()
         self._refresh_lens_info()
+        self._apply_panel_widths()
+        for split in self._panel_splits().values():
+            split.bind(width=self._limit_panel)
+        Window.bind(size=lambda *_: [self._limit_panel(s, s.width) for s in
+                                     self._panel_splits().values()])
         Clock.schedule_once(lambda dt: self._start_init_thread(), 0.1)
         Clock.schedule_interval(self.update_live_feed, 1.0 / 30.0)
         threading.Thread(target=self._position_poller, daemon=True).start()
@@ -3424,6 +3480,54 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         return [w for w in self.root.walk()
                 if isinstance(w, pn.Collapsible)] if self.root else []
 
+    # ------------------------------------------------ column dividers
+
+    PANEL_DEFAULT_DP = {'left': 260.0, 'right': 320.0}
+    IMAGE_MIN_DP = 240.0      # the image area is never squeezed below this
+
+    def _panel_splits(self) -> dict:
+        ids = self.root.ids if self.root else {}
+        return {k: ids[f'{k}_split'] for k in ('left', 'right')
+                if ids.get(f'{k}_split') is not None}
+
+    def _limit_panel(self, split, width):
+        """A column cannot be dragged over the image area: the two
+        columns always leave it IMAGE_MIN_DP."""
+        from kivy.metrics import dp
+        if not self.root or self.root.width <= 0:
+            return
+        others = sum(s.width for s in self._panel_splits().values()
+                     if s is not split)
+        room = self.root.width - others - dp(self.IMAGE_MIN_DP)
+        if width > room and room >= split.min_size:
+            split.width = room
+
+    def _apply_panel_widths(self):
+        from kivy.metrics import dp
+        for key, split in self._panel_splits().items():
+            w = self.panel_widths.get(key)
+            if w:
+                split.width = min(max(dp(w), split.min_size), split.max_size)
+
+    def remember_panel_widths(self):
+        """Keep the column widths for this user (called when a divider
+        is let go)."""
+        from kivy.metrics import dp
+        self.panel_widths = {k: round(s.width / dp(1), 1)
+                             for k, s in self._panel_splits().items()}
+        self._persist()
+
+    def reset_panel_width(self, which):
+        """Put a column ('left', 'right' or its splitter) back to its
+        usual width."""
+        from kivy.metrics import dp
+        for key, split in self._panel_splits().items():
+            if which == key or which is split:
+                split.width = dp(self.PANEL_DEFAULT_DP[key])
+                self.remember_panel_widths()
+                self._set_status(f'{key.capitalize()} column back to its '
+                                 f'usual width')
+
     def save_layout(self, name: str):
         """Save panel widths and which sections are open as a named layout."""
         name = (name or '').strip() or 'default'
@@ -3462,6 +3566,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             ids.left_split.width = float(data.get('left_w', 250))
         if ids.get('right_split'):
             ids.right_split.width = float(data.get('right_w', 300))
+        self.remember_panel_widths()
         sections = data.get('sections', {})
         for c in self._collapsibles():
             if c.title and c.title in sections:
@@ -4095,6 +4200,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             'zstack_dir': self.zstack_dir,
             'zman_mode': self.zman_mode,
             'zman_order': self.zman_order,
+            'panel_widths': self.panel_widths,
             'zman_step': self.zman_step_text,
             'map_flip_x': bool(self.map_flip_x),
             'lens_work_z': self.lens_work_z,
@@ -4140,6 +4246,12 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self.zman_step_text = f"{abs(float(d.get('zman_step', 5))):g}"
         except (TypeError, ValueError):
             pass
+        try:
+            self.panel_widths = {
+                k: float(v) for k, v in (d.get('panel_widths') or {}).items()
+                if k in self.PANEL_DEFAULT_DP and float(v) > 0}
+        except (TypeError, ValueError, AttributeError):
+            self.panel_widths = {}
         self.map_flip_x = bool(d.get('map_flip_x', True))
         self.work_at_start_on = bool(d.get('work_at_start_on', True))
         try:

@@ -16,6 +16,25 @@
     size_hint_y: None
     height: '28dp'
 
+# The divider between two columns: drag it to resize the column,
+# double-click it for the usual width. It lights up under the mouse.
+<ColumnStrip>:
+    background_normal: ''
+    background_down: ''
+    background_color: ACCENT if (self.hot or self.state == 'down') else PANEL2
+    canvas.after:
+        Color:
+            rgba: TXT if (self.hot or self.state == 'down') else TXT_DIM
+        Rectangle:
+            pos: self.center_x - dp(1.5), self.center_y - dp(13)
+            size: dp(3), dp(3)
+        Rectangle:
+            pos: self.center_x - dp(1.5), self.center_y - dp(1.5)
+            size: dp(3), dp(3)
+        Rectangle:
+            pos: self.center_x - dp(1.5), self.center_y + dp(10)
+            size: dp(3), dp(3)
+
 <AccentButton@FlatButton>:
     background_color: ACCENT
 
@@ -199,13 +218,13 @@ LumaViewProMainLayout:
         padding: '4dp'
 
         # ---------------- LEFT: controls (resizable) ----------------
-        Splitter:
+        ColumnSplitter:
             id: left_split
             sizable_from: 'right'
             size_hint_x: None
             width: '260dp'
             min_size: '160dp'
-            max_size: '560dp'
+            max_size: '900dp'
             strip_size: '10dp'
             ScrollView:
                 do_scroll_x: False
@@ -1067,7 +1086,7 @@ LumaViewProMainLayout:
                     text_size: self.size
 
         # --------------- RIGHT: navigator + stage (resizable) ---------------
-        Splitter:
+        ColumnSplitter:
             id: right_split
             sizable_from: 'left'
             size_hint_x: None
