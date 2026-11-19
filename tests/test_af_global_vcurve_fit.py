@@ -161,3 +161,55 @@ def test_two_pass_is_unchanged_by_default():
         acq.ChannelSettings())
     assert ok and abs(best - 103.3) < 2.0
     assert scope.grabs > 21           # coarse + fine
+
+
+# ------------------- a focus at the edge of the range is not accepted
+
+def _fake_sweep(results):
+    calls = []
+
+    def sweep(hw, cfg, settings, status_cb=None, **kwargs):
+        calls.append((cfg.z_bottom_um, cfg.z_top_um))
+        return results[len(calls) - 1]
+    return sweep, calls
+
+
+def test_a_focus_inside_the_range_is_taken_after_one_sweep():
+    import acquisition as acq
+    cfg = acq.AutofocusConfig(z_bottom_um=6600, z_top_um=6700, step_um=2)
+    sweep, calls = _fake_sweep([(6652.0, True)])
+    assert acq.autofocus_checked(None, cfg, None, sweep=sweep) == \
+        (6652.0, True)
+    assert len(calls) == 1
+
+
+def test_a_focus_at_the_edge_makes_the_search_look_further_that_way():
+    import acquisition as acq
+    cfg = acq.AutofocusConfig(z_bottom_um=6646, z_top_um=6746, step_um=2)
+    said = []
+    sweep, calls = _fake_sweep([(6647.1, True), (6590.0, True)])
+    best, ok = acq.autofocus_checked(None, cfg, None, sweep=sweep,
+                                     status_cb=said.append)
+    assert (best, ok) == (6590.0, True)
+    assert calls == [(6646, 6746), (6571.0, 6671.0)]
+    assert any('bottom edge' in s for s in said)
+
+
+def test_a_focus_still_at_the_edge_is_not_used():
+    import acquisition as acq
+    cfg = acq.AutofocusConfig(z_bottom_um=6646, z_top_um=6746, step_um=2)
+    sweep, calls = _fake_sweep([(6746.0, True), (6821.0, True)])
+    best, ok = acq.autofocus_checked(None, cfg, None, sweep=sweep)
+    assert ok is False and len(calls) == 2
+
+
+def test_low_contrast_and_cancel_pass_straight_through():
+    import acquisition as acq
+    cfg = acq.AutofocusConfig(z_bottom_um=100, z_top_um=200, step_um=5)
+    sweep, calls = _fake_sweep([(150.0, False)])
+    assert acq.autofocus_checked(None, cfg, None, sweep=sweep) == \
+        (150.0, False)
+    sweep, calls = _fake_sweep([(None, False)])
+    assert acq.autofocus_checked(None, cfg, None, sweep=sweep) == \
+        (None, False)
+    assert len(calls) == 1

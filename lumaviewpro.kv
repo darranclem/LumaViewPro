@@ -35,6 +35,44 @@
             pos: self.center_x - dp(1.5), self.center_y + dp(10)
             size: dp(3), dp(3)
 
+# A channel button with its two marks underneath: P (green) when the
+# colour is imaged in protocols, AF (amber) on the autofocus colour.
+# Pressing a mark changes it.
+<ChannelCell@BoxLayout>:
+    channel: ''
+    label: ''
+    tint: TXT
+    orientation: 'vertical'
+    spacing: '2dp'
+    size_hint_y: None
+    height: '43dp'
+    FlatButton:
+        text: root.label
+        color: root.tint
+        height: '25dp'
+        background_color: ACCENT if app.live_channel == root.channel else PANEL2
+        on_press: app.set_live(root.channel)
+    BoxLayout:
+        size_hint_y: None
+        height: '16dp'
+        spacing: '2dp'
+        FlatButton:
+            text: 'P'
+            bold: True
+            font_size: '10sp'
+            height: '16dp'
+            color: (0.05, 0.05, 0.05, 1) if root.channel in app.marked_channels else (0.45, 0.45, 0.48, 1)
+            background_color: (0.3, 0.85, 0.35, 1) if root.channel in app.marked_channels else (0.13, 0.13, 0.15, 1)
+            on_press: app.toggle_channel_protocol(root.channel)
+        FlatButton:
+            text: 'AF'
+            bold: True
+            font_size: '10sp'
+            height: '16dp'
+            color: (0.05, 0.05, 0.05, 1) if app.af_channel == root.channel else (0.45, 0.45, 0.48, 1)
+            background_color: (1.0, 0.72, 0.1, 1) if app.af_channel == root.channel else (0.13, 0.13, 0.15, 1)
+            on_press: app.set_af_channel_to(root.channel)
+
 <AccentButton@FlatButton>:
     background_color: ACCENT
 
@@ -274,39 +312,44 @@ LumaViewProMainLayout:
                             cols: 4
                             spacing: '3dp'
                             size_hint_y: None
-                            height: '62dp'
-                            FlatButton:
-                                text: 'BF'
-                                background_color: ACCENT if app.live_channel == 'BF' else PANEL2
-                                on_press: app.set_live('BF')
-                            FlatButton:
-                                text: 'PC'
-                                background_color: ACCENT if app.live_channel == 'PC' else PANEL2
-                                on_press: app.set_live('PC')
-                            FlatButton:
-                                text: 'DF'
-                                background_color: ACCENT if app.live_channel == 'DF' else PANEL2
-                                on_press: app.set_live('DF')
+                            height: '89dp'
+                            ChannelCell:
+                                channel: 'BF'
+                                label: 'BF'
+                                tint: TXT
+                            ChannelCell:
+                                channel: 'PC'
+                                label: 'PC'
+                                tint: TXT
+                            ChannelCell:
+                                channel: 'DF'
+                                label: 'DF'
+                                tint: TXT
                             FlatButton:
                                 text: 'OFF'
+                                size_hint_y: 1
                                 background_color: RED if app.live_channel == 'OFF' else PANEL2
                                 on_press: app.set_live('OFF')
-                            FlatButton:
-                                text: 'Blue'
-                                color: (0.3, 0.95, 1.0, 1)
-                                background_color: ACCENT if app.live_channel == 'BLUE' else PANEL2
-                                on_press: app.set_live('BLUE')
-                            FlatButton:
-                                text: 'Green'
-                                color: (0.35, 0.95, 0.35, 1)
-                                background_color: ACCENT if app.live_channel == 'GREEN' else PANEL2
-                                on_press: app.set_live('GREEN')
-                            FlatButton:
-                                text: 'Red'
-                                color: (1.0, 0.4, 0.3, 1)
-                                background_color: ACCENT if app.live_channel == 'RED' else PANEL2
-                                on_press: app.set_live('RED')
+                            ChannelCell:
+                                channel: 'BLUE'
+                                label: 'Blue'
+                                tint: (0.3, 0.95, 1.0, 1)
+                            ChannelCell:
+                                channel: 'GREEN'
+                                label: 'Green'
+                                tint: (0.35, 0.95, 0.35, 1)
+                            ChannelCell:
+                                channel: 'RED'
+                                label: 'Red'
+                                tint: (1.0, 0.4, 0.3, 1)
                             Widget:
+                        PanelLabel:
+                            text: 'P: imaged in protocols, stacks and scans.  AF: autofocus runs in this colour.'
+                            font_size: '9sp'
+                            height: '13dp'
+                        WrapLabel:
+                            text: app.channel_summary
+                            color: (0.3, 0.85, 1.0, 1)
 
                     Collapsible:
                         title: 'CHANNEL SETTINGS'
@@ -517,7 +560,7 @@ LumaViewProMainLayout:
                     Collapsible:
                         title: 'AUTOFOCUS'
                         PanelLabel:
-                            text: 'Like a z-stack: set Bottom below, Top above'
+                            text: 'Range and interval; searched around the AF point Z'
                         FieldRow:
                             PanelLabel:
                                 text: 'Bottom (um)'
@@ -1036,6 +1079,33 @@ LumaViewProMainLayout:
                         color: TXT
                         font_size: '10sp'
                         halign: 'center'
+            # Progress of a protocol run: only there while one runs. The
+            # bar fills behind the line that says where the run is.
+            Label:
+                size_hint_y: None
+                height: '22dp' if app.run_active else 0
+                opacity: 1 if app.run_active else 0
+                text: app.run_line
+                color: (1, 1, 1, 1)
+                bold: True
+                font_size: '12sp'
+                halign: 'left'
+                valign: 'middle'
+                padding: dp(8), 0
+                text_size: self.size
+                shorten: True
+                shorten_from: 'right'
+                canvas.before:
+                    Color:
+                        rgba: (0.09, 0.09, 0.10, 1)
+                    Rectangle:
+                        pos: self.pos
+                        size: self.size
+                    Color:
+                        rgba: (0.10, 0.42, 0.60, 1)
+                    Rectangle:
+                        pos: self.pos
+                        size: self.width * app.run_fraction, self.height
             # Plate map controls, shown while the map fills the image area
             BoxLayout:
                 size_hint_y: None
@@ -1060,6 +1130,11 @@ LumaViewProMainLayout:
                     text: 'Clear previews'
                     height: '24dp'
                     on_press: app.clear_map_previews()
+                FlatButton:
+                    text: 'STOP' if app.worker_busy else 'Spiral scan (no files)'
+                    height: '24dp'
+                    background_color: RED if app.worker_busy else ACCENT
+                    on_press: app.toggle_overview_spiral()
             BoxLayout:
                 size_hint_y: None
                 height: '18dp'
@@ -1267,18 +1342,18 @@ LumaViewProMainLayout:
                                             id: wiz_fine_step
                                             text: '5'
                                         FlatButton:
-                                            text: 'Apply at this Z'
+                                            text: 'Apply'
                                             height: '26dp'
                                             on_press: app.wiz_apply_fine()
                                     FieldRow:
                                         height: '28dp'
                                         AccentButton:
-                                            text: 'Set AF point here'
-                                            on_press: app.af_set_anchor_here()
+                                            text: 'Set AF point here (X, Y, Z)'
+                                            on_press: app.wiz_set_af_point()
                                         AccentButton:
                                             text: 'Run autofocus'
                                             disabled: app.worker_busy
-                                            on_press: app.run_af_cycle()
+                                            on_press: app.wiz_run_af()
 
                                 # ---- 4 wells
                                 Collapsible:
@@ -1433,6 +1508,22 @@ LumaViewProMainLayout:
                                         SmallInput:
                                             id: wiz_fmap_n
                                             text: '3'
+                                            on_text: app.fmap_marks_refresh()
+                                    WrapLabel:
+                                        text: 'The focus points are the squares with a cross on the plate map (white once moved). To move one: switch "Map click moves" on and click in its well, or drive the stage there and press "Focus point = stage position". During the walk, driving somewhere else in the well before Set focus moves it too.'
+                                        color: TXT_DIM
+                                        font_size: '10sp'
+                                    FlatButton:
+                                        text: 'Map click moves focus point: ' + ('ON' if app.pos_edit_mode == 'focus' else 'off')
+                                        background_color: ACCENT if app.pos_edit_mode == 'focus' else PANEL2
+                                        on_press: app.set_pos_edit('focus')
+                                    FlatButton:
+                                        text: 'Focus point = stage position'
+                                        on_press: app.wiz_fmap_point_here()
+                                    FlatButton:
+                                        text: 'Put moved focus points back'
+                                        disabled: app.fmap_active
+                                        on_press: app.wiz_fmap_reset()
                                     AccentButton:
                                         text: 'Start (autofocus, then first point)'
                                         disabled: app.fmap_active or app.worker_busy

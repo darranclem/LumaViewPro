@@ -10,6 +10,7 @@ inspected and adjusted there.
 
 from __future__ import annotations
 
+import math
 import time
 
 from kivy.clock import Clock
@@ -44,10 +45,11 @@ WIZARD_STEPS = [
     ('autofocus', 'Autofocus channel and point',
      '1. Pick the autofocus channel.  2. Drive to a spot with clear '
      'structure that will stay put.  3. Find focus (coarse) sweeps the '
-     'whole range in big steps to find roughly where focus is.  4. Set '
+     'whole range in big steps to find roughly where focus is.  4. Type '
      'the fine range and step used for every later autofocus.  5. Set AF '
-     'point here, then Run autofocus to record the sharp position. Every '
-     'other focus is stored relative to this result.'),
+     'point here: it keeps this X, Y and Z, and the range is searched '
+     'around that Z.  6. Run autofocus to record the sharp position. '
+     'Every other focus is stored relative to this result.'),
     ('wells', 'Wells',
      'On the navigator: click a well to switch it on or off, drag a box '
      'to switch a group (start on an on well to switch the group off). '
@@ -101,7 +103,7 @@ class ExperimentWizardMixin:
     wiz_help = StringProperty('')
     wiz_info = StringProperty('')
     wiz_sampling = StringProperty('single')
-    wiz_focus_mode = StringProperty('corners')
+    wiz_focus_mode = StringProperty('per_well')
     wiz_zstack_on = BooleanProperty(False)
     wiz_rev = NumericProperty(0)          # bumps to refresh channel buttons
     fmap_active = BooleanProperty(False)
@@ -154,6 +156,7 @@ class ExperimentWizardMixin:
     def wiz_close(self):
         self._wiz_leave()
         self.wiz_active = False
+        self.fmap_marks_refresh()
         self.set_map_big(False)
 
     def _wiz_skipped(self, index: int) -> bool:
@@ -185,6 +188,8 @@ class ExperimentWizardMixin:
             self.wiz_apply_acquire()
         if self.fmap_active:
             self.wiz_fmap_cancel()
+        if self.pos_edit_mode == 'focus':
+            self.set_pos_edit('focus')        # map clicks back to normal
 
     def _wiz_goto(self, index: int):
         key, title, text = WIZARD_STEPS[index]
@@ -194,6 +199,7 @@ class ExperimentWizardMixin:
         self.wiz_help = text
         self.wiz_rev += 1
         self._wiz_refresh_info()
+        self.fmap_marks_refresh()
         if key == 'acquire':
             self._wiz_sync_acquire()
 
@@ -217,6 +223,10 @@ class ExperimentWizardMixin:
             anchor = 'not set' if s.anchor_xy is None else 'set'
             ref = ('not run' if s.current_z is None
                    else f'z = {s.current_z:.1f} um')
+            if s.anchor_xy is not None and s.anchor_z is not None:
+                anchor = (f'at X {s.anchor_xy[0] / 1000:.2f}, Y '
+                          f'{s.anchor_xy[1] / 1000:.2f} mm, Z '
+                          f'{s.anchor_z:.1f} um')
             self.wiz_info = (f'Channel {self.af_channel}. AF point {anchor}. '
                              f'Autofocus {ref}. Fine range '
                              f'{self.af_config.z_bottom_um:.0f} to '
@@ -237,7 +247,12 @@ class ExperimentWizardMixin:
         elif key == 'sampling':
             self.wiz_info = self.positions_info
         elif key == 'focusmap':
-            self.wiz_info = f'{len(self.surface.points)} focus points stored'
+            plan = self._focus_plan()
+            moved = sum(1 for p in plan if p['moved'])
+            self.wiz_info = (
+                f'{len(plan)} focus point{"" if len(plan) == 1 else "s"} '
+                f'planned' + (f' ({moved} moved by you)' if moved else '')
+                + f'; {len(self.surface.points)} stored in the focus map')
         elif key == 'acquire':
             self.wiz_info = self._optout_text()
         elif key == 'save':
@@ -278,19 +293,41 @@ class ExperimentWizardMixin:
         self._sync_af_fields()
         self._persist()
 
-    def wiz_apply_fine(self):
-        """Center the fine autofocus window on the current Z."""
+    def _wiz_af_center(self) -> float:
+        """The Z kept with the AF point, or the current Z before one is
+        set."""
+        z = self.surface.anchor_z
+        return self.stage_z_um if z is None else z
+
+    def wiz_set_af_point(self):
+        """The AF point = this X, Y and Z, with the range and interval
+        typed here around that Z."""
         self._wiz_fine_window(self.stage_z_um)
+        self.af_set_anchor_here()
+        self._wiz_refresh_info()
+
+    def wiz_run_af(self):
+        """Autofocus at the AF point with the range and interval typed
+        here, around the Z kept with the point."""
+        self._wiz_fine_window(self._wiz_af_center())
+        self.run_af_cycle()
+
+    def wiz_apply_fine(self):
+        """Use the range and interval typed here, around the Z kept with
+        the AF point (the current Z before a point is set)."""
+        self._wiz_fine_window(self._wiz_af_center())
         self._wiz_refresh_info()
         self._set_status(f'Autofocus range {self.af_config.z_bottom_um:.0f} '
                          f'to {self.af_config.z_top_um:.0f} um, step '
                          f'{self.af_config.step_um:g} um')
 
-    def _wiz_sweep(self, cfg: AutofocusConfig):
+    def _wiz_sweep(self, cfg: AutofocusConfig, check: bool = True):
+        """Autofocus over ``cfg``. ``check``: a focus at the edge of the
+        range is not accepted (acq.autofocus_checked)."""
         def _pos(z):
             Clock.schedule_once(lambda dt: setattr(self, 'stage_z_um', z), 0)
         ch = cfg.channel
-        best, ok = acq.autofocus_sweep(
+        best, ok = (acq.autofocus_checked if check else acq.autofocus_sweep)(
             self.hw, cfg, self._cs(ch), cancel=self.worker.cancel,
             status_cb=self._set_status, pos_cb=_pos,
             template=self.af_template,
@@ -312,7 +349,7 @@ class ExperimentWizardMixin:
                               step_um=step, channel=self.af_channel)
 
         def _job():
-            best, ok = self._wiz_sweep(cfg)
+            best, ok = self._wiz_sweep(cfg, check=False)
             if best is None:
                 self._set_status('Coarse focus search canceled')
                 return
@@ -530,12 +567,122 @@ class ExperimentWizardMixin:
 
     def wiz_set_focus_mode(self, label: str):
         for mode, text in experiment.FOCUS_LABELS.items():
-            if text == label:
+            if text == label and mode != self.wiz_focus_mode:
                 self.wiz_focus_mode = mode
+                self._persist()
+        if self.root:
+            self.fmap_marks_refresh()
+            self._wiz_refresh_info()
+
+    def _focus_plan(self) -> list[dict]:
+        """The focus points for the wells in use (experiment.focus_plan),
+        each where the user has put it; [] when there are no wells."""
+        if self.no_plate_on or not self.root:
+            return []
+        wells = self._wiz_wells()
+        if not wells:
+            return []
+        n = max(int(self._f(self.root.ids.wiz_fmap_n.text, 3)), 1)
+        well_x, well_y = self.well_size_mm()
+        # A point moved on another plate may not be inside this one's well.
+        moved = {k: v for k, v in self.focus_moves.items()
+                 if abs(v[0]) <= well_x * 0.55 and abs(v[1]) <= well_y * 0.55}
+        return experiment.focus_plan(
+            self.wiz_focus_mode, wells, well_x_mm=well_x, well_y_mm=well_y,
+            n_per_well=n, well_name=self.current_labware.get_well_name,
+            moved=moved)
+
+    def _focus_point_place(self, p: dict):
+        """(stage x, stage y, plate mm) of a point of the focus plan."""
+        lw = self.current_labware
+        rel = (p['well'][1] * (lw.spacing_x_mm or 0.0) + p['dx'],
+               p['well'][0] * (lw.spacing_y_mm or 0.0) + p['dy'])
+        x, y = self.plate_rel_to_stage(*rel)
+        return x, y, (lw.a1_offset_x_mm + rel[0], lw.a1_offset_y_mm + rel[1])
+
+    def fmap_marks_refresh(self):
+        """Draw the focus points on the plate map while the focus map
+        step is open, they are being moved, or the focus walk runs."""
+        plate = self.root.ids.get('plate_map') if self.root else None
+        if plate is None:
+            return
+        marks, highlight = [], None
+        if self.fmap_active:
+            for i, p in enumerate(self._fmap_points):
+                if p.get('plate_mm') is None:
+                    continue
+                if i == self._fmap_index:
+                    highlight = len(marks)
+                marks.append((*p['plate_mm'], p['label'] in self.focus_moves))
+        elif self.pos_edit_mode == 'focus' or (
+                self.wiz_active and self.wiz_key == 'focusmap'):
+            for p in self._focus_plan():
+                marks.append((*self._focus_point_place(p)[2], p['moved']))
+        plate.set_focus_markers(marks, highlight)
+
+    def focus_point_move_to(self, x_um: float, y_um: float,
+                            drive: bool = True):
+        """Put the focus point of the well at (x_um, y_um) there (the
+        nearest one, where a well has several). It stays there for every
+        later focus map until the points are reset."""
+        plan = self._focus_plan()
+        if not plan:
+            self._set_status('No focus points to move: select wells first, '
+                             'and a focus map other than "No focus map"')
+            return
+        ok, _ = self._edit_target_well(x_um, y_um)
+        if not ok:
+            return
+        rc = self._pos_well(x_um, y_um)
+        rel = self.stage_to_plate_rel(x_um, y_um)
+        if rc is None or rel is None:
+            self._set_status('That point is not inside a well')
+            return
+        lw = self.current_labware
+        dx = rel[0] - rc[1] * (lw.spacing_x_mm or 0.0)
+        dy = rel[1] - rc[0] * (lw.spacing_y_mm or 0.0)
+        i = experiment.nearest_focus_point(plan, rc, dx, dy)
+        if i is None:
+            self._set_status(
+                f'{lw.get_well_name(*rc)} has no focus point with "'
+                f'{experiment.FOCUS_LABELS[self.wiz_focus_mode]}": choose '
+                f'one point in every well, or click a well that has one')
+            return
+        label = plan[i]['label']
+        self.focus_moves[label] = [round(dx, 4), round(dy, 4)]
+        self._persist()
+        if self.fmap_active:
+            for k, p in enumerate(self._fmap_points):
+                if p['label'] == label and p.get('well') is not None:
+                    p['x'], p['y'] = float(x_um), float(y_um)
+                    p['plate_mm'] = (lw.a1_offset_x_mm + rel[0],
+                                     lw.a1_offset_y_mm + rel[1])
+                    self._fmap_done.pop(k, None)   # focus was set elsewhere
+                    if k == self._fmap_index and drive:
+                        self._fmap_goto()
+        self.fmap_marks_refresh()
+        self._wiz_refresh_info()
+        self._set_status(f'Focus point {label} moved ({dx:+.2f}, {dy:+.2f} '
+                         f'mm from the well center); it stays there until '
+                         f'the points are reset')
+
+    def wiz_fmap_point_here(self):
+        """The focus point of the well the stage is in = where the stage
+        is now."""
+        self.focus_point_move_to(self.stage_x_um, self.stage_y_um,
+                                 drive=False)
+
+    def wiz_fmap_reset(self):
+        """Every focus point back to where it is generated."""
+        n = len(self.focus_moves)
+        self.focus_moves = {}
+        self._persist()
+        self.fmap_marks_refresh()
+        self._wiz_refresh_info()
+        self._set_status(f'{n} moved focus point{"" if n == 1 else "s"} put '
+                         f'back' if n else 'No focus point had been moved')
 
     def _fmap_plan(self) -> list[dict]:
-        lw = self.current_labware
-        n = max(int(self._f(self.root.ids.wiz_fmap_n.text, 3)), 1)
         if self.no_plate_on or not self._wiz_wells():
             # No wells to hang points on: one focus point per position
             # (corners mode: the first, last and middle positions).
@@ -546,24 +693,11 @@ class ExperimentWizardMixin:
                 pos = [pos[i] for i in idx]
             return [{'label': p['name'], 'x': p['x_um'], 'y': p['y_um'],
                      'plate_mm': None} for p in pos]
-        well_x, well_y = self.well_size_mm()
-        pts = experiment.focus_points(
-            self.wiz_focus_mode, self._wiz_wells(),
-            well_x_mm=well_x, well_y_mm=well_y,
-            n_per_well=n)
         out = []
-        count: dict[tuple[int, int], int] = {}
-        for (row, col), dx, dy in pts:
-            count[(row, col)] = count.get((row, col), 0) + 1
-            rel = (col * (lw.spacing_x_mm or 0.0) + dx,
-                   row * (lw.spacing_y_mm or 0.0) + dy)
-            x, y = self.plate_rel_to_stage(*rel)
-            name = lw.get_well_name(row, col)
-            if self.wiz_focus_mode == 'multi' and n > 1:
-                name += f' point {count[(row, col)]}'
-            out.append({'label': name, 'x': x, 'y': y,
-                        'plate_mm': (lw.a1_offset_x_mm + rel[0],
-                                     lw.a1_offset_y_mm + rel[1])})
+        for p in self._focus_plan():
+            x, y, plate_mm = self._focus_point_place(p)
+            out.append({'label': p['label'], 'x': x, 'y': y,
+                        'plate_mm': plate_mm, 'well': p['well']})
         return [p for p in out if acq.in_stage_bounds(p['x'], p['y'])]
 
     def wiz_fmap_start(self):
@@ -625,10 +759,7 @@ class ExperimentWizardMixin:
         self._fmap_update = update
         self._fmap_done = {}
         self._fmap_index = 0
-        cfg = AutofocusConfig(z_bottom_um=self.af_config.z_bottom_um,
-                              z_top_um=self.af_config.z_top_um,
-                              step_um=self.af_config.step_um,
-                              channel=self.surface.anchor_channel)
+        cfg = self._anchor_af_cfg()
 
         def _job():
             ax, ay = self.surface.anchor_xy
@@ -640,12 +771,15 @@ class ExperimentWizardMixin:
                 return
             if not ok:
                 self._set_status('Autofocus at the AF point found no clear '
-                                 'focus - focus map not started')
+                                 'focus inside its range - focus map not '
+                                 'started. Focus there by eye, press "Set AF '
+                                 'point here" in step 3 and try again.')
                 return
             if self.surface.ref_z is None:
                 self.surface.set_reference_z(best)
             else:
                 self.surface.update_cycle(best)
+            self._af_window_follow()
 
             def _begin(dt):
                 self._refresh_surface_info()
@@ -669,6 +803,7 @@ class ExperimentWizardMixin:
         plate = self.root.ids.get('plate_map') if self.root else None
         if plate is not None:
             plate.set_target_plate_mm(p['plate_mm'])
+        self.fmap_marks_refresh()
         if i in self._fmap_done:
             x, y, z = self._fmap_done[i]
         else:
@@ -690,6 +825,21 @@ class ExperimentWizardMixin:
             return
         self._fmap_done[self._fmap_index] = (
             self.stage_x_um, self.stage_y_um, self.stage_z_um)
+        # Focus set somewhere else in the well than planned: that is where
+        # this well's focus point is from now on.
+        p = self._fmap_points[self._fmap_index]
+        if p.get('well') is not None and math.hypot(
+                self.stage_x_um - p['x'], self.stage_y_um - p['y']) > 25.0 \
+                and self._pos_well(self.stage_x_um,
+                                   self.stage_y_um) == tuple(p['well']):
+            rel = self.stage_to_plate_rel(self.stage_x_um, self.stage_y_um)
+            lw = self.current_labware
+            self.focus_moves[p['label']] = [
+                round(rel[0] - p['well'][1] * (lw.spacing_x_mm or 0.0), 4),
+                round(rel[1] - p['well'][0] * (lw.spacing_y_mm or 0.0), 4)]
+            p['x'], p['y'] = self.stage_x_um, self.stage_y_um
+            p['plate_mm'] = (lw.a1_offset_x_mm + rel[0],
+                             lw.a1_offset_y_mm + rel[1])
         if self._fmap_index < len(self._fmap_points) - 1:
             self._fmap_index += 1
             self._fmap_goto()
@@ -710,6 +860,7 @@ class ExperimentWizardMixin:
         plate = self.root.ids.get('plate_map') if self.root else None
         if plate is not None:
             plate.set_target_plate_mm(None)
+        self.fmap_marks_refresh()
 
     def wiz_fmap_cancel(self):
         self._fmap_end()

@@ -293,6 +293,10 @@ class LumaViewProApp(ExperimentWizardMixin, App):
     shading_on = BooleanProperty(False)
     surface_info = StringProperty('Surface: no anchor')
     worker_busy = BooleanProperty(False)
+    # Progress of a protocol run, shown in a strip under the image.
+    run_active = BooleanProperty(False)
+    run_fraction = NumericProperty(0.0)
+    run_line = StringProperty('')
     map_big = BooleanProperty(False)      # plate map fills the image area
     pos_edit_mode = StringProperty('')    # map clicks: '', 'move' or 'add'
     zman_info = StringProperty('')        # manual z-stack: what will be run
@@ -300,6 +304,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
     zman_order = StringProperty('slice')  # 'slice' by slice, or by 'channel'
     zman_step_text = StringProperty('5')  # its interval: one for all colours
     zman_marked = StringProperty('')      # colours ticked "Use in protocol"
+    marked_channels = ListProperty([])    # the same, for the channel buttons
+    channel_summary = StringProperty('')  # protocol colours and autofocus
     zstack_dir = StringProperty('')       # live z-stacks; '' = data folder
     # How protocol runs and z-stacks are saved: one file per well / stack
     # ('ome-tiff' or 'zarr'), or single-page TIFFs ('single').
@@ -400,6 +406,9 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         self.protocol_positions: list[dict] = []
         self._pos_review_index = 0
         self.travel_clearance_um = 500.0
+        # Focus map points the user has put somewhere else in their well:
+        # {label: [dx_mm, dy_mm] from the well center}.
+        self.focus_moves: dict = {}
 
         # Global z-stack plan (setup wizard): lens data for the suggested
         # step, and the opt-outs. zstack_optout maps a well name to the
@@ -1575,7 +1584,61 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             af_chk.active = (self.selected_channel == self.af_channel)
             self._af_chk_sync = False
         self._sync_channel_sliders()
+        self._refresh_channel_marks()
         self.zman_refresh()   # marked colours, optical section of this one
+
+    # -------- which colours are imaged and which one focuses: the P and
+    # AF marks under each channel button
+
+    def _refresh_channel_marks(self, *_):
+        if not getattr(self, 'channel_settings', None):
+            return      # a setting changed before the app was built
+        marked =[ch for ch in CHANNELS if self.channel_settings[ch].enabled]
+        self.marked_channels = marked
+        af = self.af_channel
+        others = [ch for ch in marked if ch != af]
+        text = ('Imaged: ' + ', '.join(marked) if marked
+                else 'No colour is imaged (press P under a colour)')
+        text += f'.  Autofocus: on {af} only'
+        if others:
+            text += ('; ' + ', '.join(others) + ' follow'
+                     + ('s' if len(others) == 1 else '') + ' by Z offset'
+                     if self.use_z_offsets_on else
+                     '; ' + ', '.join(others) + ' at the same Z')
+        if marked and af not in marked:
+            text += f'.  {af} focuses but is not imaged'
+        self.channel_summary = text + '.'
+
+    def on_af_channel(self, *_):
+        self._refresh_channel_marks()
+
+    def on_use_z_offsets_on(self, *_):
+        self._refresh_channel_marks()
+
+    def toggle_channel_protocol(self, channel: str):
+        """P under a channel button: image this colour in protocols,
+        marked stacks and scans, or leave it out."""
+        cs = self.channel_settings[channel]
+        cs.enabled = not cs.enabled
+        self._sync_channel_fields()
+        self._persist()
+        self._set_status(f'{channel} ' + ('is imaged' if cs.enabled
+                                          else 'is left out') +
+                         ' in protocols, marked stacks and scans')
+
+    def set_af_channel_to(self, channel: str):
+        """AF under a channel button: this is the colour autofocus runs
+        in (there is one; the others follow by their Z offsets)."""
+        if channel == self.af_channel:
+            self._set_status(f'Autofocus already runs in {channel}; press '
+                             f'AF under another colour to change it')
+            return
+        self.af_channel = channel
+        self.af_config.channel = channel
+        self.surface.anchor_channel = channel
+        self._sync_channel_fields()
+        self._persist()
+        self._set_status(f'Autofocus channel: {channel}')
 
     @staticmethod
     def _f(widget_text, fallback):
@@ -1594,6 +1657,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self.af_channel = self.selected_channel
             self.af_config.channel = self.af_channel
             self.surface.anchor_channel = self.af_channel
+            self._refresh_channel_marks()
             self._persist()
             self._set_status(f'Autofocus channel: {self.af_channel}')
         else:
@@ -2224,6 +2288,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                             for p in self.protocol_positions)
                 if w is not None}
             plate.set_position_markers(marks, highlight)
+        self.fmap_marks_refresh()
         if self.wiz_active:
             self._wiz_refresh_info()
 
@@ -2326,14 +2391,18 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                          z_here=self.stage_z_um - self.surface.drift_um)
 
     def set_pos_edit(self, mode: str):
-        """Clicks on the plate map move ('move') or add ('add') positions
-        instead of switching wells on and off; the same mode again, or
-        '', goes back to normal."""
+        """Clicks on the plate map move ('move') or add ('add') positions,
+        or move a focus map point ('focus'), instead of switching wells on
+        and off; the same mode again, or '', goes back to normal."""
         self.pos_edit_mode = '' if mode == self.pos_edit_mode else mode
         plate = self._plate_map()
         if plate is not None:
             plate.point_click_mode = bool(self.pos_edit_mode)
+        self.fmap_marks_refresh()
         self._set_status({
+            'focus': 'Click in a well: its focus point (the square with a '
+                     'cross) moves to the click. Zoom in first (Ctrl + '
+                     'wheel). A double-click still drives the stage.',
             'move': 'Click in a well: its position (or the center of its '
                     'tile scan) moves to the click. Zoom in first (Ctrl + '
                     'wheel). A double-click still drives the stage.',
@@ -2354,6 +2423,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self.pos_move_to(float(target[0]), float(target[1]))
         elif self.pos_edit_mode == 'add':
             self.pos_add_at(float(target[0]), float(target[1]))
+        elif self.pos_edit_mode == 'focus':
+            self.focus_point_move_to(float(target[0]), float(target[1]))
 
     def position_add_here(self):
         """Add the current stage position (and focus) as a protocol
@@ -2496,6 +2567,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             'use_surface': self.use_surface_on,
             'use_z_offsets': self.use_z_offsets_on,
             'no_plate': self.no_plate_on,
+            'focus_mode': self.wiz_focus_mode,
+            'focus_moves': self.focus_moves,
             'af_every_n': int(self.af_every_n),
             'zplan': self.zplan,
             'zstack_optout': self.zstack_optout,
@@ -2594,6 +2667,10 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self.use_surface_on = bool(d.get('use_surface', True))
             self.use_z_offsets_on = bool(d.get('use_z_offsets', True))
             self.no_plate_on = bool(d.get('no_plate', False))
+            if d.get('focus_mode') in experiment.FOCUS_MODES:
+                self.wiz_focus_mode = d['focus_mode']
+            if 'focus_moves' in d:
+                self.focus_moves = dict(d.get('focus_moves') or {})
             self.af_every_n = max(int(d.get('af_every_n', 1)), 1)
             self.zplan.update(d.get('zplan') or {})
             self.zstack_optout = dict(d.get('zstack_optout') or {})
@@ -2940,10 +3017,17 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         reason, so AF can return to exactly this appearance."""
         self.af_config.channel = self.af_channel
         self.surface.set_anchor(self.stage_x_um, self.stage_y_um,
-                                self.af_channel)
+                                self.af_channel, z_um=self.stage_z_um)
+        self._af_window_follow()
         self._persist()
         self._refresh_surface_info()
         ch = self.af_channel
+        where = (f'AF point set at X {self.stage_x_um / 1000:.3f}, '
+                 f'Y {self.stage_y_um / 1000:.3f} mm, Z '
+                 f'{self.stage_z_um:.1f} um: autofocus searches '
+                 f'{self.af_config.z_bottom_um:.0f} to '
+                 f'{self.af_config.z_top_um:.0f} um')
+        self._set_status(where)
         def _capture():
             self.hw.set_channel(ch, self._cs(ch))
             time.sleep(0.3)
@@ -2954,18 +3038,41 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                 self._save_af_template()
                 Clock.schedule_once(
                     lambda dt: setattr(self, 'live_channel', ch), 0)
-                self._set_status(f'AF anchor + focus reference captured '
-                                 f'({ch})')
+                self._set_status(f'{where} (focus reference image '
+                                 f'taken, {ch})')
             else:
-                self._set_status('AF anchor set (no reference frame)')
+                self._set_status(f'{where} (no reference image)')
         self._bg(_capture)
 
+    def _anchor_af_cfg(self) -> AutofocusConfig:
+        """The autofocus search at the AF point: the range and interval
+        around the Z kept with the point (the Z it was set at, then the
+        last focus found there), so the search always starts in range."""
+        cfg = AutofocusConfig(z_bottom_um=self.af_config.z_bottom_um,
+                              z_top_um=self.af_config.z_top_um,
+                              step_um=self.af_config.step_um,
+                              channel=self.surface.anchor_channel)
+        z = self.surface.anchor_z
+        return cfg if z is None else acq.af_window(z, cfg)
+
+    def _af_window_follow(self):
+        """Show the range where the next autofocus at the AF point will
+        search (Bottom / Top follow the point's Z)."""
+        z = self.surface.anchor_z
+        if z is None:
+            return
+        w = acq.af_window(z, self.af_config)
+        self.af_config.z_bottom_um = w.z_bottom_um
+        self.af_config.z_top_um = w.z_top_um
+        Clock.schedule_once(lambda dt: self._sync_af_fields(), 0)
+
     def af_goto_anchor(self):
+        """Back to the AF point: X, Y and the Z kept with it."""
         if self.surface.anchor_xy is None:
             self._set_status('No AF anchor set')
             return
         x, y = self.surface.anchor_xy
-        self._bg(self.hw.move_xy, x, y)
+        self._bg(self._safe_goto, x, y, self.surface.anchor_z)
 
     def run_af_test(self):
         """Test autofocus on the CURRENT field of view with the selected
@@ -3016,32 +3123,31 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             ch = self.surface.anchor_channel
             self._set_status('AF cycle: moving to anchor...')
             self.hw.move_xy(x, y)
-            cfg = AutofocusConfig(z_bottom_um=self.af_config.z_bottom_um,
-                                  z_top_um=self.af_config.z_top_um,
-                                  step_um=self.af_config.step_um,
-                                  channel=ch)
+            cfg = self._anchor_af_cfg()
             def _pos(z):
                 Clock.schedule_once(lambda dt: setattr(self, 'stage_z_um', z), 0)
-            best, ok = acq.autofocus_sweep(self.hw, cfg, self._cs(ch),
-                                           cancel=self.worker.cancel,
-                                           status_cb=self._set_status,
-                                           pos_cb=_pos,
-                                           template=self.af_template,
-                                           high_stability=self.high_stability_on,
-                                           method=self.af_method)
+            best, ok = acq.autofocus_checked(
+                self.hw, cfg, self._cs(ch), cancel=self.worker.cancel,
+                status_cb=self._set_status, pos_cb=_pos,
+                template=self.af_template,
+                high_stability=self.high_stability_on, method=self.af_method)
             # Keep the AF channel lit so the image stream stays visible.
             Clock.schedule_once(lambda dt: setattr(self, 'live_channel', ch), 0)
             if best is None:
                 self._set_status('Autofocus canceled')
                 return
             if not ok:
-                self._set_status(f'AF: LOW CONTRAST - parked mid-range at '
-                                 f'z={best:.1f} um (surface NOT updated)')
+                self._set_status(
+                    f'AF: NO FOCUS FOUND between '
+                    f'{cfg.z_bottom_um:.0f} and {cfg.z_top_um:.0f} um or '
+                    f'just beyond (low contrast, or focus is outside the '
+                    f'range) - focus surface NOT changed')
                 return
             if self.surface.ref_z is None:
                 self.surface.set_reference_z(best)
             else:
                 self.surface.update_cycle(best)
+            self._af_window_follow()
             self._persist()
             Clock.schedule_once(lambda dt: self._refresh_surface_info(), 0)
             self._set_status(f'AF done: best focus z={best:.2f} um '
@@ -3271,6 +3377,111 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                               total=total, stitch=stitch,
                               on_tile=self._mosaic_add)
             Clock.schedule_once(lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
+        self._bg(_job, busy_job=True)
+
+    # ------------------- spiral overview on the plate map (no files)
+
+    OVERVIEW_OVERLAP_PCT = 2.0     # fields just meet: nothing is stitched
+
+    def toggle_overview_spiral(self):
+        """Click-on / click-off, like the tile scan buttons."""
+        if self.worker_busy:
+            self.cancel_job()
+            return
+        self.run_overview_spiral()
+
+    def run_overview_spiral(self):
+        """Spiral outwards from here and leave every field on the plate
+        map, all the imaged colours of a field in one picture. Nothing is
+        saved: it is an overview of the sample to navigate by. Runs until
+        STOP, the stage edges, or the map holds as many as it keeps."""
+        if not (self.stage_connected and self.camera_connected):
+            self._set_status('The spiral needs stage + camera')
+            return
+        plate = self._plate_map()
+        if plate is None or self.no_plate_on or self._image_corners_rel(
+                self.stage_x_um, self.stage_y_um, 10, 10) is None:
+            self._set_status('The spiral overview is drawn on the plate '
+                             'map: choose and calibrate the plate first')
+            return
+        channels = self._marked_channels()
+        if not channels:
+            self._set_status('No colour is imaged: press P under the '
+                             'colours to scan (top of the left column)')
+            return
+        fov_x, fov_y = self._fov_um()
+        cx, cy, z0 = self.stage_x_um, self.stage_y_um, self.stage_z_um
+        positions = acq.spiral_positions_unbounded(
+            cx, cy, fov_x, fov_y, overlap_pct=self.OVERVIEW_OVERLAP_PCT)
+        surface = (self.surface if self.use_surface_on
+                   and self.surface.current_z is not None else None)
+        shading = self.shading if self.shading_on else None
+        offsets = self.use_z_offsets_on
+        settings = self.channel_settings
+        limit = int(plate.MAX_SNAPSHOTS)
+        cancel = self.worker.cancel
+        said = ' + '.join(channels)
+
+        def _leave(rgb, x, y, w, h):
+            def _add(dt):
+                corners = self._image_corners_rel(x, y, w, h)
+                if corners:
+                    plate.add_snapshot(rgb, corners)
+            Clock.schedule_once(_add, 0)
+
+        def _job():
+            limits: dict[str, list[float]] = {}
+            n = 0
+            try:
+                for (x, y) in positions:
+                    if cancel.is_set() or n >= limit:
+                        break
+                    self._set_status(f'Spiral overview, field {n + 1} '
+                                     f'({said}; nothing is saved). STOP '
+                                     f'to end')
+                    self.hw.move_xy(x, y)
+                    base_z = surface.z_at(x, y) if surface is not None \
+                        else None
+                    planes = {}
+                    for ch in channels:
+                        if cancel.is_set():
+                            break
+                        cs = settings[ch]
+                        z_now = None
+                        if base_z is not None:
+                            z_now = base_z + (cs.z_offset_um if offsets
+                                              else 0.0)
+                            self.hw.move_z(z_now)
+                        self.hw.set_channel(ch, cs)
+                        frame = self.hw.grab_settled(settle_s=0.15)
+                        if frame is None:
+                            continue
+                        if shading is not None and shading.enabled:
+                            if z_now is None and shading.has_stack(ch):
+                                z_now = self.hw.get_pos()[2]
+                            frame = shading.apply(frame, ch, z_now)
+                        planes[ch] = frame
+                    if len(planes) < len(channels):
+                        continue      # stopped part way, or no frame
+                    rgb = acq.overview_rgb(planes, CHANNEL_LUTS, limits,
+                                           self.PREVIEW_PX)
+                    if rgb is not None:
+                        h, w = next(iter(planes.values())).shape[:2]
+                        _leave(rgb, x, y, w, h)
+                        n += 1
+            finally:
+                self.hw.leds_off()
+                # Back to where it started, at the focus it started with.
+                self.hw.move_xy(cx, cy)
+                if surface is not None:
+                    self.hw.move_z(z0)
+                self._set_status(
+                    f'Spiral overview: {n} fields ({said}) left on the '
+                    f'plate map; no files were saved'
+                    + (f'. Stopped at {limit}, the most the map keeps'
+                       if n >= limit else ''))
+                Clock.schedule_once(
+                    lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
         self._bg(_job, busy_job=True)
 
     # ------------------------------------------- stitching with Quark
@@ -3588,6 +3799,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             return
         cs.enabled = bool(active)
         self._persist()
+        self._refresh_channel_marks()
         self.zman_refresh()
         self._set_status(f'{self.selected_channel} '
                          + ('marked' if cs.enabled else 'not marked')
@@ -4075,15 +4287,68 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             single_writer=acq.save_image,
             name_of=experiment.file_name)
 
+        # What the run will take, for the progress strip: the images of
+        # one timepoint, the wells in the order they are visited, and each
+        # position's place among those of its well.
+        use_offs = self.use_z_offsets_on
+        cycle_total = 0
+        for p in positions:
+            opt = self.zstack_optout.get(p['well'] or '', ())
+            for ch in channels:
+                cycle_total += 1 if ('*' in opt or ch in opt) else len(
+                    acq.zstack_planes(0.0, self.channel_settings[ch],
+                                      use_offs))
+        total = cycle_total * cycles
+        well_order = list(dict.fromkeys(p['well'] or '' for p in positions))
+        in_well: dict = {}
+        site_no = []
+        for p in positions:
+            in_well[p['well'] or ''] = in_well.get(p['well'] or '', 0) + 1
+            site_no.append(in_well[p['well'] or ''])
+        fmt = self.save_format
+        prog = {'done': 0, 'cyc_done': 0, 't0': time.time()}
+
+        def _progress(cyc, note='', **where):
+            done = prog['done']
+            left = experiment.time_left_s(
+                done, total, cyc, cycles, prog['cyc_done'], cycle_total,
+                time.time() - prog['t0'], interval_s)
+            if note:
+                line = f'{100.0 * done / max(total, 1):.0f}%   |   {note}'
+                if left is not None:
+                    line += ('   |   about '
+                             f'{experiment.duration_text(left)} left')
+            else:
+                line = experiment.progress_line(
+                    done=done, total=total, cycle=cyc + 1, cycles=cycles,
+                    left_s=left, **where)
+            frac = min(done / max(total, 1), 1.0)
+
+            def _show(dt):
+                self.run_fraction = frac
+                self.run_line = line
+            Clock.schedule_once(_show, 0)
+
         def _job():
+            Clock.schedule_once(lambda dt: (
+                setattr(self, 'run_fraction', 0.0),
+                setattr(self, 'run_line', f'0%   |   {total} images to take'),
+                setattr(self, 'run_active', True)), 0)
             try:
                 _run()
             finally:
+                Clock.schedule_once(
+                    lambda dt: setattr(self, 'run_active', False), 0)
                 # The well files get their metadata now, whatever happened.
                 try:
                     saver.close()
                 except Exception as e:
                     self._set_status(f'Closing the well files failed: {e}')
+
+        # The autofocus range is centered on the Z kept with the AF point,
+        # which follows the focus found there: a slow drift over a long
+        # run does not walk out of it.
+        af_state = {'missed': 0}
 
         def _run():
             for cyc in range(cycles):
@@ -4091,19 +4356,19 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                 if cancel.is_set():
                     break
                 self._set_status(f'Protocol timepoint {cyc + 1}/{cycles}...')
+                prog['cyc_done'] = 0
+                prog['t0'] = t0
 
                 # Autofocus at the one AF point (every af_every-th
                 # timepoint). Its result moves the whole focus surface up
                 # or down by the measured drift.
                 if do_af and cyc % af_every == 0:
+                    _progress(cyc, note=f'timepoint {cyc + 1} of {cycles}: '
+                                        f'autofocus at the AF point')
                     ax, ay = self.surface.anchor_xy
                     self._safe_goto(ax, ay, None)
-                    cfg = AutofocusConfig(
-                        z_bottom_um=self.af_config.z_bottom_um,
-                        z_top_um=self.af_config.z_top_um,
-                        step_um=self.af_config.step_um,
-                        channel=self.surface.anchor_channel)
-                    best, af_ok = acq.autofocus_sweep(
+                    cfg = self._anchor_af_cfg()
+                    best, af_ok = acq.autofocus_checked(
                         self.hw, cfg, self._cs(self.surface.anchor_channel),
                         cancel=cancel, status_cb=self._set_status,
                         template=self.af_template,
@@ -4114,8 +4379,13 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                             self.surface.set_reference_z(best)
                         else:
                             self.surface.update_cycle(best)
+                        self._af_window_follow()
                         Clock.schedule_once(
                             lambda dt: self._refresh_surface_info(), 0)
+                    elif best is not None:
+                        # No focus found: this timepoint is imaged at the
+                        # focus of the last good autofocus.
+                        af_state['missed'] += 1
                     if cancel.is_set():
                         break
 
@@ -4172,6 +4442,19 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                                 t_s=time.time() - t_run)
                             if path is not None:
                                 files.setdefault(ch, []).append(path)
+                            prog['done'] += 1
+                            prog['cyc_done'] += 1
+                            _progress(
+                                cyc, well=p['well'],
+                                well_i=well_order.index(p['well'] or '') + 1,
+                                wells=len(well_order), site=p['site'],
+                                site_i=site_no[pi],
+                                sites=in_well[p['well'] or ''], channel=ch,
+                                plane=zi, planes=len(planes),
+                                file=os.path.basename(
+                                    path if (path and fmt == 'single')
+                                    else well_file.well_path(
+                                        base_dir, p['well'], fmt)))
                             # The image stays on the plate map where it
                             # was taken (middle plane of a z-stack).
                             if zi == (len(planes) + 1) // 2:
@@ -4193,11 +4476,19 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                         self._set_status(
                             f'Protocol: cycle {cyc + 1}/{cycles} done, '
                             f'next in {remaining / 60:.1f} min')
+                        _progress(cyc, note=(
+                            f'timepoint {cyc + 1} of {cycles} done, next '
+                            f'in {experiment.duration_text(remaining)}'))
                         time.sleep(min(2.0, max(remaining, 0.1)))
                     if cancel.is_set():
                         break
             Clock.schedule_once(lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
-            self._set_status(f'Protocol finished -> {base_dir}')
+            self._set_status(
+                f'Protocol finished -> {base_dir}' + (
+                    f'  |  AUTOFOCUS FOUND NO FOCUS at '
+                    f'{af_state["missed"]} of {cycles} timepoints: those '
+                    f'were imaged at the last good focus'
+                    if af_state['missed'] else ''))
             if proc is not None:
                 # Videos need every timepoint, so they are made now; the
                 # processing thread reports when it is through.
@@ -4250,6 +4541,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             'work_at_start_on': bool(self.work_at_start_on),
             'protocol_optin_v2': True,
             'no_plate_on': self.no_plate_on,
+            'focus_mode': self.wiz_focus_mode,
+            'focus_moves': self.focus_moves,
             'af_every_n': int(self.af_every_n),
             'zplan': self.zplan,
             'zstack_optout': self.zstack_optout,
@@ -4348,6 +4641,9 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self.use_surface_on = bool(d.get('use_surface_on', True))
             self.use_z_offsets_on = bool(d.get('use_z_offsets_on', True))
             self.no_plate_on = bool(d.get('no_plate_on', False))
+            if d.get('focus_mode') in experiment.FOCUS_MODES:
+                self.wiz_focus_mode = d['focus_mode']
+            self.focus_moves = dict(d.get('focus_moves') or {})
             self.af_every_n = max(int(d.get('af_every_n', 1)), 1)
             self.zplan.update(d.get('zplan') or {})
             self.af_each_cycle_on = bool(d.get('af_each_cycle_on', True))

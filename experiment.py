@@ -26,7 +26,7 @@ SAMPLING_LABELS = {
 FOCUS_MODES = ('corners', 'per_well', 'multi', 'none')
 FOCUS_LABELS = {
     'corners': 'Four corners + center of the selected wells',
-    'per_well': 'One point in every selected well',
+    'per_well': 'One point at the center of every selected well',
     'multi': 'Several points in every selected well',
     'none': 'No focus map (AF point focus everywhere)',
 }
@@ -504,6 +504,112 @@ def focus_points(mode: str, wells: list[tuple[int, int]], *,
                             0.3 * well_y_mm * math.sin(ang)))
         return out
     return [(w, 0.0, 0.0) for w in wells]
+
+
+def focus_plan(mode: str, wells: list[tuple[int, int]], *,
+               well_x_mm: float, well_y_mm: float, n_per_well: int = 3,
+               well_name=None, moved: dict | None = None) -> list[dict]:
+    """The focus points as they will be visited, each with its name:
+    [{'label', 'well': (row, col), 'dx', 'dy', 'moved'}], ``dx``/``dy`` in
+    plate mm from the center of the well.
+
+    ``moved`` {label: (dx, dy)} holds the points the user has put somewhere
+    else in their well; every other point is where ``focus_points`` puts it
+    (the well center, or the ring for several points per well)."""
+    moved = moved or {}
+    name_of = well_name or (lambda r, c: f'{row_letters(r)}{c + 1}')
+    several = mode == 'multi' and int(n_per_well) > 1
+    count: dict[tuple[int, int], int] = {}
+    out = []
+    for well, dx, dy in focus_points(mode, wells, well_x_mm=well_x_mm,
+                                     well_y_mm=well_y_mm,
+                                     n_per_well=n_per_well):
+        count[well] = count.get(well, 0) + 1
+        label = name_of(*well)
+        if several:
+            label += f' point {count[well]}'
+        at = moved.get(label)
+        if at is not None:
+            dx, dy = float(at[0]), float(at[1])
+        out.append({'label': label, 'well': tuple(well), 'dx': dx, 'dy': dy,
+                    'moved': at is not None})
+    return out
+
+
+def nearest_focus_point(plan: list[dict], well: tuple[int, int],
+                        dx: float, dy: float) -> int | None:
+    """Index of the focus point of ``well`` nearest to (dx, dy), or None
+    when the well holds no focus point."""
+    best, best_d = None, None
+    for i, p in enumerate(plan):
+        if tuple(p['well']) != tuple(well):
+            continue
+        d = math.hypot(p['dx'] - dx, p['dy'] - dy)
+        if best_d is None or d < best_d:
+            best, best_d = i, d
+    return best
+
+
+# ------------------------------------------------------- run progress
+
+def duration_text(seconds: float) -> str:
+    """'45 s', '12 min', '3 h 05 min'."""
+    s = max(float(seconds), 0.0)
+    if s < 90:
+        return f'{s:.0f} s'
+    m = int(round(s / 60.0))
+    if m < 90:
+        return f'{m} min'
+    return f'{m // 60} h {m % 60:02d} min'
+
+
+def time_left_s(done: int, total: int, cycle: int, cycles: int,
+                cycle_done: int, cycle_total: int, cycle_elapsed_s: float,
+                interval_s: float) -> float | None:
+    """Estimated time to the end of a run: the rest of this timepoint at
+    the rate measured in it, plus the later timepoints, each as long as
+    the interval between timepoints or the imaging itself, whichever is
+    longer. ``cycle`` counts from 0. None until an image has been taken."""
+    if cycle_done <= 0 or cycle_total <= 0 or total <= 0 or done >= total:
+        return None if done < total else 0.0
+    per_image = cycle_elapsed_s / cycle_done
+    imaging = per_image * cycle_total
+    rest = per_image * (cycle_total - cycle_done)
+    later = max(cycles - cycle - 1, 0)
+    if later:
+        gap = max(float(interval_s), imaging)
+        # the wait to the next timepoint, then the full ones, then the last
+        rest = max(gap - cycle_elapsed_s, rest) + (later - 1) * gap + imaging
+    return rest
+
+
+def progress_line(*, done: int, total: int, cycle: int, cycles: int,
+                  well: str | None = None, well_i: int = 0, wells: int = 0,
+                  site: str = '', site_i: int = 0, sites: int = 0,
+                  channel: str = '', plane: int = 0, planes: int = 0,
+                  file: str = '', left_s: float | None = None) -> str:
+    """One line saying where a run is (counts from 1; parts that do not
+    apply - one timepoint, no wells, one plane - are left out)."""
+    pct = 100.0 * done / total if total else 0.0
+    parts = [f'{pct:.0f}%', f'image {done} of {total}']
+    if cycles > 1:
+        parts.append(f'timepoint {cycle} of {cycles}')
+    if well:
+        parts.append(f'well {well} ({well_i} of {wells})' if wells > 1
+                     else f'well {well}')
+    if site and sites > 1:
+        parts.append(f'{site} ({site_i} of {sites})')
+    elif site and not well:
+        parts.append(site)
+    if channel:
+        parts.append(channel)
+    if planes > 1:
+        parts.append(f'slice {plane} of {planes}')
+    if left_s is not None and done < total:
+        parts.append(f'about {duration_text(left_s)} left')
+    if file:
+        parts.append(file)
+    return '   |   '.join(parts)
 
 
 # ------------------------------------------------------- focus surface

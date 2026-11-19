@@ -176,12 +176,25 @@ def saturated_fraction(img: np.ndarray, significant_bits: int) -> float:
 def save_settings(payload: dict) -> None:
     """Write this account's settings. Written to a second file first and
     swapped in, so a crash mid-write cannot leave a broken file (which
-    would reset every setting at the next launch)."""
+    would reset every setting at the next launch).
+
+    Windows refuses the write or the swap for a moment while another
+    program (virus scanner, indexer) has the file just written open, as
+    happens when two settings are changed in quick succession; it is
+    tried again for up to half a second before the failure is reported."""
     os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
     tmp = SETTINGS_PATH + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(payload, f, indent=2)
-    os.replace(tmp, SETTINGS_PATH)
+    text = json.dumps(payload, indent=2)
+    for attempt in range(10):
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.write(text)
+            os.replace(tmp, SETTINGS_PATH)
+            return
+        except PermissionError:
+            if attempt == 9:
+                raise
+            time.sleep(0.05)
 
 
 def load_settings() -> dict:
@@ -924,6 +937,69 @@ def autofocus_sweep(hw: ScopeHW, cfg: AutofocusConfig,
     return float(best), True
 
 
+def af_window(center_um: float, cfg: AutofocusConfig) -> AutofocusConfig:
+    """``cfg`` with its range (same height, same interval) centered on
+    ``center_um``: the search starts around a known focus instead of at
+    fixed heights. A range that would go below 0 keeps its height."""
+    half = abs(cfg.z_top_um - cfg.z_bottom_um) / 2.0
+    lo = max(float(center_um) - half, 0.0)
+    return AutofocusConfig(z_bottom_um=lo, z_top_um=lo + 2.0 * half,
+                           step_um=cfg.step_um, channel=cfg.channel,
+                           settle_s=cfg.settle_s)
+
+
+def af_edge_side(best_um: float, cfg: AutofocusConfig) -> int:
+    """-1 / +1 when an autofocus result lies at the bottom / top edge of
+    the range it was searched in (within one step), else 0. A focus at
+    the edge was not bracketed: the sharpest plane seen was the last one,
+    so the real focus is probably outside the range."""
+    lo = min(cfg.z_bottom_um, cfg.z_top_um)
+    hi = max(cfg.z_bottom_um, cfg.z_top_um)
+    margin = min(max(abs(cfg.step_um), 0.5), (hi - lo) / 4.0)
+    if best_um <= lo + margin:
+        return -1
+    if best_um >= hi - margin:
+        return 1
+    return 0
+
+
+def autofocus_checked(hw: ScopeHW, cfg: AutofocusConfig,
+                      settings: ChannelSettings, status_cb=None,
+                      sweep=None, **kwargs) -> tuple[float | None, bool]:
+    """``autofocus_sweep`` that does not take the edge of its range for
+    focus. When the best plane is at an edge, the range is moved three
+    quarters of its height that way and searched once more; a focus that
+    is still at an edge is returned as not found (z, False), so that the
+    caller keeps the focus it had rather than following a wrong one."""
+    sweep = sweep or autofocus_sweep
+    best, ok = sweep(hw, cfg, settings, status_cb=status_cb, **kwargs)
+    if best is None or not ok:
+        return best, ok
+    side = af_edge_side(best, cfg)
+    if side == 0:
+        return best, True
+    lo = min(cfg.z_bottom_um, cfg.z_top_um)
+    hi = max(cfg.z_bottom_um, cfg.z_top_um)
+    shift = side * 0.75 * (hi - lo)
+    lo2 = max(lo + shift, 0.0)
+    again = AutofocusConfig(z_bottom_um=lo2, z_top_um=lo2 + (hi - lo),
+                            step_um=cfg.step_um, channel=cfg.channel,
+                            settle_s=cfg.settle_s)
+    if status_cb:
+        status_cb(f'AF: sharpest at the {"top" if side > 0 else "bottom"} '
+                  f'edge of the range (z={best:.1f} um) - searching '
+                  f'{again.z_bottom_um:.0f} to {again.z_top_um:.0f} um')
+    best2, ok2 = sweep(hw, again, settings, status_cb=status_cb, **kwargs)
+    if best2 is None:
+        return None, False
+    if ok2 and af_edge_side(best2, again) == 0:
+        return best2, True
+    if status_cb:
+        status_cb(f'AF: focus is outside {min(lo, lo2):.0f} to '
+                  f'{max(hi, again.z_top_um):.0f} um - result NOT used')
+    return best2, False
+
+
 class FocusSurface:
     """Focus map anchored to an autofocus reference point.
 
@@ -940,21 +1016,52 @@ class FocusSurface:
         self.current_z: float | None = None  # anchor AF result this cycle
         # Points: list of (x_um, y_um, z_offset_um_from_ref)
         self.points: list[tuple[float, float, float]] = []
+        # The autofocus point was moved after its last autofocus: the
+        # anchor Z the stored offsets still refer to (see set_anchor).
+        self.rebase_from: float | None = None
+        # Where the autofocus search at the anchor is centered: the Z the
+        # stage was at when the point was set, then the last focus found.
+        self.anchor_z: float | None = None
 
-    def set_anchor(self, x_um: float, y_um: float, channel: str) -> None:
-        self.anchor_xy = (float(x_um), float(y_um))
+    MOVED_UM = 5.0      # an anchor set this close to the old one is the same
+
+    def set_anchor(self, x_um: float, y_um: float, channel: str,
+                   z_um: float | None = None) -> None:
+        """Set the autofocus point. The focus there may differ from the
+        focus at the old point, and that difference is not drift: the
+        next autofocus re-ties every stored focus to the new point at the
+        height it has now, instead of shifting it all by the difference."""
+        new = (float(x_um), float(y_um))
+        old = self.anchor_xy
+        if old is not None and self.current_z is not None and \
+                self.rebase_from is None and \
+                math.hypot(new[0] - old[0], new[1] - old[1]) > self.MOVED_UM:
+            self.rebase_from = self.current_z
+        self.anchor_xy = new
         self.anchor_channel = channel
+        if z_um is not None:
+            self.anchor_z = float(z_um)
 
     def set_reference_z(self, z_um: float) -> None:
         self.ref_z = float(z_um)
         self.current_z = float(z_um)
+        self.anchor_z = float(z_um)
 
     def update_cycle(self, new_anchor_z: float) -> None:
         """Per-cycle update: record this cycle's anchor AF result."""
         if self.ref_z is None:
             self.set_reference_z(new_anchor_z)
-        else:
-            self.current_z = float(new_anchor_z)
+            self.rebase_from = None
+            return
+        if self.rebase_from is not None:
+            # First autofocus at a moved AF point: keep every stored focus
+            # (map points and positions) at its present height.
+            d = float(new_anchor_z) - self.rebase_from
+            self.points = [(x, y, off - d) for x, y, off in self.points]
+            self.ref_z += d
+            self.rebase_from = None
+        self.current_z = float(new_anchor_z)
+        self.anchor_z = float(new_anchor_z)
 
     @property
     def drift_um(self) -> float:
@@ -988,6 +1095,8 @@ class FocusSurface:
             'ref_z': self.ref_z,
             'current_z': self.current_z,
             'points': self.points,
+            'rebase_from': self.rebase_from,
+            'anchor_z': self.anchor_z,
         }
 
     def from_dict(self, d: dict) -> None:
@@ -996,6 +1105,8 @@ class FocusSurface:
         self.ref_z = d.get('ref_z')
         self.current_z = d.get('current_z')
         self.points = [tuple(p) for p in d.get('points', [])]
+        self.rebase_from = d.get('rebase_from')
+        self.anchor_z = d.get('anchor_z')
 
 
 # -------------------------------------------------------------- shading
@@ -1379,6 +1490,51 @@ def spiral_positions_unbounded(center_x: float, center_y: float,
         if emitted == 0:
             return   # whole ring out of bounds: physical edge reached
         ring += 1
+
+
+TRANSMITTED_CHANNELS = ('BF', 'PC', 'DF')
+
+
+def overview_rgb(planes: dict[str, np.ndarray],
+                 tints: dict[str, tuple],
+                 limits: dict[str, list[float]],
+                 max_px: int = 192) -> np.ndarray | None:
+    """One small colour picture of a field from its channels, for an
+    overview built up on the plate map (uint8, h x w x 3).
+
+    Each channel is drawn in its own colour and the channels are added.
+    ``limits`` ({channel: [black, white]}) is kept by the caller between
+    fields so that every field of a scan is scaled alike: black is set
+    by the first field (0 for transmitted light) and only ever goes
+    down, white only ever goes up. Transmitted light is drawn at half
+    strength when there is fluorescence too, so it does not drown it."""
+    out = None
+    with_fluo = any(ch not in TRANSMITTED_CHANNELS for ch in planes)
+    for ch, frame in planes.items():
+        if frame is None or frame.ndim != 2 or frame.size == 0:
+            continue
+        h, w = frame.shape[:2]
+        f = max(max(w, h) // max(int(max_px), 1), 1)
+        small = frame[::f, ::f].astype(np.float32)
+        transmitted = ch in TRANSMITTED_CHANNELS
+        lo = 0.0 if transmitted else float(np.percentile(small, 1.0))
+        hi = float(np.percentile(small, 99.8))
+        lim = limits.get(ch)
+        if lim is None:
+            lim = limits[ch] = [lo, hi]
+        else:
+            lim[0], lim[1] = min(lim[0], lo), max(lim[1], hi)
+        # An empty first field must not be stretched into noise.
+        span = max(lim[1] - lim[0], 0.25 * lim[0], 16.0)
+        g = np.clip((small - lim[0]) / span, 0.0, 1.0) * 255.0
+        if transmitted and with_fluo:
+            g *= 0.5
+        tint = tints.get(ch, (1.0, 1.0, 1.0))
+        rgb = np.stack([g * float(t) for t in tint[:3]], axis=-1)
+        out = rgb if out is None else out + rgb
+    if out is None:
+        return None
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
 def stitch_tiles(tiles: list[np.ndarray],

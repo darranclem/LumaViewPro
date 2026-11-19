@@ -581,3 +581,162 @@ def test_optimised_interval_follows_the_lens():
     assert ex.stack_step_um(section, 2.3) == pytest.approx(section / 2.3)
     # a higher NA lens gives a thinner section, so a finer interval
     assert ex.optical_section_um(0.45, 520.0, 1.0, 0.325) < section
+
+
+# ------------------------------- focus points the user can move about
+
+def test_one_focus_point_per_well_is_at_the_well_center():
+    wells = [(1, 2), (1, 3), (4, 7)]
+    plan = ex.focus_plan('per_well', wells, well_x_mm=6.4, well_y_mm=6.4)
+    assert [p['label'] for p in plan] == ['B3', 'B4', 'E8']
+    assert all(p['dx'] == 0.0 and p['dy'] == 0.0 and not p['moved']
+               for p in plan)
+
+
+def test_a_moved_focus_point_stays_where_it_was_put():
+    wells = [(1, 2), (1, 3)]
+    plan = ex.focus_plan('per_well', wells, well_x_mm=6.4, well_y_mm=6.4,
+                         moved={'B4': (1.5, -0.8)})
+    by = {p['label']: p for p in plan}
+    assert (by['B4']['dx'], by['B4']['dy'], by['B4']['moved']) == \
+        (1.5, -0.8, True)
+    assert (by['B3']['dx'], by['B3']['dy'], by['B3']['moved']) == \
+        (0.0, 0.0, False)
+
+
+def test_several_points_per_well_are_named_and_moved_one_by_one():
+    plan = ex.focus_plan('multi', [(0, 0)], well_x_mm=6.4, well_y_mm=6.4,
+                         n_per_well=3, moved={'A1 point 2': (0.0, 0.0)},
+                         well_name=lambda r, c: 'A1')
+    assert [p['label'] for p in plan] == ['A1 point 1', 'A1 point 2',
+                                          'A1 point 3']
+    assert [p['moved'] for p in plan] == [False, True, False]
+    assert (plan[1]['dx'], plan[1]['dy']) == (0.0, 0.0)
+    assert math.hypot(plan[0]['dx'], plan[0]['dy']) > 1.0
+
+
+def test_a_click_moves_the_nearest_focus_point_of_that_well_only():
+    plan = ex.focus_plan('multi', [(0, 0), (0, 1)], well_x_mm=6.4,
+                         well_y_mm=6.4, n_per_well=3)
+    i = ex.nearest_focus_point(plan, (0, 1), plan[4]['dx'] + 0.1,
+                               plan[4]['dy'])
+    assert i == 4
+    assert ex.nearest_focus_point(plan, (5, 5), 0.0, 0.0) is None
+    corners = ex.focus_plan('corners', [(0, 0), (0, 1), (0, 2)],
+                            well_x_mm=6.4, well_y_mm=6.4)
+    assert ex.nearest_focus_point(corners, (0, 1), 0.0, 0.0) is not None
+
+
+# ------------------------------------------------- progress of a run
+
+def test_progress_line_says_where_the_run_is():
+    line = ex.progress_line(done=132, total=1188, cycle=1, cycles=3,
+                            well='C8', well_i=2, wells=6, site='TA3',
+                            site_i=3, sites=9, channel='GREEN', plane=4,
+                            planes=11, file='C8.ome.tiff', left_s=1500)
+    for part in ('11%', 'image 132 of 1188', 'timepoint 1 of 3',
+                 'well C8 (2 of 6)', 'TA3 (3 of 9)', 'GREEN',
+                 'slice 4 of 11', 'about 25 min left', 'C8.ome.tiff'):
+        assert part in line
+
+
+def test_progress_line_leaves_out_what_does_not_apply():
+    line = ex.progress_line(done=1, total=4, cycle=1, cycles=1, well='B2',
+                            well_i=1, wells=1, site='P1', site_i=1, sites=1,
+                            channel='BF', plane=1, planes=1)
+    assert 'timepoint' not in line and 'slice' not in line
+    assert 'P1' not in line and 'left' not in line
+    assert 'well B2' in line and 'BF' in line and '25%' in line
+
+
+def test_time_left_counts_the_waits_between_timepoints():
+    # 10 of 40 images of timepoint 1 of 3 took 100 s: 300 s more here.
+    one = ex.time_left_s(10, 40, 0, 1, 10, 40, 100.0, 0.0)
+    assert one == pytest.approx(300.0)
+    # Three timepoints 30 min apart: the two waits dominate.
+    three = ex.time_left_s(10, 120, 0, 3, 10, 40, 100.0, 1800.0)
+    assert three == pytest.approx(1700.0 + 1800.0 + 400.0)
+    # Timepoints back to back when imaging takes longer than the interval.
+    tight = ex.time_left_s(10, 120, 0, 3, 10, 40, 100.0, 60.0)
+    assert tight == pytest.approx(300.0 + 400.0 + 400.0)
+    assert ex.time_left_s(0, 40, 0, 1, 0, 40, 5.0, 0.0) is None
+
+
+def test_durations_read_naturally():
+    assert ex.duration_text(45) == '45 s'
+    assert ex.duration_text(720) == '12 min'
+    assert ex.duration_text(3 * 3600 + 5 * 60) == '3 h 05 min'
+
+
+# ---------------------- one autofocus point carries the whole surface
+
+def test_moving_the_autofocus_point_keeps_every_stored_focus_where_it_is():
+    s = FocusSurface()
+    s.set_anchor(50, 30, 'BF')
+    s.set_reference_z(1000.0)
+    for x, y, off in CORNERS:
+        s.add_point(x, y, 1000.0 + off)
+    position_z = 1012.0 - s.drift_um          # a position, as it is stored
+    probes = [(0, 0), (50, 30), (20, 45)]
+    before = [s.z_at(x, y) for x, y in probes]
+    # The AF point goes to a spot where the plate is 40 um higher: that
+    # is not drift, so nothing may move at the first autofocus there...
+    s.set_anchor(80, 10, 'BF')
+    s.update_cycle(1040.0)
+    assert [s.z_at(x, y) for x, y in probes] == pytest.approx(before)
+    assert position_z + s.drift_um == pytest.approx(1012.0)
+    # ...and from then on everything follows the new point.
+    s.update_cycle(1043.0)
+    assert [s.z_at(x, y) for x, y in probes] == \
+        pytest.approx([z + 3.0 for z in before])
+    assert position_z + s.drift_um == pytest.approx(1015.0)
+
+
+def test_setting_the_autofocus_point_where_it_already_is_changes_nothing():
+    s = FocusSurface()
+    s.set_anchor(50, 30, 'BF')
+    s.set_reference_z(1000.0)
+    s.add_point(10, 10, 1004.0)
+    s.set_anchor(51, 30, 'BF')
+    s.update_cycle(1006.0)                    # drift, as before
+    assert s.z_at(10, 10) == pytest.approx(1010.0)
+    assert s.rebase_from is None
+
+
+def test_a_moved_autofocus_point_survives_saving_and_loading():
+    s = FocusSurface()
+    s.set_anchor(50, 30, 'BF')
+    s.set_reference_z(1000.0)
+    s.add_point(10, 10, 1004.0)
+    s.set_anchor(80, 10, 'BF')
+    t = FocusSurface()
+    t.from_dict(s.to_dict())
+    t.update_cycle(1040.0)
+    assert t.z_at(10, 10) == pytest.approx(1004.0)
+
+
+# ------------------ the autofocus point keeps its Z; the range is around it
+
+def test_the_autofocus_point_keeps_the_z_it_was_set_at():
+    s = FocusSurface()
+    s.set_anchor(50, 30, 'BF', z_um=6480.0)
+    assert s.anchor_z == 6480.0
+    s.update_cycle(6483.5)                    # then the focus found there
+    assert s.anchor_z == 6483.5
+    t = FocusSurface()
+    t.from_dict(s.to_dict())
+    assert t.anchor_z == 6483.5
+    old = FocusSurface()
+    old.from_dict({'anchor_xy': [1, 2], 'ref_z': 5.0, 'current_z': 6.0})
+    assert old.anchor_z is None               # settings from before this
+
+
+def test_the_autofocus_range_is_searched_around_the_point_z():
+    import acquisition as acq
+    cfg = acq.AutofocusConfig(z_bottom_um=6646, z_top_um=6746, step_um=2,
+                              channel='GREEN')
+    w = acq.af_window(6480.0, cfg)
+    assert (w.z_bottom_um, w.z_top_um) == (6430.0, 6530.0)
+    assert (w.step_um, w.channel) == (2, 'GREEN')
+    low = acq.af_window(20.0, cfg)            # never below the bottom of travel
+    assert (low.z_bottom_um, low.z_top_um) == (0.0, 100.0)

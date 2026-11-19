@@ -278,3 +278,65 @@ def test_parking_gives_up_when_a_stuck_thread_holds_the_hardware_lock():
     finally:
         release.set()
         t.join(2.0)
+
+
+# ------------------------------- spiral overview: one picture per field
+
+_TINTS = {'BF': (1.0, 1.0, 1.0), 'GREEN': (0.0, 1.0, 0.0),
+          'RED': (1.0, 0.0, 0.0)}
+
+
+def _field(value, spot=None, shape=(40, 60)):
+    f = np.full(shape, value, np.uint16)
+    if spot is not None:
+        f[10:20, 10:20] = spot
+    return f
+
+
+def test_overview_puts_every_colour_of_a_field_in_one_picture():
+    limits = {}
+    green = _field(100, 4000)
+    red = _field(100)
+    red[25:35, 40:50] = 3000
+    rgb = acq.overview_rgb({'GREEN': green, 'RED': red}, _TINTS, limits)
+    assert rgb.dtype == np.uint8 and rgb.shape == (40, 60, 3)
+    assert rgb[15, 15, 1] > 200 and rgb[15, 15, 0] < 30    # green spot
+    assert rgb[30, 45, 0] > 200 and rgb[30, 45, 1] < 30    # red spot
+    assert rgb[2, 2].max() < 30                            # background
+    assert set(limits) == {'GREEN', 'RED'}
+
+
+def test_overview_is_made_small():
+    rgb = acq.overview_rgb({'BF': _field(500, shape=(1200, 1920))},
+                           _TINTS, {}, max_px=192)
+    assert max(rgb.shape[:2]) <= 192
+
+
+def test_overview_scales_every_field_of_a_scan_alike():
+    limits = {}
+    acq.overview_rgb({'GREEN': _field(100, 4000)}, _TINTS, limits)
+    # a dimmer field later in the scan is drawn dimmer, not stretched
+    dim = acq.overview_rgb({'GREEN': _field(100, 1000)}, _TINTS, limits)
+    alone = acq.overview_rgb({'GREEN': _field(100, 1000)}, _TINTS, {})
+    assert dim[15, 15, 1] < 100 < alone[15, 15, 1]
+
+
+def test_overview_does_not_stretch_an_empty_field_into_noise():
+    rng = np.random.default_rng(1)
+    empty = (100 + rng.integers(0, 4, (40, 60))).astype(np.uint16)
+    rgb = acq.overview_rgb({'GREEN': empty}, _TINTS, {})
+    assert rgb.max() < 80
+
+
+def test_overview_transmitted_light_does_not_drown_fluorescence():
+    bf = _field(3000)
+    with_fluo = acq.overview_rgb({'BF': bf, 'GREEN': _field(100, 4000)},
+                                 _TINTS, {})
+    alone = acq.overview_rgb({'BF': bf}, _TINTS, {})
+    assert alone[2, 2, 0] > 200            # full strength on its own
+    assert 100 < with_fluo[2, 2, 0] < 150  # half strength beside a colour
+    assert with_fluo[15, 15, 1] == 255     # the green spot shows on top
+
+
+def test_overview_of_nothing_is_none():
+    assert acq.overview_rgb({}, _TINTS, {}) is None

@@ -379,6 +379,9 @@ class WellPlateMapWidget(Widget):
         self.target_plate_mm: tuple[float, float] | None = None  # calibration
         self.position_markers: list[tuple[float, float]] = []    # protocol
         self.highlight_marker: int | None = None
+        # Where focus will be set for the focus map: (x_mm, y_mm, moved).
+        self.focus_markers: list[tuple[float, float, bool]] = []
+        self.highlight_focus: int | None = None
         self.on_well_double_click = None  # callable(row, col, x_mm, y_mm)
         self.on_well_selected = None      # callable(row, col, x_mm, y_mm)
         self.active_wells: set[tuple[int, int]] = set()
@@ -684,6 +687,16 @@ class WellPlateMapWidget(Widget):
         self.highlight_marker = highlight
         self.redraw()
 
+    def set_focus_markers(self, marks, highlight: int | None = None):
+        """Show the focus map points ((x_mm, y_mm, moved), plate top-left
+        origin); an empty list hides them."""
+        marks = [(float(m[0]), float(m[1]), bool(m[2])) for m in marks]
+        if marks == self.focus_markers and highlight == self.highlight_focus:
+            return
+        self.focus_markers = marks
+        self.highlight_focus = highlight
+        self.redraw()
+
     # ------------------------------------------------------------- drawing
 
     def redraw(self, *args):
@@ -789,6 +802,24 @@ class WellPlateMapWidget(Widget):
                     Color(0.95, 0.75, 0.1, 0.9)
                     Line(points=[sx - 4, sy, sx, sy + 4, sx + 4, sy, sx, sy - 4,
                                  sx - 4, sy], width=1.1)
+            # Focus map points: a square with a cross (white once moved
+            # off the place it was generated at; larger for the one the
+            # focus walk is at).
+            for i, (fx, fy, moved) in enumerate(self.focus_markers):
+                sx, sy = self._mm_to_screen(fx, fy)
+                if sx < left - 12 or sx > right + 12 or \
+                        sy < bottom - 12 or sy > top + 12:
+                    continue
+                r = 8 if i == self.highlight_focus else 5
+                Color(0, 0, 0, 0.75)
+                Line(rectangle=(sx - r, sy - r, 2 * r, 2 * r), width=2.6)
+                if moved:
+                    Color(1.0, 1.0, 1.0, 1)
+                else:
+                    Color(0.25, 0.85, 1.0, 1)
+                Line(rectangle=(sx - r, sy - r, 2 * r, 2 * r), width=1.3)
+                Line(points=[sx - r, sy, sx + r, sy], width=1.1)
+                Line(points=[sx, sy - r, sx, sy + r], width=1.1)
             # Stage position marker: the field-of-view outline, plus the
             # cross and circle while the outline is too small to see.
             if box is not None:
