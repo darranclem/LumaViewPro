@@ -62,7 +62,7 @@ class _Scope:
         return np.clip(_scene(xx + x0, yy + y0) * shade, 0, 65535).astype(np.uint16)
 
 
-def _scan(tmp_path, rows=3, cols=3):
+def _scan(tmp_path, rows=3, cols=3, save_format='single'):
     hw = _Scope()
     settings = {'BF': acq.ChannelSettings(enabled=True)}
     # Tile centres 20 % overlapped, well inside the stage.
@@ -73,7 +73,8 @@ def _scan(tmp_path, rows=3, cols=3):
     said = []
     paths = acq.run_tile_scan(hw, positions, settings, None, None, UM, out,
                               threading.Event(), status_cb=said.append,
-                              settle_s=0.0, total=len(positions))
+                              settle_s=0.0, total=len(positions),
+                              save_format=save_format)
     return out, positions, paths, said
 
 
@@ -254,3 +255,22 @@ def test_a_meniscus_spot_is_divided_out_of_each_field_and_the_folder_copy_is_wri
     assert np.array_equal(out, fixed)
     assert np.array_equal(tifffile.imread(src / 'custom0002_BF_0000.tiff'), field), 'the original is untouched'
     assert os.path.exists(os.path.join(record['out_dir'], 'flatten.json'))
+
+
+@pytest.mark.parametrize('fmt', ['ome-tiff', 'zarr'])
+def test_a_tile_scan_saved_as_one_file_keeps_no_single_tiles(tmp_path, fmt):
+    import well_file
+    out, positions, paths, said = _scan(tmp_path, save_format=fmt)
+    names = sorted(os.listdir(out))
+    one = 'scan.ome.tiff' if fmt == 'ome-tiff' else 'scan.zarr'
+    assert one in names and quark_stitch.TILE_SCAN_SIDECAR in names
+    assert not [n for n in names if n.startswith('tile_') and n.endswith('.tiff')], names
+    assert os.path.exists(paths['BF']), 'the mosaic is still made (from the tiles, before they go)'
+    got = well_file.read_run(os.path.join(out, one))
+    assert len(got['images']) == len(positions) and got['channels'] == ['BF']
+    hw = _Scope()
+    for i, (x, y) in enumerate(positions):
+        hw.move_xy(x, y)
+        key = ('', f'tile_{i:04d}')
+        assert np.array_equal(got['images'][key][0, 0, 0], hw.grab_settled())
+        assert got['xy'][key] == (x, y)

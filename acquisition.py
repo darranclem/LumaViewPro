@@ -1615,8 +1615,18 @@ def run_tile_scan(hw: ScopeHW,
                   stitch: bool = True,
                   use_channel_z_offsets: bool = True,
                   total: int | None = None,
-                  on_tile=None) -> dict[str, str]:
+                  on_tile=None,
+                  save_format: str = 'single') -> dict[str, str]:
     """Acquire every enabled channel at each tile position, then stitch.
+
+    ``save_format`` other than 'single' (see ``well_file.SAVE_FORMATS``):
+    every tile also goes into ONE file, ``<out_dir>/scan.ome.tiff`` or
+    ``scan.zarr`` (each tile an image with its stage position, as the
+    wells of a protocol run are saved; Quark reads it as the well 'scan').
+    The single-page tiles are still written while the scan runs (a Quark
+    module older than the one file's format stitches from them) and are
+    removed once the stitching is through: the one file is then the data
+    of record.
 
     ``positions`` may be a list or an endless generator (spiral-until-edge);
     out-of-bounds positions are skipped. ``on_tile(channel, frame, x, y)``
@@ -1641,6 +1651,15 @@ def run_tile_scan(hw: ScopeHW,
         _status('Tile scan: no channels enabled ("Use in protocol")')
         return {}
     collected: dict[str, list[np.ndarray]] = {ch: [] for ch in enabled}
+    writer = None
+    in_one_file: list[str] = []     # single-page tiles the one file also holds
+    if save_format != 'single':
+        import well_file
+        kind = well_file.container(save_format)
+        os.makedirs(out_dir, exist_ok=True)
+        writer = well_file.WellWriter(
+            os.path.join(out_dir, 'scan' + well_file.EXTENSION[kind]), kind,
+            um_per_px=um_per_px, info={'kind': 'tile scan'})
     used_positions: list[tuple[float, float]] = []
     used_indices: list[int] = []    # the number in each tile's file name
     n_txt = str(total) if total else '...'
@@ -1677,7 +1696,18 @@ def run_tile_scan(hw: ScopeHW,
                 if z_now is None and shading.has_stack(ch):
                     z_now = hw.get_pos()[2]
                 frame = shading.apply(frame, ch, z_now)
-            save_image(os.path.join(out_dir, f'tile_{i:04d}_{ch}.tiff'), frame)
+            tile_path = os.path.join(out_dir, f'tile_{i:04d}_{ch}.tiff')
+            save_image(tile_path, frame)
+            if writer is not None:
+                plane = well_file.storable(frame)
+                if plane is not None:
+                    try:
+                        writer.add(plane, tile=f'tile_{i:04d}', channel=ch,
+                                   x_um=x, y_um=y, z_um=z_now)
+                        in_one_file.append(tile_path)
+                    except Exception as e:
+                        # (A frame of another size: it stays a file of its own.)
+                        _status(f'Tile {i + 1} {ch} kept as its own file: {e}')
             collected[ch].append(frame)
             if on_tile is not None:
                 try:
@@ -1685,6 +1715,14 @@ def run_tile_scan(hw: ScopeHW,
                 except Exception:
                     pass
     hw.leds_off()
+    one_file_done = False
+    if writer is not None:
+        # Finished before the stitching, which may read it.
+        try:
+            writer.close()
+            one_file_done = True
+        except Exception as e:
+            _status(f'The one file could not be finished ({e}): the single tiles are kept')
 
     # The record that lets this folder be stitched again (by Quark, or by
     # quark_stitch.py from the command line), whether or not it is stitched now.
@@ -1724,6 +1762,13 @@ def run_tile_scan(hw: ScopeHW,
                 p = os.path.join(out_dir, f'stitched_{ch}.tiff')
                 save_image(p, mosaic)
                 stitched_paths[ch] = p
+    if one_file_done:
+        # The one file holds them: the single-page tiles are not kept.
+        for tile_path in in_one_file:
+            try:
+                os.remove(tile_path)
+            except OSError:
+                pass
     _status(f'Tile scan finished ({len(used_positions)} tiles) -> {out_dir}{quark_note}')
     return stitched_paths
 

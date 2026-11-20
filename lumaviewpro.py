@@ -3376,7 +3376,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                               self.worker.cancel, status_cb=self._set_status,
                               use_channel_z_offsets=self.use_z_offsets_on,
                               total=total, stitch=stitch,
-                              on_tile=self._mosaic_add)
+                              on_tile=self._mosaic_add,
+                              save_format=self.save_format)
             Clock.schedule_once(lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
         self._bg(_job, busy_job=True)
 
