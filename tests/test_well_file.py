@@ -85,8 +85,107 @@ def test_a_crash_before_close_leaves_an_index_of_every_page(tmp_path):
     w.add(frame(0, 0, 0, 1), tile='P1', z=1, channel='BF')
     with open(path + '.index.json', encoding='utf-8') as f:
         lines = [json.loads(line) for line in f]
-    assert [(r['page'], r['z']) for r in lines] == [(0, 0), (1, 1)]
+    assert lines[0]['header']['shape'] == [24, 32], 'the first line says what the frames are'
+    assert [(r['page'], r['z']) for r in lines[1:]] == [(0, 0), (1, 1)]
+    # A reader takes the planes of a file that was never closed from it.
+    got = well_file.read_well(path)
+    assert np.array_equal(got['tiles']['P1'][0, 0, 1], frame(0, 0, 0, 1))
     w.close()
+
+
+def big(well, tile, t, c, z):
+    """A frame large enough to have reduced copies, different everywhere."""
+    y, x = np.mgrid[0:200, 0:260]
+    return ((x * 7 + y * 13 + 1000 * well + 100 * tile + 10 * t + 3 * c + z) % 4000).astype(np.uint16)
+
+
+@pytest.mark.parametrize('fmt', well_file.FORMATS)
+def test_every_frame_has_its_reduced_copies_each_the_mean_of_its_block(tmp_path, fmt):
+    assert well_file.level_shapes((1900, 1900)) == [(1900, 1900), (950, 950), (475, 475), (237, 237), (118, 118)]
+    assert well_file.level_shapes((200, 260)) == [(200, 260), (100, 130)]
+    path = well_file.well_path(str(tmp_path), 'B3', fmt)
+    with well_file.WellWriter(path, fmt, um_per_px=0.65, well='B3') as w:
+        for z in range(3):
+            w.add(big(0, 0, 0, 0, z), tile='TA1', z=z, channel='BF', x_um=5.0, y_um=6.0)
+    half = well_file.read_run(path, level=1)
+    assert half['levels'] == [(200, 260), (100, 130)]
+    for z in range(3):
+        want = big(0, 0, 0, 0, z).reshape(100, 2, 130, 2).mean((1, 3))
+        assert np.abs(half['images'][('', 'TA1')][0, 0, z].astype(float) - want).max() <= 0.5
+    if fmt == 'ome-tiff':
+        with tifffile.TiffFile(path) as tf:
+            assert len(tf.pages) == 3, 'the reduced copies are not pages of their own'
+            assert len(tf.series) == 1 and len(tf.series[0].levels) == 2
+            assert tf.series[0].levels[1].shape[-2:] == (100, 130)
+    else:
+        with open(os.path.join(path, 'TA1', '.zattrs'), encoding='utf-8') as f:
+            sets = json.load(f)['multiscales'][0]['datasets']
+        assert [d['path'] for d in sets] == ['0', '1']
+        assert sets[1]['coordinateTransformations'][0]['scale'][3:] == [1.3, 1.3]
+
+
+@pytest.mark.parametrize('fmt', ['run-ome-tiff', 'run-zarr'])
+def test_a_whole_run_is_one_file_with_its_wells_as_a_plate(tmp_path, fmt):
+    import experiment
+    base = tmp_path / 'protocol_20261120_101500'
+    saver = well_file.RunSaver(str(base), fmt, um_per_px=0.65, z_step_um=2.0,
+                               name_of=experiment.file_name)
+    wells = [('B3', 'TA1'), ('B3', 'TA2'), ('C11', 'TA1')]
+    for t in (1, 2):
+        for wi, (well, site) in enumerate(wells):
+            for ci, ch in enumerate(('BF', 'GREEN')):
+                for z in (1, 2):
+                    assert saver.save(big(wi, int(site[-1]), t, ci, z), well=well, site=site, z_index=z,
+                                      channel=ch, timepoint=t, x_um=100.0 * wi, y_um=20.0) is None
+    done = saver.close()
+    ext = '.ome.tiff' if fmt == 'run-ome-tiff' else '.zarr'
+    assert os.listdir(base) == ['protocol_20261120_101500' + ext], 'one file for the run'
+    path = str(base / ('protocol_20261120_101500' + ext))
+    assert done[0]['planes'] == 24 and done[0]['wells'] == ['B3', 'C11'] and done[0]['levels'] == 2
+    got = well_file.read_run(path)
+    assert list(got['images']) == [('B3', 'TA1'), ('B3', 'TA2'), ('C11', 'TA1')]
+    assert got['images'][('C11', 'TA1')].shape == (2, 2, 2, 200, 260)
+    assert np.array_equal(got['images'][('B3', 'TA2')][1, 1, 1], big(1, 2, 2, 1, 2))
+    assert got['xy'][('C11', 'TA1')] == (200.0, 20.0)
+    doc = well_file.read_index(path)
+    assert doc['scope'] == 'run' and doc['version'] == 2
+    if fmt == 'run-ome-tiff':
+        assert all(len(row) == 4 + 2 for row in doc['planes']), 'an offset for the plane and for its copy'
+        with tifffile.TiffFile(path) as tf:
+            assert len(tf.series) == 3
+            xml = tf.ome_metadata
+        assert '<Plate ID="Plate:0"' in xml and 'Rows="3" Columns="11"' in xml
+        assert '<Well ID="Well:0:1" Row="2" Column="10">' in xml and 'Name="C11 TA1"' in xml
+    else:
+        with open(os.path.join(path, '.zattrs'), encoding='utf-8') as f:
+            plate = json.load(f)['plate']
+        assert [w['path'] for w in plate['wells']] == ['B/3', 'C/11'] and plate['field_count'] == 2
+        with open(os.path.join(path, 'B', '3', '.zattrs'), encoding='utf-8') as f:
+            assert [i['path'] for i in json.load(f)['well']['images']] == ['TA1', 'TA2']
+        assert os.path.exists(os.path.join(path, 'C', '11', 'TA1', '1', '.zarray'))
+
+
+def test_a_zarr_store_says_what_it_holds_from_the_first_frame_of_every_timepoint(tmp_path):
+    path = str(tmp_path / 'run.zarr')
+    w = well_file.WellWriter(path, 'zarr', run=True)
+    w.add(big(0, 0, 0, 0, 0), tile='TA1', well='B3')
+    assert len(well_file.read_index(path)['planes']) == 1, 'readable while the run goes on'
+    w.add(big(0, 1, 0, 0, 0), tile='TA2', well='B3')
+    w.add(big(0, 0, 1, 0, 0), tile='TA1', well='B3', timepoint=1)
+    assert len(well_file.read_index(path)['planes']) == 3
+    w.close()
+
+
+def test_a_folder_of_single_files_is_packed_into_one_file_for_the_run(tmp_path):
+    src = tmp_path / 'run'
+    for well in ('B3', 'C4'):
+        (src / well).mkdir(parents=True)
+        for t in (1, 2):
+            tifffile.imwrite(str(src / well / f'{well}_TA1_Z001_BF_t{t:04d}.tiff'), big(1, 1, t, 0, 0))
+    out = well_file.pack_run(str(src), 'run-zarr', out_dir=str(tmp_path / 'packed'))
+    assert out[0]['planes'] == 4 and out[0]['wells'] == ['B3', 'C4']
+    got = well_file.read_run(str(tmp_path / 'packed' / 'packed.zarr'))
+    assert np.array_equal(got['images'][('C4', 'TA1')][1, 0, 0], big(1, 1, 2, 0, 0))
 
 
 def test_what_cannot_be_one_well_is_refused(tmp_path):

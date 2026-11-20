@@ -308,7 +308,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
     channel_summary = StringProperty('')  # protocol colours and autofocus
     zstack_dir = StringProperty('')       # live z-stacks; '' = data folder
     # How protocol runs and z-stacks are saved: one file per well / stack
-    # ('ome-tiff' or 'zarr'), or single-page TIFFs ('single').
+    # ('ome-tiff' or 'zarr'), one file for the whole run ('run-ome-tiff',
+    # 'run-zarr'), or single-page TIFFs ('single').
     save_format = StringProperty('ome-tiff')
     lens_pos_info = StringProperty('')    # work position of the lens in use
     work_at_start_on = BooleanProperty(True)   # raise to it after homing
@@ -4276,7 +4277,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         t_run = time.time()
         stacked_all = [self.channel_settings[ch] for ch in channels
                        if self.channel_settings[ch].zstack.enabled]
-        # One file per well (or single-page TIFFs): see well_file.RunSaver.
+        # One file per well, one for the whole run, or single-page TIFFs:
+        # see well_file.RunSaver.
         saver = well_file.RunSaver(
             base_dir, self.save_format,
             um_per_px=self.effective_um_per_px(),
