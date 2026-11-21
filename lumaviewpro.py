@@ -313,7 +313,10 @@ class LumaViewProApp(ExperimentWizardMixin, App):
     save_format = StringProperty('ome-tiff')
     lens_pos_info = StringProperty('')    # work position of the lens in use
     work_at_start_on = BooleanProperty(True)   # raise to it after homing
-    map_flip_x = BooleanProperty(True)    # plate map drawn left-right mirrored
+    # The plate map is drawn as a plate is always drawn: A1 top left. (It
+    # was mirrored by default for a short while, together with the stage
+    # direction; the stage direction was right, the mirrored map was not.)
+    map_flip_x = BooleanProperty(False)
     # Settings are kept per Windows account.
     user_name = StringProperty(os.environ.get('USERNAME') or 'this user')
     settings_path = StringProperty(acq.SETTINGS_PATH)
@@ -4539,7 +4542,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             'zman_order': self.zman_order,
             'panel_widths': self.panel_widths,
             'zman_step': self.zman_step_text,
-            'map_flip_x': bool(self.map_flip_x),
+            'map_mirror': bool(self.map_flip_x),
             'lens_work_z': self.lens_work_z,
             'work_at_start_on': bool(self.work_at_start_on),
             'protocol_optin_v2': True,
@@ -4593,7 +4596,9 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                 if k in self.PANEL_DEFAULT_DP and float(v) > 0}
         except (TypeError, ValueError, AttributeError):
             self.panel_widths = {}
-        self.map_flip_x = bool(d.get('map_flip_x', True))
+        # (a new key: the 'map_flip_x' saved while mirrored was the
+        # default is not read back, so A1 returns to the top left)
+        self.map_flip_x = bool(d.get('map_mirror', False))
         self.work_at_start_on = bool(d.get('work_at_start_on', True))
         try:
             self.lens_work_z = {

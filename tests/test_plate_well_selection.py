@@ -486,3 +486,40 @@ def test_screen_and_plate_coordinates_round_trip_when_mirrored():
     for mm in ((10.0, 12.0), (100.5, 70.25)):
         assert p.w._screen_to_mm(*p.w._mm_to_screen(*mm)) == \
             pytest.approx(mm, abs=1e-6)
+
+
+def test_the_map_is_drawn_with_a1_top_left_unless_asked_otherwise():
+    p = Plate()
+    assert p.w.flip_x is False
+    a1, a12, h1 = p.xy(0, 0), p.xy(0, 11), p.xy(7, 0)
+    assert a1[0] < a12[0], 'column 1 is on the left'
+    assert a1[1] > h1[1], 'row A is at the top'
+
+
+def test_the_calibration_target_is_always_drawn_inside_the_map():
+    p = Plate()
+    w = p.w
+    assert w.target_on_screen() is None
+    target = w._well_center_mm(0, 0)
+    # The whole plate in view: drawn at its own place.
+    w.set_target_plate_mm(target)
+    sx, sy, outside = w.target_on_screen()
+    assert not outside and (sx, sy) == pytest.approx(w._mm_to_screen(*target))
+    # The large map zoomed in on a stage position far from the target:
+    # setting the target zooms out until it is in view.
+    w.set_target_plate_mm(None)
+    far = w._well_center_mm(2, 3)
+    w.set_view(40.0, far)
+    w.set_target_plate_mm(target)
+    assert 1.0 < w.zoom < 40.0
+    assert w.view_center_mm == pytest.approx(far), 'the view stays on the stage'
+    sx, sy, outside = w.target_on_screen()
+    assert not outside
+    assert w.x < sx < w.right and w.y < sy < w.top
+    # Zoomed in again by hand: the target is out of the view, and is drawn
+    # at the rim on the side it lies (A1: up and to the left of C4).
+    w.set_view(40.0, far)
+    sx, sy, outside = w.target_on_screen()
+    assert outside
+    assert w.x < sx < w.center_x and w.center_y < sy < w.top
+    w.redraw()                      # draws without error, arrow included

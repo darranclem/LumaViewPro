@@ -676,9 +676,42 @@ class WellPlateMapWidget(Widget):
             self.redraw()
 
     def set_target_plate_mm(self, plate_mm: tuple[float, float] | None):
-        """Show/clear the guided calibration target (plate top-left origin)."""
+        """Show/clear the guided calibration target (plate top-left origin).
+        A view zoomed in on the stage (the large map) is zoomed out as far
+        as it takes to have the target in it too."""
         self.target_plate_mm = plate_mm
+        if plate_mm is not None:
+            self.keep_in_view(plate_mm)
         self.redraw()
+
+    TARGET_RIM_PX = 26.0       # an out-of-view target is drawn this far in
+
+    def keep_in_view(self, mm: tuple[float, float]):
+        """Zoom out (never in) until the plate point ``mm`` is inside the
+        view, keeping the middle of the view where it is."""
+        if self.zoom <= 1.0 or self.view_center_mm is None \
+                or self.width < 4 * self.TARGET_RIM_PX \
+                or self.height < 4 * self.TARGET_RIM_PX:
+            return
+        sx, sy = self._mm_to_screen(*mm)
+        dx, dy = abs(sx - self.center_x), abs(sy - self.center_y)
+        half_w = self.width / 2.0 - self.TARGET_RIM_PX
+        half_h = self.height / 2.0 - self.TARGET_RIM_PX
+        need = max(dx / half_w, dy / half_h)
+        if need > 1.0:
+            self.set_view(self.zoom / need, self.view_center_mm)
+
+    def target_on_screen(self) -> tuple[float, float, bool] | None:
+        """Where the calibration target is drawn: at its own place, or,
+        when that is outside the view, at the nearest point just inside
+        the rim (third value True: it is then drawn with an arrow)."""
+        if self.target_plate_mm is None:
+            return None
+        sx, sy = self._mm_to_screen(*self.target_plate_mm)
+        m = min(self.TARGET_RIM_PX, self.width / 4.0, self.height / 4.0)
+        cx = min(max(sx, self.x + m), self.right - m)
+        cy = min(max(sy, self.y + m), self.top - m)
+        return cx, cy, (abs(cx - sx) > 0.5 or abs(cy - sy) > 0.5)
 
     def set_position_markers(self, plate_mm_list: list[tuple[float, float]],
                              highlight: int | None = None):
@@ -838,14 +871,30 @@ class WellPlateMapWidget(Widget):
                     Line(points=[sx - 5, sy, sx + 5, sy], width=1.0)
                     Line(points=[sx, sy - 5, sx, sy + 5], width=1.0)
             # Calibration target marker
-            if self.target_plate_mm is not None:
-                sx, sy = self._mm_to_screen(*self.target_plate_mm)
-                Color(1.0, 0.35, 0.25, 1)
-                Line(circle=(sx, sy, 8), width=1.6)
-                Line(points=[sx - 12, sy, sx - 4, sy], width=1.6)
-                Line(points=[sx + 4, sy, sx + 12, sy], width=1.6)
-                Line(points=[sx, sy - 12, sx, sy - 4], width=1.6)
-                Line(points=[sx, sy + 4, sx, sy + 12], width=1.6)
+            # (never out of sight: outside the view it is drawn at the rim
+            # with an arrow toward where it is; a dark edge keeps it
+            # readable over the live image)
+            target = self.target_on_screen()
+            if target is not None:
+                sx, sy, outside = target
+                marks = [[sx - 12, sy, sx - 4, sy], [sx + 4, sy, sx + 12, sy],
+                         [sx, sy - 12, sx, sy - 4], [sx, sy + 4, sx, sy + 12]]
+                if outside:
+                    tx, ty = self._mm_to_screen(*self.target_plate_mm)
+                    d = max(((tx - sx) ** 2 + (ty - sy) ** 2) ** 0.5, 1e-6)
+                    ux, uy = (tx - sx) / d, (ty - sy) / d
+                    tip = (sx + 20 * ux, sy + 20 * uy)
+                    marks.append([sx + 9 * ux, sy + 9 * uy, *tip])
+                    for side in (1.0, -1.0):
+                        marks.append([*tip,
+                                      tip[0] - 7 * ux + side * 5 * uy,
+                                      tip[1] - 7 * uy - side * 5 * ux])
+                for colour, extra in (((0, 0, 0, 0.8), 1.6),
+                                      ((1.0, 0.35, 0.25, 1), 0.0)):
+                    Color(*colour)
+                    Line(circle=(sx, sy, 8), width=1.6 + extra)
+                    for pts in marks:
+                        Line(points=pts, width=1.6 + extra)
             StencilUnUse()
             Rectangle(pos=self.pos, size=self.size)
             StencilPop()

@@ -860,31 +860,35 @@ LumaViewProMainLayout:
                             valign: 'top'
                         FieldRow:
                             FlatButton:
-                                text: 'Calibrate plate'
+                                text: '2 Calibrate plate'
                                 on_press: app.wiz_open_tool('calibrate')
                             FlatButton:
-                                text: 'Autofocus set-up'
+                                text: '3 Autofocus'
                                 on_press: app.wiz_open_tool('autofocus')
                         FieldRow:
                             FlatButton:
-                                text: 'Wells'
+                                text: '4 Wells'
                                 on_press: app.wiz_open_tool('wells')
                             FlatButton:
-                                text: 'Colours'
+                                text: '5 Colours'
                                 on_press: app.wiz_open_tool('channels')
                         FieldRow:
                             FlatButton:
-                                text: 'Positions in wells'
+                                text: '6 Positions in wells'
                                 on_press: app.wiz_open_tool('sampling')
                             FlatButton:
-                                text: 'Focus map'
+                                text: '7 Focus map'
                                 on_press: app.wiz_open_tool('focusmap')
                         FieldRow:
                             FlatButton:
-                                text: 'Z-stack plan, timelapse'
+                                text: '8 Z-stack'
                                 on_press: app.wiz_open_tool('acquire')
+                            AccentButton:
+                                text: '9 Time-lapse'
+                                on_press: app.wiz_open_tool('timelapse')
+                        FieldRow:
                             FlatButton:
-                                text: 'Save and run'
+                                text: '10 Check, save and run'
                                 on_press: app.wiz_open_tool('save')
 
                     Collapsible:
@@ -907,8 +911,8 @@ LumaViewProMainLayout:
                                 on_press: app.open_output_dir()
                         FieldRow:
                             PanelLabel:
-                                text: 'Cycles'
-                                size_hint_x: 0.3
+                                text: 'Timepoints'
+                                size_hint_x: 0.5
                             SmallInput:
                                 id: protocol_cycles_input
                                 text: '1'
@@ -935,7 +939,7 @@ LumaViewProMainLayout:
                             text: 'Save as: ' + app.save_format_label(app.save_format)
                             on_press: app.cycle_save_format()
                         AccentButton:
-                            text: 'Run protocol (timelapse)'
+                            text: 'Run protocol' + ('' if protocol_cycles_input.text.strip() in ('', '0', '1') else ' (time-lapse, %s timepoints)' % protocol_cycles_input.text.strip())
                             on_press: app.run_protocol()
 
                     Collapsible:
@@ -1211,13 +1215,78 @@ LumaViewProMainLayout:
                             Collapsible:
                                 show_header: False
                                 open: app.wiz_active
+                                GridLayout:
+                                    cols: 10
+                                    spacing: '2dp'
+                                    size_hint_y: None
+                                    height: '24dp'
+                                    FlatButton:
+                                        text: '1'
+                                        height: '24dp'
+                                        bold: app.wiz_step == 0
+                                        background_color: ACCENT if app.wiz_step == 0 else PANEL2
+                                        on_press: app.wiz_jump(0)
+                                    FlatButton:
+                                        text: '2'
+                                        height: '24dp'
+                                        bold: app.wiz_step == 1
+                                        background_color: ACCENT if app.wiz_step == 1 else PANEL2
+                                        on_press: app.wiz_jump(1)
+                                    FlatButton:
+                                        text: '3'
+                                        height: '24dp'
+                                        bold: app.wiz_step == 2
+                                        background_color: ACCENT if app.wiz_step == 2 else PANEL2
+                                        on_press: app.wiz_jump(2)
+                                    FlatButton:
+                                        text: '4'
+                                        height: '24dp'
+                                        bold: app.wiz_step == 3
+                                        background_color: ACCENT if app.wiz_step == 3 else PANEL2
+                                        on_press: app.wiz_jump(3)
+                                    FlatButton:
+                                        text: '5'
+                                        height: '24dp'
+                                        bold: app.wiz_step == 4
+                                        background_color: ACCENT if app.wiz_step == 4 else PANEL2
+                                        on_press: app.wiz_jump(4)
+                                    FlatButton:
+                                        text: '6'
+                                        height: '24dp'
+                                        bold: app.wiz_step == 5
+                                        background_color: ACCENT if app.wiz_step == 5 else PANEL2
+                                        on_press: app.wiz_jump(5)
+                                    FlatButton:
+                                        text: '7'
+                                        height: '24dp'
+                                        bold: app.wiz_step == 6
+                                        background_color: ACCENT if app.wiz_step == 6 else PANEL2
+                                        on_press: app.wiz_jump(6)
+                                    FlatButton:
+                                        text: '8'
+                                        height: '24dp'
+                                        bold: app.wiz_step == 7
+                                        background_color: ACCENT if app.wiz_step == 7 else PANEL2
+                                        on_press: app.wiz_jump(7)
+                                    FlatButton:
+                                        text: '9'
+                                        height: '24dp'
+                                        bold: app.wiz_step == 8
+                                        background_color: ACCENT if app.wiz_step == 8 else PANEL2
+                                        on_press: app.wiz_jump(8)
+                                    FlatButton:
+                                        text: '10'
+                                        height: '24dp'
+                                        bold: app.wiz_step == 9
+                                        background_color: ACCENT if app.wiz_step == 9 else PANEL2
+                                        on_press: app.wiz_jump(9)
                                 Label:
                                     text: app.wiz_title
                                     color: (0.3, 0.85, 1.0, 1)
                                     bold: True
-                                    font_size: '13sp'
+                                    font_size: '16sp'
                                     size_hint_y: None
-                                    height: '22dp'
+                                    height: '30dp'
                                     halign: 'left'
                                     valign: 'middle'
                                     text_size: self.size
@@ -1569,7 +1638,7 @@ LumaViewProMainLayout:
                                             disabled: not app.fmap_active
                                             on_press: app.wiz_fmap_cancel()
 
-                                # ---- 8 z-stacks and timelapse
+                                # ---- 8 z-stack
                                 Collapsible:
                                     show_header: False
                                     open: app.wiz_key == 'acquire'
@@ -1681,43 +1750,71 @@ LumaViewProMainLayout:
                                                 text: 'Clear'
                                                 size_hint_x: 0.6
                                                 on_press: app.wiz_clear_optout()
-                                    FieldRow:
-                                        PanelLabel:
-                                            text: 'Timepoints'
-                                        SmallInput:
-                                            id: wiz_cycles
-                                            text: '1'
-                                        PanelLabel:
-                                            text: 'Every (min)'
-                                        SmallInput:
-                                            id: wiz_interval
-                                            text: '5'
-                                    FlatButton:
-                                        text: 'Autofocus during the timelapse: ' + ('ON' if app.af_each_cycle_on else 'off')
-                                        background_color: ACCENT if app.af_each_cycle_on else PANEL2
-                                        on_press: app.af_each_cycle_on = not app.af_each_cycle_on
-                                    FieldRow:
-                                        disabled: not app.af_each_cycle_on
-                                        opacity: 1 if app.af_each_cycle_on else 0.35
-                                        PanelLabel:
-                                            text: 'Autofocus every N timepoints'
-                                            size_hint_x: 2.2
-                                        SmallInput:
-                                            id: wiz_af_every
-                                            text: '1'
+
+                                # ---- 9 time-lapse
+                                Collapsible:
+                                    show_header: False
+                                    open: app.wiz_key == 'timelapse'
+                                    AccentButton:
+                                        text: 'Time-lapse: ' + ('ON' if app.wiz_timelapse_on else 'off (imaged once)')
+                                        height: '32dp'
+                                        background_color: ACCENT if app.wiz_timelapse_on else PANEL2
+                                        on_press: app.wiz_toggle_timelapse()
+                                    BoxLayout:
+                                        orientation: 'vertical'
+                                        size_hint_y: None
+                                        height: self.minimum_height
+                                        spacing: '4dp'
+                                        disabled: not app.wiz_timelapse_on
+                                        opacity: 1 if app.wiz_timelapse_on else 0.35
+                                        FieldRow:
+                                            PanelLabel:
+                                                text: 'Number of timepoints'
+                                                size_hint_x: 2.2
+                                            SmallInput:
+                                                id: wiz_cycles
+                                                text: '1'
+                                                on_text: app.wiz_update_timelapse_text()
+                                        FieldRow:
+                                            PanelLabel:
+                                                text: 'One timepoint every (min)'
+                                                size_hint_x: 2.2
+                                            SmallInput:
+                                                id: wiz_interval
+                                                text: '5'
+                                                on_text: app.wiz_update_timelapse_text()
+                                        FlatButton:
+                                            text: 'Autofocus during the time-lapse: ' + ('ON' if app.af_each_cycle_on else 'off')
+                                            background_color: ACCENT if app.af_each_cycle_on else PANEL2
+                                            on_press: app.af_each_cycle_on = not app.af_each_cycle_on
+                                        FieldRow:
+                                            disabled: not app.af_each_cycle_on
+                                            opacity: 1 if app.af_each_cycle_on else 0.35
+                                            PanelLabel:
+                                                text: 'Autofocus every N timepoints'
+                                                size_hint_x: 2.2
+                                            SmallInput:
+                                                id: wiz_af_every
+                                                text: '1'
+
+                                # ---- 10 save
+                                Collapsible:
+                                    show_header: False
+                                    open: app.wiz_key == 'save'
+                                    PanelLabel:
+                                        text: 'Processing while the experiment runs'
+                                        bold: True
                                     FlatButton:
                                         text: 'Online compositing (all colours of a position in one file): ' + ('ON' if app.compose_on else 'off')
                                         background_color: ACCENT if app.compose_on else PANEL2
                                         on_press: app.toggle_online('compose')
                                     FlatButton:
-                                        text: 'Online stitching (tiles of a well in one image, video of timelapses): ' + ('ON' if app.stitch_on else 'off')
+                                        text: 'Online stitching (tiles of a well in one image, video of time-lapses): ' + ('ON' if app.stitch_on else 'off')
                                         background_color: ACCENT if app.stitch_on else PANEL2
                                         on_press: app.toggle_online('stitch')
-
-                                # ---- 9 save
-                                Collapsible:
-                                    show_header: False
-                                    open: app.wiz_key == 'save'
+                                    PanelLabel:
+                                        text: 'Save'
+                                        bold: True
                                     FieldRow:
                                         PanelLabel:
                                             text: 'Protocol name'

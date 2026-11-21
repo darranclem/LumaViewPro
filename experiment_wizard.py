@@ -28,12 +28,12 @@ CAMERA_PIXEL_UM = 2.0
 
 # (key, title, help)
 WIZARD_STEPS = [
-    ('plate', 'Plate',
+    ('plate', 'Choose the plate',
      'Choose the labware in PLATE NAVIGATOR below. For a single dish or '
      'slide pick that labware. If there is no plate definition at all, '
      'switch "No plate" on: positions are then free points with no well '
      'names.'),
-    ('calibrate', 'Calibrate plate',
+    ('calibrate', 'Calibrate the plate position',
      'Press Start. The stage goes to six rim positions in turn: A1 at 12, '
      '3, 6 and 9 o\'clock, the last well of the first row at 9 o\'clock '
      'and the last well of the first column at 12 o\'clock. Each time, '
@@ -42,7 +42,7 @@ WIZARD_STEPS = [
      'is confirmed the calibration finishes by itself. The navigator '
      'below zooms in on the well and shows the live image on it. '
      '"Next step" without starting keeps the current calibration.'),
-    ('autofocus', 'Autofocus channel and point',
+    ('autofocus', 'Set up autofocus',
      '1. Pick the autofocus channel.  2. Drive to a spot with clear '
      'structure that will stay put.  3. Find focus (coarse) sweeps the '
      'whole range in big steps to find roughly where focus is.  4. Type '
@@ -50,44 +50,49 @@ WIZARD_STEPS = [
      'point here: it keeps this X, Y and Z, and the range is searched '
      'around that Z.  6. Run autofocus to record the sharp position. '
      'Every other focus is stored relative to this result.'),
-    ('wells', 'Wells',
+    ('wells', 'Choose the wells',
      'On the navigator: click a well to switch it on or off, drag a box '
      'to switch a group (start on an on well to switch the group off). '
      'With "No plate" on, drive to each place and press Add position.'),
-    ('channels', 'Colours',
+    ('channels', 'Choose the colours',
      'Switch on every channel to acquire. Set exposure, gain and LED '
      'power per channel in CHANNEL SETTINGS on the left. For lenses with '
      'chromatic focus shift: focus with the autofocus channel and press '
      'Reference = here; then select another channel on the left, refocus '
      'and press Set offset. The offset is applied whenever that channel '
      'is imaged.'),
-    ('sampling', 'What to image in each well',
+    ('sampling', 'Choose what to image in each well',
      'Choose how each selected well is sampled, fill in the numbers for '
      'that choice and press Generate positions. Overlap applies to tiles '
      'and coverage. 100 % coverage overfills the well so all of it is '
      'imaged. Generating again replaces the previous positions.'),
-    ('focusmap', 'Focus map',
+    ('focusmap', 'Set focus across the plate',
      'Choose where focus is set, then press Start. Autofocus runs at the '
      'AF point; the stage then goes to each focus point in turn. Focus by '
      'eye (mouse wheel over the image) or press AF here, then Set focus. '
      'Each focus is stored as an offset from the autofocus result, and '
      'the surface between and beyond the points is interpolated.'),
-    ('acquire', 'Z-stacks and timelapse',
-     'Z-stack: on for every well and colour unless opted out below. '
+    ('acquire', 'Z-stack (optional)',
+     'Switch "Z-stack everywhere" on to image several planes at every '
+     'position, for every well and colour unless opted out below. '
      'Each stack is centered on the position\'s focus and runs from the '
      'top of the range down. The step is suggested from the lens (NA, '
      'wavelength and the image scale, which carries the magnification - '
      'pick the objective in the top bar): 1x sampling steps by one optical '
-     'section, 2.3x is Nyquist, or type your own step. '
-     'Timelapse: how many timepoints and how far '
-     'apart. Autofocus re-runs at the one AF point (every timepoint, or '
+     'section, 2.3x is Nyquist, or type your own step. Leave it off for '
+     'one plane per position.'),
+    ('timelapse', 'Time-lapse (optional)',
+     'Switch "Time-lapse" on to image everything again and again: type '
+     'how many timepoints and how many minutes from the start of one to '
+     'the start of the next. Left off, everything is imaged once. '
+     'Autofocus can re-run at the one AF point (every timepoint, or '
      'every N timepoints); if focus has drifted, the whole focus surface '
-     'moves up or down by that amount, so every position follows. '
+     'moves up or down by that amount, so every position follows.'),
+    ('save', 'Check, save and run',
      'Online compositing and stitching run while the experiment goes on: '
      'a position is composited when all its colours and planes are in, a '
-     'well is stitched when all its tiles are in, and the timelapse video '
-     'is made after the last timepoint. The raw files are always kept.'),
-    ('save', 'Save and run',
+     'well is stitched when all its tiles are in, and the time-lapse video '
+     'is made after the last timepoint. The raw files are always kept. '
      'Check the summary, name the protocol and save it. Files are named '
      'well_tile-or-position_Z_colour_timepoint, for example '
      'B3_TA1_Z001_GREEN_t0001.tiff (T = tile, t = timepoint; Z001 is the '
@@ -105,6 +110,8 @@ class ExperimentWizardMixin:
     wiz_sampling = StringProperty('single')
     wiz_focus_mode = StringProperty('per_well')
     wiz_zstack_on = BooleanProperty(False)
+    wiz_timelapse_on = BooleanProperty(False)
+    wiz_timelapse_text = StringProperty('')
     wiz_rev = NumericProperty(0)          # bumps to refresh channel buttons
     fmap_active = BooleanProperty(False)
     fmap_label = StringProperty('')
@@ -175,6 +182,31 @@ class ExperimentWizardMixin:
         if i < len(WIZARD_STEPS):
             self._wiz_goto(i)
 
+    def wiz_jump(self, index: int):
+        """Go straight to a step from the numbered strip under the title."""
+        index = int(index)
+        if not 0 <= index < len(WIZARD_STEPS) or index == int(self.wiz_step):
+            return
+        if self.cal_active:
+            self._set_status('Finish or cancel the plate calibration first')
+            return
+        if self._wiz_skipped(index):
+            self._set_status(f'{WIZARD_STEPS[index][1]}: not used with '
+                             f'"No plate" on')
+            return
+        if self.wiz_key == 'plate' and not self.objective_name:
+            self._set_status('Select the objective that is on the '
+                             'microscope first: image size, tile spacing '
+                             'and z steps all depend on it')
+            return
+        self._wiz_leave()
+        self._wiz_goto(index)
+
+    def wiz_step_name(self, index: int) -> str:
+        """Title of a step, for the numbered strip."""
+        return WIZARD_STEPS[int(index)][1] if \
+            0 <= int(index) < len(WIZARD_STEPS) else ''
+
     def wiz_prev(self):
         self._wiz_leave()
         i = int(self.wiz_step) - 1
@@ -184,7 +216,7 @@ class ExperimentWizardMixin:
             self._wiz_goto(i)
 
     def _wiz_leave(self):
-        if self.wiz_key == 'acquire':
+        if self.wiz_key in ('acquire', 'timelapse'):
             self.wiz_apply_acquire()
         if self.fmap_active:
             self.wiz_fmap_cancel()
@@ -200,7 +232,7 @@ class ExperimentWizardMixin:
         self.wiz_rev += 1
         self._wiz_refresh_info()
         self.fmap_marks_refresh()
-        if key == 'acquire':
+        if key in ('acquire', 'timelapse'):
             self._wiz_sync_acquire()
 
     def _wiz_refresh_info(self):
@@ -255,6 +287,8 @@ class ExperimentWizardMixin:
                 + f'; {len(self.surface.points)} stored in the focus map')
         elif key == 'acquire':
             self.wiz_info = self._optout_text()
+        elif key == 'timelapse':
+            self.wiz_info = self.wiz_timelapse_text
         elif key == 'save':
             self.wiz_info = self.wiz_summary()
 
@@ -980,8 +1014,11 @@ class ExperimentWizardMixin:
         ov = self.zplan.get('override_um')
         ids.wiz_z_override.text = f'{ov:g}' if ov else ''
         self._wiz_syncing = False
-        ids.wiz_cycles.text = ids.protocol_cycles_input.text
+        cycles = max(int(self._f(ids.protocol_cycles_input.text, 1)), 1)
+        self.wiz_timelapse_on = cycles > 1
+        ids.wiz_cycles.text = str(cycles)
         ids.wiz_interval.text = ids.protocol_interval_input.text
+        self.wiz_update_timelapse_text()
         ids.wiz_af_every.text = str(int(self.af_every_n))
         self.wiz_update_step_hint()
         self._refresh_flagged()
@@ -998,7 +1035,8 @@ class ExperimentWizardMixin:
             cs.zstack.enabled = bool(self.wiz_zstack_on) and ch not in off
             cs.zstack.range_um = self.zplan['range_um']
             cs.zstack.step_um = round(step, 3)
-        cycles = max(int(self._f(ids.wiz_cycles.text, 1)), 1)
+        cycles = max(int(self._f(ids.wiz_cycles.text, 1)), 1) \
+            if self.wiz_timelapse_on else 1
         interval = max(self._f(ids.wiz_interval.text, 5.0), 0.0)
         ids.protocol_cycles_input.text = str(cycles)
         ids.protocol_interval_input.text = f'{interval:g}'
@@ -1006,6 +1044,45 @@ class ExperimentWizardMixin:
         self._set_zmark(False)
         self._sync_channel_fields()
         self._persist()
+
+    # --- time-lapse
+
+    @staticmethod
+    def timelapse_text(on: bool, cycles: int, interval_min: float) -> str:
+        """What the time-lapse settings amount to, in words."""
+        if not on or cycles <= 1:
+            return 'Time-lapse off: everything is imaged once.'
+        total = (cycles - 1) * max(interval_min, 0.0)
+        h, m = int(total // 60), total % 60
+        span = (f'{h} h {m:g} min' if h else f'{m:g} min')
+        if interval_min <= 0:
+            return (f'{cycles} timepoints, one straight after the other '
+                    f'(no waiting).')
+        return (f'{cycles} timepoints, one every {interval_min:g} min: the '
+                f'last one starts {span} after the first. If one timepoint '
+                f'takes longer than {interval_min:g} min, the next starts '
+                f'as soon as it has finished.')
+
+    def wiz_update_timelapse_text(self, *_):
+        if not self.root:
+            return
+        ids = self.root.ids
+        self.wiz_timelapse_text = self.timelapse_text(
+            bool(self.wiz_timelapse_on),
+            max(int(self._f(ids.wiz_cycles.text, 1)), 1),
+            max(self._f(ids.wiz_interval.text, 5.0), 0.0))
+        if self.wiz_key == 'timelapse':
+            self.wiz_info = self.wiz_timelapse_text
+
+    def wiz_toggle_timelapse(self):
+        """Time-lapse on or off; switched on with one timepoint typed, it
+        starts from two."""
+        self.wiz_timelapse_on = not self.wiz_timelapse_on
+        ids = self.root.ids
+        if self.wiz_timelapse_on and \
+                int(self._f(ids.wiz_cycles.text, 1)) < 2:
+            ids.wiz_cycles.text = '2'
+        self.wiz_update_timelapse_text()
 
     # --- opting out of the z-stack
 
@@ -1165,8 +1242,10 @@ class ExperimentWizardMixin:
                 f'Positions: {n_pos}\n'
                 f'Colours: {", ".join(chans) or "NONE SWITCHED ON"}\n'
                 f'Z-stack: {stack}\n'
-                f'Timepoints: {cycles}, every '
-                f'{ids.protocol_interval_input.text} min\n'
+                f'Time-lapse: ' + (
+                    f'{cycles} timepoints, one every '
+                    f'{ids.protocol_interval_input.text} min'
+                    if cycles > 1 else 'off (imaged once)') + '\n'
                 f'Autofocus: {self.af_channel}, AF point {af}, {every}; '
                 f'{surf}\n'
                 f'Online processing: {self._online_text(cycles)}\n'
