@@ -820,6 +820,10 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         f = self.latest_frame
         if f is None or (self.worker_busy and self._mosaic is not None):
             return None
+        # No light on (all channels off, or the end of a scan): the frame
+        # is black, and would cover the preview left on the map there.
+        if self.hw.active_channel is None:
+            return None
         h, w = f.shape[:2]
         return self._image_corners_rel(self.stage_x_um, self.stage_y_um,
                                        w, h, live=True)
