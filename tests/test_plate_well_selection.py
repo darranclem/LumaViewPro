@@ -523,3 +523,20 @@ def test_the_calibration_target_is_always_drawn_inside_the_map():
     assert outside
     assert w.x < sx < w.center_x and w.center_y < sy < w.top
     w.redraw()                      # draws without error, arrow included
+
+
+# ------------------- a double-click on the live image drawn on the map
+
+def test_a_point_on_the_live_image_is_given_as_a_fraction_of_the_image():
+    from plate_navigator import WellPlateMapWidget
+    w = WellPlateMapWidget.__new__(WellPlateMapWidget)
+    # image 2 mm wide, 1 mm high, top-left at (10, 20) on the plate
+    w.live_corners_mm = [(10, 20), (12, 20), (12, 21), (10, 21)]
+    assert w.live_image_fraction(11.0, 20.5) == pytest.approx((0.0, 0.0))
+    assert w.live_image_fraction(11.5, 20.25) == pytest.approx((0.25, -0.25))
+    assert w.live_image_fraction(13.0, 20.5) is None        # beside it
+    # mirrored / turned images: the fraction follows the image, not the map
+    w.live_corners_mm = [(12, 21), (10, 21), (10, 20), (12, 20)]
+    assert w.live_image_fraction(11.5, 20.25) == pytest.approx((-0.25, 0.25))
+    w.live_corners_mm = None
+    assert w.live_image_fraction(11.0, 20.5) is None

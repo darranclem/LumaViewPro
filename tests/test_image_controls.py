@@ -340,3 +340,198 @@ def test_overview_transmitted_light_does_not_drown_fluorescence():
 
 def test_overview_of_nothing_is_none():
     assert acq.overview_rgb({}, _TINTS, {}) is None
+
+
+# --------------------------- double-click centering: never a second move
+
+def test_a_check_frame_from_before_the_move_is_not_corrected():
+    # A 300 px move; the "new" frame still shows the old view, so the spot
+    # is found 300 px off. Correcting that would make the move twice.
+    assert not acq.trim_allowed((-300, 0), (300, 0), 2160, True)
+    assert not acq.trim_allowed((-200, -150), (200, 150), 2160, True)
+
+
+def test_nothing_is_corrected_before_the_stage_has_arrived():
+    assert not acq.trim_allowed((-300, 0), (20, 5), 2160, False)
+
+
+def test_a_small_real_offset_is_trimmed_once():
+    assert acq.trim_allowed((-300, 0), (20, 5), 2160, True)
+    assert acq.trim_allowed((-800, 400), (60, -30), 2160, True)
+    # a short move lost in the drive's backlash is made up
+    assert acq.trim_allowed((-30, 0), (28, 0), 2160, True)
+    # nothing to do within 3 px; too far off to be a trim
+    assert not acq.trim_allowed((-300, 0), (2, 1), 2160, True)
+    assert not acq.trim_allowed((-900, 0), (400, 0), 2160, True)
+
+
+def test_the_image_moving_twice_as_far_as_planned_is_noticed():
+    assert acq.centering_scale((-300, 100), (-600, 200)) == pytest.approx(2.0)
+    assert acq.centering_scale((-300, 100), (-300, 100)) == pytest.approx(1.0)
+    assert acq.centering_scale((-300, 0), (0, 0)) == pytest.approx(0.0)
+    assert acq.centering_scale((0, 0), (5, 5)) is None
+
+
+def test_stage_is_waited_for_until_it_reports_being_at_its_target():
+    import threading
+
+    class Stage:
+        def __init__(self):
+            self.cur = {'X': 0.0, 'Y': 0.0}
+            self.tgt = {'X': 50.0, 'Y': -20.0}
+            self.reads = 0
+
+        def current_pos(self, a):
+            self.reads += 1
+            if self.reads > 6:                 # arrives after a few polls
+                self.cur = dict(self.tgt)
+            return self.cur[a]
+
+        def target_pos(self, a):
+            return self.tgt[a]
+
+    hw = acq.ScopeHW.__new__(acq.ScopeHW)
+    hw.lock = threading.RLock()
+    hw.stage = Stage()
+    hw.stage_ok = lambda: True
+    assert hw.xy_arrived(timeout_s=2.0) is True
+    stuck = Stage()
+    stuck.current_pos = lambda a: 0.0
+    hw.stage = stuck
+    assert hw.xy_arrived(timeout_s=0.1) is False
+
+
+def test_only_a_move_short_enough_to_be_lost_in_backlash_is_made_up_whole():
+    assert acq.trim_allowed((-30, 0), (30, 0), 2160, True, floor_px=33)
+    assert not acq.trim_allowed((-100, -50), (100, 50), 2160, True,
+                                floor_px=33)
+
+
+# ------------------------------------------------ the Autofocus channel
+
+def test_binning_sums_blocks_and_stops_at_full_scale():
+    img = np.arange(16, dtype=np.uint16).reshape(4, 4)
+    out = acq.bin_sum(img, 2)
+    assert out.dtype == np.uint16 and out.shape == (2, 2)
+    assert out.tolist() == [[10, 18], [42, 50]]
+    assert acq.bin_sum(img, 2, top=40).tolist() == [[10, 18], [40, 40]]
+    assert acq.bin_sum(img, 1) is img                  # unbinned: untouched
+    bright = np.full((8, 8), 200, dtype=np.uint8)
+    assert acq.bin_sum(bright, 8).tolist() == [[255]]  # 8 bit: cut at 255
+    odd = np.ones((5, 7), dtype=np.uint16)             # the rest is dropped
+    assert acq.bin_sum(odd, 2).shape == (2, 3)
+
+
+def test_autofocus_channel_is_there_by_default_and_is_not_a_colour():
+    cs = acq.default_channel_settings()
+    assert acq.AF_CHANNEL in cs and acq.AF_CHANNEL not in acq.CHANNELS
+    af = cs[acq.AF_CHANNEL]
+    assert af.enabled and af.source == 'BF' and af.binning in acq.AF_BINNINGS
+    assert all(cs[ch].binning == 1 for ch in acq.CHANNELS)
+
+
+def test_autofocus_channel_lights_the_light_chosen_for_it():
+    led = _Board()
+    hw = acq.ScopeHW(led=led)
+    af = acq.ChannelSettings(led_power=80, source='GREEN', binning=4)
+    hw.set_channel(acq.AF_CHANNEL, af)
+    assert led.sent == ['LEDS_OFF', 'LEDS_ENT', 'LED1_80']
+    assert hw.active_channel == acq.AF_CHANNEL and hw.soft_bin == 4
+    led.sent.clear()
+    af.led_power = 90
+    hw.set_channel(acq.AF_CHANNEL, af)
+    assert led.sent == ['LED1_90']                 # same light: no blink
+    led.sent.clear()
+    af.source = 'BF'                               # another light: the
+    hw.set_channel(acq.AF_CHANNEL, af)             # old one goes off first
+    assert led.sent == ['LEDS_OFF', 'LEDS_ENT', 'LED3_90']
+    hw.set_channel('BF', acq.ChannelSettings(led_power=10))
+    assert hw.soft_bin == 1                        # colours are never binned
+    hw.set_channel(acq.AF_CHANNEL, af)
+    hw.set_channel(None)
+    assert hw.soft_bin == 1
+
+
+def test_frames_are_binned_only_while_the_autofocus_channel_is_lit():
+    class Cam:
+        active = True
+        array = np.full((8, 8), 10, dtype=np.uint16)
+
+        def grab_new_capture(self, timeout):
+            return True, 0.0
+
+        def get_pixel_format(self):
+            return 'Mono12'
+
+        def exposure_t(self, ms):
+            pass
+
+        def gain(self, db):
+            pass
+
+    hw = acq.ScopeHW(camera=Cam())
+    hw.ensure_manual_exposure = lambda: True
+    hw.set_channel(acq.AF_CHANNEL,
+                   acq.ChannelSettings(source='BF', binning=2))
+    f = hw.grab_fresh()
+    assert f.shape == (4, 4) and int(f[0, 0]) == 40
+    Cam.array = np.full((8, 8), 2000, dtype=np.uint16)
+    assert int(hw.grab_fresh()[0, 0]) == 4095      # 12 bit full scale
+    hw.set_channel('BF', acq.ChannelSettings())
+    assert hw.grab_fresh().shape == (8, 8)
+
+
+def test_settings_without_an_autofocus_channel_adopt_the_old_one():
+    old = {'GREEN': {'exposure_ms': 80.0, 'gain_db': 6.0, 'led_power': 300,
+                     'enabled': True}}
+    cs = acq.channel_settings_from_dict(old)
+    acq.adopt_af_channel(cs, 'GREEN', enabled=False)
+    af = cs[acq.AF_CHANNEL]
+    assert (af.source, af.exposure_ms, af.gain_db, af.led_power) == \
+        ('GREEN', 80.0, 6.0, 300)
+    assert af.binning == 1 and af.enabled is False
+    acq.adopt_af_channel(cs, 'nonsense')
+    assert cs[acq.AF_CHANNEL].source == 'BF'
+
+
+def test_autofocus_channel_settings_survive_saving_and_are_checked():
+    cs = acq.default_channel_settings()
+    cs[acq.AF_CHANNEL] = acq.ChannelSettings(
+        exposure_ms=2.0, led_power=400, enabled=False, source='RED',
+        binning=8)
+    back = acq.channel_settings_from_dict(acq.channel_settings_to_dict(cs))
+    af = back[acq.AF_CHANNEL]
+    assert (af.source, af.binning, af.enabled, af.exposure_ms) == \
+        ('RED', 8, False, 2.0)
+    bad = acq.channel_settings_to_dict(cs)
+    bad[acq.AF_CHANNEL].update(source='UV', binning=3, z_offset_um=7.0)
+    bad[acq.AF_CHANNEL]['zstack']['enabled'] = True
+    af = acq.channel_settings_from_dict(bad)[acq.AF_CHANNEL]
+    assert (af.source, af.binning, af.z_offset_um, af.zstack.enabled) == \
+        ('BF', 1, 0.0, False)
+
+
+def test_autofocus_scores_by_the_light_not_by_the_channel_name():
+    assert acq.led_channel('GREEN', None) == 'GREEN'
+    assert acq.led_channel(acq.AF_CHANNEL,
+                           acq.ChannelSettings(source='RED')) == 'RED'
+    assert acq.led_channel(acq.AF_CHANNEL, acq.ChannelSettings()) == 'BF'
+
+
+def test_imaged_colours_share_one_binning_and_autofocus_keeps_its_own():
+    cs = acq.default_channel_settings()
+    af_bin = cs[acq.AF_CHANNEL].binning
+    assert acq.set_imaging_binning(cs, 4) == 4
+    assert {cs[ch].binning for ch in acq.CHANNELS} == {4}
+    assert cs[acq.AF_CHANNEL].binning == af_bin        # independent
+    assert acq.set_imaging_binning(cs, 3) == 1         # not a binning
+    cs[acq.AF_CHANNEL].binning = 8
+    acq.set_imaging_binning(cs, 2)
+    back = acq.channel_settings_from_dict(acq.channel_settings_to_dict(cs))
+    assert acq.imaging_binning(back) == 2
+    assert back[acq.AF_CHANNEL].binning == 8
+    # A file in which the colours disagree: they all take the first one's.
+    d = acq.channel_settings_to_dict(cs)
+    d['RED']['binning'] = 8
+    mixed = acq.channel_settings_from_dict(d)
+    assert {mixed[ch].binning for ch in acq.CHANNELS} == {2}

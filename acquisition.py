@@ -44,6 +44,12 @@ except Exception:  # pragma: no cover
 # Channels with an LED (official Etaluma designations / board indices).
 CHANNELS = ['BF', 'PC', 'DF', 'BLUE', 'GREEN', 'RED']
 LED_CHANNEL_MAP = {'BLUE': 0, 'GREEN': 1, 'RED': 2, 'BF': 3, 'PC': 4, 'DF': 5}
+# The Autofocus channel: not a light of its own and never imaged. It is
+# the ONE channel autofocus runs in, with its own light (any of CHANNELS),
+# exposure, gain, LED current and binning, so that it can be bright,
+# binned and short whatever the imaged colours need.
+AF_CHANNEL = 'AF'
+AF_BINNINGS = (1, 2, 4, 8)
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 # The settings file that lives with the program: the starting point for a
@@ -110,6 +116,75 @@ class ChannelSettings:
     enabled: bool = False      # include in protocols - must be actively set
     z_offset_um: float = 0.0   # chromatic aberration compensation
     zstack: ZStackConfig = field(default_factory=ZStackConfig)
+    # The Autofocus channel only: which light it uses, and how many
+    # pixels a side are summed into one (1, 2, 4 or 8).
+    source: str = ''
+    binning: int = 1
+
+
+def led_channel(channel: str, settings: ChannelSettings | None) -> str:
+    """The light a channel is lit with: itself, or for the Autofocus
+    channel the light chosen for it."""
+    if channel != AF_CHANNEL:
+        return channel
+    src = getattr(settings, 'source', '') if settings is not None else ''
+    return src if src in CHANNELS else 'BF'
+
+
+def bin_sum(img: np.ndarray, n: int, top: int | None = None) -> np.ndarray:
+    """``img`` with every ``n`` x ``n`` block of pixels summed into one
+    (the sum is cut off at ``top``, the camera's full scale, or at what
+    the data type holds). Four pixels summed are four times as bright, so
+    the exposure can be a quarter as long for the same picture."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return img
+    if img is None or n <= 1 or getattr(img, 'ndim', 0) != 2:
+        return img
+    h, w = (img.shape[0] // n) * n, (img.shape[1] // n) * n
+    if h == 0 or w == 0:
+        return img
+    s = img[:h, :w].reshape(h // n, n, w // n, n).sum(axis=(1, 3),
+                                                      dtype=np.uint32)
+    if np.issubdtype(img.dtype, np.integer):
+        full = int(np.iinfo(img.dtype).max)
+        top = full if top is None else min(int(top), full)
+        return np.minimum(s, top).astype(img.dtype)
+    return s.astype(img.dtype)
+
+
+def imaging_binning(cs: dict) -> int:
+    """The binning of the imaged colours (one value for all of them)."""
+    b = getattr(cs.get(CHANNELS[0]), 'binning', 1)
+    return b if b in AF_BINNINGS else 1
+
+
+def set_imaging_binning(cs: dict, n: int) -> int:
+    """Every imaged colour gets the same binning, so that all the images
+    of a protocol have one size and one pixel size. The Autofocus channel
+    keeps its own. Returns the binning set."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        n = 1
+    n = n if n in AF_BINNINGS else 1
+    for ch in CHANNELS:
+        if ch in cs:
+            cs[ch].binning = n
+    return n
+
+
+def adopt_af_channel(cs: dict, source: str, enabled: bool = True) -> None:
+    """Settings saved before there was an Autofocus channel: it takes the
+    light, exposure, gain and LED current of the colour autofocus ran in
+    (unbinned), so autofocus behaves as it did."""
+    source = source if source in CHANNELS else 'BF'
+    src = cs.get(source) or ChannelSettings()
+    cs[AF_CHANNEL] = ChannelSettings(
+        exposure_ms=src.exposure_ms, gain_db=src.gain_db,
+        led_power=src.led_power, enabled=bool(enabled),
+        source=source, binning=1)
 
 
 def default_channel_settings() -> dict[str, ChannelSettings]:
@@ -120,6 +195,8 @@ def default_channel_settings() -> dict[str, ChannelSettings]:
         'BLUE': ChannelSettings(exposure_ms=100.0, led_power=100),
         'GREEN': ChannelSettings(exposure_ms=100.0, led_power=100),
         'RED': ChannelSettings(exposure_ms=100.0, led_power=100),
+        AF_CHANNEL: ChannelSettings(exposure_ms=5.0, led_power=100,
+                                    enabled=True, source='BF', binning=2),
     }
     return defaults
 
@@ -230,6 +307,11 @@ class ScopeHW:
         self.stage = stage
         self.lock = threading.RLock()
         self.active_channel: str | None = None
+        self.active_led: str | None = None     # the light that is on
+        # Frames are handed out with soft_bin x soft_bin pixels summed
+        # into one (the Autofocus channel's binning; 1 for every colour).
+        self.soft_bin: int = 1
+        self.soft_bin_top: int | None = None   # full scale of the camera
 
     # ------------------------------------------------------------- LEDs
 
@@ -241,14 +323,20 @@ class ScopeHW:
                 except Exception:
                     pass
             self.active_channel = None
+            self.active_led = None
+            self.soft_bin = 1
 
-    def led_on(self, channel: str, power: int) -> None:
+    def led_on(self, channel: str, power: int,
+               source: str | None = None) -> None:
+        """``source``: the light to use when the channel is not a light
+        itself (the Autofocus channel)."""
         with self.lock:
             if self.led is None or not getattr(self.led, 'driver', False):
                 return
-            idx = LED_CHANNEL_MAP.get(channel, 3)
+            light = source or channel
+            idx = LED_CHANNEL_MAP.get(light, 3)
             try:
-                if channel != self.active_channel:
+                if channel != self.active_channel or light != self.active_led:
                     # Switching channel: everything else off first.
                     self.led.exchange_command('LEDS_OFF')
                     self.led.exchange_command('LEDS_ENT')
@@ -256,8 +344,10 @@ class ScopeHW:
                 # current - no off/on flash between steps.
                 self.led.exchange_command(f'LED{idx}_{int(round(power))}')
                 self.active_channel = channel
+                self.active_led = light
             except Exception:
                 self.active_channel = None   # unknown state: resync next time
+                self.active_led = None
 
     # ----------------------------------------------------------- camera
 
@@ -355,7 +445,13 @@ class ScopeHW:
                 return
             if settings is not None:
                 self.apply_camera_settings(settings)
-            self.led_on(channel, settings.led_power if settings else 50)
+            n = getattr(settings, 'binning', 1) if settings is not None else 1
+            n = n if n in AF_BINNINGS else 1
+            if n > 1:
+                self.soft_bin_top = saturation_level(self.significant_bits())
+            self.soft_bin = n
+            self.led_on(channel, settings.led_power if settings else 50,
+                        source=led_channel(channel, settings))
             if self.led is None or not getattr(self.led, 'driver', False):
                 self.active_channel = channel   # no LED board: track anyway
 
@@ -375,6 +471,9 @@ class ScopeHW:
             return None
         arr = getattr(cam, 'array', None)
         if isinstance(arr, np.ndarray) and arr.size > 0:
+            n = getattr(self, 'soft_bin', 1)
+            if n > 1:
+                return bin_sum(arr, n, getattr(self, 'soft_bin_top', None))
             return arr.copy()
         return None
 
@@ -455,6 +554,28 @@ class ScopeHW:
         if wait:
             self._wait_axis('X')
             self._wait_axis('Y')
+
+    def xy_arrived(self, tol_um: float = 1.0, timeout_s: float = 10.0) -> bool:
+        """Wait until the stage itself reports X and Y at their targets
+        (actual position against target, not only the status flag, which
+        can still say "arrived" for an instant after a new target is
+        written). True when it got there."""
+        deadline = time.time() + timeout_s
+        while True:
+            try:
+                with self.lock:
+                    if not self.stage_ok():
+                        return False
+                    off = max(abs(float(self.stage.current_pos(a))
+                                  - float(self.stage.target_pos(a)))
+                              for a in ('X', 'Y'))
+            except Exception:
+                return False
+            if off <= tol_um:
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.03)
 
     def move_z(self, z_um: float, wait: bool = True) -> None:
         with self.lock:
@@ -842,7 +963,8 @@ def autofocus_sweep(hw: ScopeHW, cfg: AutofocusConfig,
     if hi - lo < 1e-6:
         hw.move_z(mid)
         return mid, False
-    mode = 'fluor' if cfg.channel in FLUOR_CHANNELS else 'transmitted'
+    mode = 'fluor' if led_channel(cfg.channel, settings) in FLUOR_CHANNELS \
+        else 'transmitted'
     coarse_scorer = lambda f: focus_metric(f, mode)
     if high_stability and template is not None:
         fine_scorer = lambda f: template_score(f, template)
@@ -1916,6 +2038,33 @@ def measure_image_shift(img_a: np.ndarray, img_b: np.ndarray,
     return sx * f, sy * f, float(resp)
 
 
+def centering_scale(planned_px, measured_px) -> float | None:
+    """How far the image moved along the planned shift, as a fraction of
+    it: 1 = as planned, 2 = twice as far (the pixel-to-stage calibration
+    is not that of the lens in use), 0 = not at all. None for no plan."""
+    px, py = float(planned_px[0]), float(planned_px[1])
+    n2 = px * px + py * py
+    if n2 < 1e-9:
+        return None
+    return (float(measured_px[0]) * px + float(measured_px[1]) * py) / n2
+
+
+def trim_allowed(planned_px, resid_px, frame_min_px: float,
+                 arrived: bool, floor_px: float = 40.0) -> bool:
+    """Whether the offset still measured after a centering move may be
+    corrected with one small move. Not when the stage had not arrived
+    when the check frame was taken, and not when the offset is the move
+    itself over again and the move was a long one: then the frame shows
+    the view from before the move, and "correcting" it would make the
+    move a second time. A move shorter than ``floor_px`` can be lost
+    whole in the drive's backlash, so there the full offset is made up."""
+    err = math.hypot(float(resid_px[0]), float(resid_px[1]))
+    move = math.hypot(float(planned_px[0]), float(planned_px[1]))
+    if not arrived or not 3.0 < err < 0.12 * frame_min_px:
+        return False
+    return err <= max(0.6 * move, float(floor_px))
+
+
 def locate_patch(img_a: np.ndarray, point_xy: tuple[float, float],
                  img_b: np.ndarray, expected_xy: tuple[float, float],
                  patch_px: int = 96, search_frac: float = 0.15,
@@ -2318,4 +2467,18 @@ def channel_settings_from_dict(d: dict) -> dict[str, ChannelSettings]:
                 step_um=float(z.get('step_um', 5.0)),
             ),
         )
+        try:
+            b = int(v.get('binning', 1))
+        except (TypeError, ValueError):
+            b = 1
+        out[ch].binning = b if b in AF_BINNINGS else 1
+        if ch == AF_CHANNEL:
+            # Never imaged: no stack, no colour offset; its own light.
+            a = out[ch]
+            a.z_offset_um = 0.0
+            a.zstack.enabled = False
+            a.source = v.get('source') if v.get('source') in CHANNELS \
+                else 'BF'
+    # One binning for all the imaged colours.
+    set_imaging_binning(out, imaging_binning(out))
     return out

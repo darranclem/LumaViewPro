@@ -35,9 +35,9 @@
             pos: self.center_x - dp(1.5), self.center_y + dp(10)
             size: dp(3), dp(3)
 
-# A channel button with its two marks underneath: P (green) when the
-# colour is imaged in protocols, AF (amber) on the autofocus colour.
-# Pressing a mark changes it.
+# A channel button with its mark underneath: P (green) when the channel
+# is in protocols (a colour: imaged; the Autofocus channel: autofocus
+# runs once per timepoint). Pressing the mark changes it.
 <ChannelCell@BoxLayout>:
     channel: ''
     label: ''
@@ -64,14 +64,6 @@
             color: (0.05, 0.05, 0.05, 1) if root.channel in app.marked_channels else (0.45, 0.45, 0.48, 1)
             background_color: (0.3, 0.85, 0.35, 1) if root.channel in app.marked_channels else (0.13, 0.13, 0.15, 1)
             on_press: app.toggle_channel_protocol(root.channel)
-        FlatButton:
-            text: 'AF'
-            bold: True
-            font_size: '10sp'
-            height: '16dp'
-            color: (0.05, 0.05, 0.05, 1) if app.af_channel == root.channel else (0.45, 0.45, 0.48, 1)
-            background_color: (1.0, 0.72, 0.1, 1) if app.af_channel == root.channel else (0.13, 0.13, 0.15, 1)
-            on_press: app.set_af_channel_to(root.channel)
 
 <AccentButton@FlatButton>:
     background_color: ACCENT
@@ -205,19 +197,6 @@ LumaViewProMainLayout:
             text: app.bit_depth
             values: app.bit_depth_options
             on_text: app.set_bit_depth(self.text)
-        Label:
-            text: 'Bin:'
-            color: TXT_DIM
-            font_size: '12sp'
-            size_hint_x: None
-            width: '28dp'
-        DarkSpinner:
-            id: binning_spinner
-            size_hint_x: None
-            width: '48dp'
-            text: app.binning
-            values: ['1', '2', '3', '4']
-            on_text: app.binning = self.text; app.set_binning(self.text)
         FlatButton:
             text: 'Crosshair: ' + ('ON' if app.crosshair_on else 'off')
             size_hint_x: None
@@ -342,9 +321,12 @@ LumaViewProMainLayout:
                                 channel: 'RED'
                                 label: 'Red'
                                 tint: (1.0, 0.4, 0.3, 1)
-                            Widget:
+                            ChannelCell:
+                                channel: 'AF'
+                                label: 'AF'
+                                tint: (1.0, 0.72, 0.1, 1)
                         PanelLabel:
-                            text: 'P: imaged in protocols, stacks and scans.  AF: autofocus runs in this colour.'
+                            text: 'P: in protocols.  AF = Autofocus channel: focuses once per timepoint.'
                             font_size: '9sp'
                             height: '13dp'
                         WrapLabel:
@@ -352,8 +334,54 @@ LumaViewProMainLayout:
                             color: (0.3, 0.85, 1.0, 1)
 
                     Collapsible:
-                        title: 'CHANNEL SETTINGS'
+                        id: channel_panel
+                        title: 'AUTOFOCUS CHANNEL SETTINGS' if app.selected_channel == 'AF' else 'CHANNEL SETTINGS: ' + app.selected_channel
                         open: True
+                        # ---- only while the Autofocus channel is the one shown
+                        Collapsible:
+                            show_header: False
+                            open: app.selected_channel == 'AF'
+                            PanelLabel:
+                                text: 'Everything below is the AUTOFOCUS channel. Its light:'
+                                color: (1.0, 0.72, 0.1, 1)
+                            GridLayout:
+                                cols: 6
+                                spacing: '2dp'
+                                size_hint_y: None
+                                height: '26dp'
+                                FlatButton:
+                                    text: 'BF'
+                                    background_color: (1.0, 0.72, 0.1, 1) if app.af_source == 'BF' else PANEL2
+                                    color: (0.05, 0.05, 0.05, 1) if app.af_source == 'BF' else TXT
+                                    on_press: app.set_af_source('BF', True)
+                                FlatButton:
+                                    text: 'PC'
+                                    background_color: (1.0, 0.72, 0.1, 1) if app.af_source == 'PC' else PANEL2
+                                    color: (0.05, 0.05, 0.05, 1) if app.af_source == 'PC' else TXT
+                                    on_press: app.set_af_source('PC', True)
+                                FlatButton:
+                                    text: 'DF'
+                                    background_color: (1.0, 0.72, 0.1, 1) if app.af_source == 'DF' else PANEL2
+                                    color: (0.05, 0.05, 0.05, 1) if app.af_source == 'DF' else TXT
+                                    on_press: app.set_af_source('DF', True)
+                                FlatButton:
+                                    text: 'Blue'
+                                    background_color: (1.0, 0.72, 0.1, 1) if app.af_source == 'BLUE' else PANEL2
+                                    color: (0.05, 0.05, 0.05, 1) if app.af_source == 'BLUE' else TXT
+                                    on_press: app.set_af_source('BLUE', True)
+                                FlatButton:
+                                    text: 'Grn'
+                                    background_color: (1.0, 0.72, 0.1, 1) if app.af_source == 'GREEN' else PANEL2
+                                    color: (0.05, 0.05, 0.05, 1) if app.af_source == 'GREEN' else TXT
+                                    on_press: app.set_af_source('GREEN', True)
+                                FlatButton:
+                                    text: 'Red'
+                                    background_color: (1.0, 0.72, 0.1, 1) if app.af_source == 'RED' else PANEL2
+                                    color: (0.05, 0.05, 0.05, 1) if app.af_source == 'RED' else TXT
+                                    on_press: app.set_af_source('RED', True)
+                            FlatButton:
+                                text: 'Start from the ' + app.af_source + ' colour (exposure, gain, LED)'
+                                on_press: app.af_take_from_light()
                         FieldRow:
                             PanelLabel:
                                 text: 'Channel'
@@ -363,6 +391,15 @@ LumaViewProMainLayout:
                                 text: app.selected_channel
                                 values: ['BF', 'PC', 'DF', 'BLUE', 'GREEN', 'RED']
                                 on_text: app.select_channel(self.text)
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Binning (Autofocus only)' if app.selected_channel == 'AF' else 'Binning (all imaged colours)'
+                                size_hint_x: 0.7
+                            DarkSpinner:
+                                id: binning_spinner
+                                text: app.af_binning_text if app.selected_channel == 'AF' else ((app.binning + 'x' + app.binning) if app.binning else '')
+                                values: ['1x1', '2x2', '4x4', '8x8']
+                                on_text: app.set_panel_binning(self.text)
                         FieldRow:
                             PanelLabel:
                                 text: 'Exposure (ms)'
@@ -471,21 +508,13 @@ LumaViewProMainLayout:
                                 text: '0'
                         FieldRow:
                             PanelLabel:
-                                text: 'Use in protocol'
+                                text: 'Autofocus in protocol (once per timepoint)' if app.selected_channel == 'AF' else 'Use in protocol'
                                 size_hint_x: 0.75
                             CheckBox:
                                 id: channel_enabled_chk
                                 active: False
                                 on_active: app.set_channel_enabled(self.active)
                                 size_hint_x: 0.25
-                        FieldRow:
-                            PanelLabel:
-                                text: 'AF channel (only one)'
-                                size_hint_x: 0.75
-                            CheckBox:
-                                id: af_channel_chk
-                                size_hint_x: 0.25
-                                on_active: app.set_af_channel(self.active)
                         AccentButton:
                             text: 'Apply channel settings'
                             on_press: app.apply_channel_fields()
@@ -558,7 +587,13 @@ LumaViewProMainLayout:
                                 on_press: app.coarse_af(True)
 
                     Collapsible:
+                        id: af_panel
                         title: 'AUTOFOCUS'
+                        FlatButton:
+                            text: 'Autofocus channel is live (settings: top of this column)' if app.live_channel == 'AF' else 'Show the Autofocus channel and its settings'
+                            background_color: ACCENT if app.live_channel == 'AF' else PANEL2
+                            disabled: app.worker_busy
+                            on_press: app.show_af_channel()
                         PanelLabel:
                             text: 'Range and interval; searched around the AF point Z'
                         FieldRow:
@@ -1376,15 +1411,11 @@ LumaViewProMainLayout:
                                 Collapsible:
                                     show_header: False
                                     open: app.wiz_key == 'autofocus'
-                                    FieldRow:
-                                        height: '28dp'
-                                        PanelLabel:
-                                            text: 'Autofocus channel'
-                                            size_hint_x: 0.6
-                                        DarkSpinner:
-                                            text: app.af_channel
-                                            values: ['BF', 'PC', 'DF', 'BLUE', 'GREEN', 'RED']
-                                            on_text: app.wiz_set_af_channel(self.text)
+                                    FlatButton:
+                                        text: 'Show the Autofocus channel; set it in Channel settings (left)'
+                                        background_color: ACCENT if app.live_channel == 'AF' else PANEL2
+                                        disabled: app.worker_busy
+                                        on_press: app.show_af_channel()
                                     PanelLabel:
                                         text: 'Coarse search: from / to / step (um)'
                                     FieldRow:

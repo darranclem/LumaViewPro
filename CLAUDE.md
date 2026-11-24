@@ -41,6 +41,8 @@ The custom app is a handful of top-level files; most work happens here:
 - `park_guard.py`: separate process started by the app once the real stage is connected; if the app ends without parking (crash, killed), it lowers the objective, confirms it is down, then centers the stage. `ScopeHW.park()` uses the same routine.
 - `image_utils.py`, `luma_sim.py`, `hw_debug.py`
 
+Autofocus runs in a channel of its own, `acq.AF_CHANNEL` ('AF'): a `ChannelSettings` entry beside the six colours (`acq.CHANNELS` stays the imaged colours) with its own light (`source`, any colour), exposure, gain, LED current and `binning` (1, 2, 4, 8). Its `enabled` (P under the AF button) is whether a protocol autofocuses, once per timepoint at the one AF point; the focus map and all positions are offsets from what it finds. The binning is done in software (`acq.bin_sum`, pixels summed, in `ScopeHW.grab_fresh` and the live view while `hw.soft_bin > 1`): the camera is not reconfigured, so the two binnings are independent. The imaged colours share ONE binning (`acq.set_imaging_binning`, the "Binning (all imaged colours)" list in Channel settings; `effective_um_per_px()` includes it), done the same way; the old camera-side "Bin:" list in the top bar is gone. It is set in the Channel settings panel like a colour (owner's wish, 2026-11-23: no separate box): showing it live selects it there, the panel's exposure, gain, LED, binning and "in protocol" are then its own, and a row of buttons chooses its light.
+
 `modules/`, `drivers/`, `ui/`, `rest/`, `scripts/` and most of `tests/` come from upstream LumaViewPro. Avoid editing them unless the task is about them.
 
 ## Stitching and shading by Quark

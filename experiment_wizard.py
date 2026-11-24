@@ -259,7 +259,9 @@ class ExperimentWizardMixin:
                 anchor = (f'at X {s.anchor_xy[0] / 1000:.2f}, Y '
                           f'{s.anchor_xy[1] / 1000:.2f} mm, Z '
                           f'{s.anchor_z:.1f} um')
-            self.wiz_info = (f'Channel {self.af_channel}. AF point {anchor}. '
+            self.wiz_info = (f'Autofocus channel: {self.af_channel_text()}'
+                             f'{"" if self._af_cs().enabled else " (NOT in the protocol)"}'
+                             f'. AF point {anchor}. '
                              f'Autofocus {ref}. Fine range '
                              f'{self.af_config.z_bottom_um:.0f} to '
                              f'{self.af_config.z_top_um:.0f} um, step '
@@ -307,15 +309,10 @@ class ExperimentWizardMixin:
 
     # -------------------------------------------------------- autofocus
 
-    def wiz_set_af_channel(self, channel: str):
-        if channel not in CHANNELS:
-            return
-        self.af_channel = channel
-        self.af_config.channel = channel
-        self.surface.anchor_channel = channel
-        self.select_channel(channel)
-        self._persist()
-        self._wiz_refresh_info()
+    def wiz_af_changed(self):
+        """The Autofocus channel's light or binning was chosen here."""
+        if self.root:
+            self._wiz_refresh_info()
 
     def _wiz_fine_window(self, center_z: float):
         ids = self.root.ids
@@ -468,10 +465,9 @@ class ExperimentWizardMixin:
         self._wiz_refresh_info()
 
     def wiz_offset_reference_here(self):
-        """The current Z is where the autofocus channel is sharp."""
-        self._wiz_ref_z = (self.stage_z_um
-                           - self.channel_settings[self.af_channel].z_offset_um)
-        self._set_status(f'Reference focus ({self.af_channel}) = '
+        """The current Z is where the Autofocus channel is sharp."""
+        self._wiz_ref_z = self.stage_z_um
+        self._set_status(f'Reference focus (Autofocus channel) = '
                          f'{self.stage_z_um:.1f} um. Now select another '
                          f'channel, refocus and press Set offset.')
 
@@ -482,6 +478,10 @@ class ExperimentWizardMixin:
                              'channel in focus first')
             return
         ch = self.selected_channel
+        if ch not in CHANNELS:
+            self._set_status('Select the colour to set the offset for: the '
+                             'Autofocus channel is the reference itself')
+            return
         self.channel_settings[ch].z_offset_um = round(self.stage_z_um - ref, 2)
         self.use_z_offsets_on = True
         self._sync_channel_fields()
@@ -489,7 +489,7 @@ class ExperimentWizardMixin:
         self._wiz_refresh_info()
         self._set_status(f'{ch} focus offset = '
                          f'{self.channel_settings[ch].z_offset_um:+.1f} um '
-                         f'relative to {self.af_channel}')
+                         f'relative to the Autofocus channel')
 
     # --------------------------------------------------------- sampling
 
@@ -961,7 +961,7 @@ class ExperimentWizardMixin:
         stacked, so no colour is undersampled) divided by the sampling
         rate, unless a step was typed in."""
         na = self._wiz_na()
-        chans = self._wiz_stack_channels() or [self.af_channel]
+        chans = self._wiz_stack_channels() or [self.af_source]
         # Camera pixel projected into the sample = the image scale, which
         # already contains the magnification (and the binning).
         scale = self.effective_um_per_px()
@@ -1002,10 +1002,11 @@ class ExperimentWizardMixin:
 
     def _wiz_sync_acquire(self):
         ids = self.root.ids
-        on = [cs for cs in self.channel_settings.values() if cs.enabled]
+        colours = [self.channel_settings[ch] for ch in CHANNELS]
+        on = [cs for cs in colours if cs.enabled]
         stacked = [cs for cs in on if cs.zstack.enabled]
         self.wiz_zstack_on = bool(self.zplan.get('on', bool(stacked)))
-        src = (stacked or on or list(self.channel_settings.values()))[0]
+        src = (stacked or on or colours)[0]
         na = self._wiz_na()
         self._wiz_syncing = True
         ids.wiz_z_range.text = f"{self.zplan.get('range_um') or src.zstack.range_um:g}"
@@ -1031,7 +1032,8 @@ class ExperimentWizardMixin:
         step, _ = self.wiz_stack_step()
         self.zplan['on'] = bool(self.wiz_zstack_on)
         off = self.zplan.get('channels_off') or []
-        for ch, cs in self.channel_settings.items():
+        for ch in CHANNELS:      # (the Autofocus channel is never imaged)
+            cs = self.channel_settings[ch]
             cs.zstack.enabled = bool(self.wiz_zstack_on) and ch not in off
             cs.zstack.range_um = self.zplan['range_um']
             cs.zstack.step_um = round(step, 3)
@@ -1246,7 +1248,8 @@ class ExperimentWizardMixin:
                     f'{cycles} timepoints, one every '
                     f'{ids.protocol_interval_input.text} min'
                     if cycles > 1 else 'off (imaged once)') + '\n'
-                f'Autofocus: {self.af_channel}, AF point {af}, {every}; '
+                f'Autofocus: {self.af_channel_text()}, AF point {af}, '
+                f'{every}; '
                 f'{surf}\n'
                 f'Online processing: {self._online_text(cycles)}\n'
                 f'Images in total: {images}')

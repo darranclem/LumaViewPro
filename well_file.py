@@ -49,6 +49,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import gzip
 from xml.sax.saxutils import quoteattr
 
@@ -478,7 +479,16 @@ class WellWriter:
             tmp = path + '.tmp'
             with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(value, f, separators=(',', ':'))
-            os.replace(tmp, path)
+            # Windows can refuse the swap for a moment while another
+            # program (virus scanner, indexer) has the file open.
+            for attempt in range(20):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except PermissionError:
+                    if attempt == 19:
+                        raise
+                    time.sleep(0.05)
 
         dtype = '|u1' if self.dtype == np.uint8 else '<u2'
         doc = self._index_doc()

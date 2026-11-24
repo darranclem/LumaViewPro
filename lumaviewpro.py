@@ -115,9 +115,12 @@ from experiment_wizard import ExperimentWizardMixin
 # LED current ceiling for the sliders/fields (mA).
 LED_MAX_MA = 600
 import labware_defs
-from acquisition import (CHANNELS, LED_CHANNEL_MAP, ChannelSettings,
+from acquisition import (CHANNELS, AF_CHANNEL, ChannelSettings,
                          AutofocusConfig, ScopeHW, FocusSurface,
                          ShadingCorrector, AcquisitionWorker, PlateCalibration)
+
+# What can be live: the colours and the Autofocus channel.
+LIVE_CHANNELS = CHANNELS + [AF_CHANNEL]
 
 Factory.register('ZoomPanCameraWidget', cls=plate_navigator.ZoomPanCameraWidget)
 Factory.register('WellPlateMapWidget', cls=plate_navigator.WellPlateMapWidget)
@@ -272,7 +275,11 @@ class LumaViewProApp(ExperimentWizardMixin, App):
     selected_well_str = StringProperty('--')
     live_channel = StringProperty('OFF')
     selected_channel = StringProperty('BF')
-    af_channel = StringProperty('BF')   # the ONE channel used for autofocus
+    # Autofocus runs in the Autofocus channel, always (acq.AF_CHANNEL):
+    # a channel of its own with its light, exposure and binning.
+    af_channel = StringProperty(AF_CHANNEL)
+    af_source = StringProperty('BF')        # its light, for the spinners
+    af_binning_text = StringProperty('2x2')  # its binning, for the spinners
     bit_depth_options = ListProperty(['8-bit'])
     bit_depth = StringProperty('8-bit')
     binning = StringProperty('1')
@@ -436,6 +443,10 @@ class LumaViewProApp(ExperimentWizardMixin, App):
     def on_start(self):
         from kivy.core.window import Window
         Window.maximize()
+        # In front of everything else when it opens: at once, and again
+        # after the other start-up work (which can take the focus away).
+        for delay in (0.3, 1.5, 4.0):
+            Clock.schedule_once(self._bring_to_front, delay)
         self.root_widget = self.root
         viewport = self.root.ids.get('main_camera_viewport')
         if viewport:
@@ -445,6 +456,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         if plate:
             plate.on_well_double_click = self.on_well_double_click
             plate.on_point_double_click = self.on_plate_point_double_click
+            plate.on_live_double_click = self.on_live_double_click
             plate.on_well_selected = self.on_well_selected
             plate.on_wells_toggle = self.on_wells_toggled
             plate.on_focus_scroll = self.on_focus_scroll
@@ -470,6 +482,66 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         threading.Thread(target=self._position_poller, daemon=True).start()
         from kivy.core.window import Window
         Window.bind(on_key_down=self._on_key_down, on_key_up=self._on_key_up)
+
+    def _bring_to_front(self, *_):
+        """Put the application window above every other window and give
+        it the keyboard. It is not kept on top afterwards."""
+        from kivy.core.window import Window
+        try:
+            Window.raise_window()
+        except Exception:
+            pass
+        if os.name != 'nt':
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u = ctypes.windll.user32
+            k = ctypes.windll.kernel32
+            hwnd = None
+            try:
+                hwnd = Window.get_window_info().window
+            except Exception:
+                pass
+            if not hwnd:
+                return
+            hwnd = wintypes.HWND(hwnd)
+            u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND,
+                                       ctypes.c_int, ctypes.c_int,
+                                       ctypes.c_int, ctypes.c_int,
+                                       wintypes.UINT]
+            u.GetForegroundWindow.restype = wintypes.HWND
+            u.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
+                                                   ctypes.c_void_p]
+            u.SetForegroundWindow.argtypes = [wintypes.HWND]
+            u.BringWindowToTop.argtypes = [wintypes.HWND]
+            u.IsIconic.argtypes = [wintypes.HWND]
+            u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+            if u.IsIconic(hwnd):
+                u.ShowWindow(hwnd, 9)                    # SW_RESTORE
+            flags = 0x0001 | 0x0002 | 0x0040   # NOSIZE | NOMOVE | SHOWWINDOW
+            # Topmost and back again: above all windows, but not pinned.
+            u.SetWindowPos(hwnd, wintypes.HWND(-1), 0, 0, 0, 0, flags)
+            u.SetWindowPos(hwnd, wintypes.HWND(-2), 0, 0, 0, 0, flags)
+            fg = u.GetForegroundWindow()
+            if fg and fg != hwnd.value:
+                # Windows only lets the foreground program hand over the
+                # keyboard: join its input queue for the moment.
+                other = u.GetWindowThreadProcessId(fg, None)
+                me = k.GetCurrentThreadId()
+                joined = other and other != me and                     u.AttachThreadInput(other, me, True)
+                u.BringWindowToTop(hwnd)
+                u.SetForegroundWindow(hwnd)
+                if joined:
+                    u.AttachThreadInput(other, me, False)
+                if u.GetForegroundWindow() != hwnd.value:
+                    # Still refused: a tap of the Alt key lifts Windows'
+                    # lock on changing the foreground window.
+                    u.keybd_event(0x12, 0, 0, 0)
+                    u.SetForegroundWindow(hwnd)
+                    u.keybd_event(0x12, 0, 2, 0)
+        except Exception:
+            pass
 
     def _on_key_up(self, window, key, scancode):
         if key in (304, 303):
@@ -605,6 +677,11 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                                  f'to find focus.')
         else:
             self._set_status('Ready (no stage)')
+        # A stored image calibration that is not the selected objective's
+        # means the wrong objective is selected (or the lens was changed).
+        hint = self._lens_hint()
+        if hint:
+            self._set_status(hint.strip())
         Clock.schedule_once(lambda dt: setattr(self, 'initializing', False), 0)
 
     def _start_park_guard(self):
@@ -623,9 +700,13 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                 pass
             flags = 0
             if os.name == 'nt':
-                # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: it must
-                # outlive this process and its console window.
-                flags = 0x00000008 | 0x00000200
+                # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP: it must
+                # outlive this process and its console window, and show no
+                # window of its own. (Not DETACHED_PROCESS: the .venv
+                # python.exe starts the real interpreter as a child, and
+                # Windows opens a new console window for a console program
+                # whose parent has none.)
+                flags = 0x08000000 | 0x00000200
             self._park_guard = subprocess.Popen(
                 [sys.executable, os.path.join(here, 'park_guard.py'),
                  str(os.getpid()), PARKED_FLAG,
@@ -652,8 +733,15 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         frame = arr
         ch = self.live_channel if self.live_channel in CHANNELS else \
             (self.hw.active_channel or 'BF')
+        # Shown as it is taken: with the binning of the channel that is
+        # lit (the imaged colours share one, the Autofocus channel has
+        # its own).
+        live_bin = self.hw.soft_bin
+        if live_bin > 1:
+            frame = acq.bin_sum(frame, live_bin, self.hw.soft_bin_top)
         if self.shading_on and self.shading.has_reference(ch):
             frame = self.shading.apply(frame, ch, self.stage_z_um)
+        self._live_bin = live_bin
         self.latest_frame = frame
         self.frame_count += 1
         now = time.time()
@@ -734,15 +822,16 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             return None
         h, w = f.shape[:2]
         return self._image_corners_rel(self.stage_x_um, self.stage_y_um,
-                                       w, h)
+                                       w, h, live=True)
 
-    def _image_corners_rel(self, x_um: float, y_um: float, w: int, h: int):
+    def _image_corners_rel(self, x_um: float, y_um: float, w: int, h: int,
+                           live: bool = False):
         """Plate position (mm from the A1 center) of the corners of a
         ``w`` x ``h`` pixel image taken with the stage at (x_um, y_um)."""
         px = ((-w / 2.0, -h / 2.0), (w / 2.0, -h / 2.0),
               (w / 2.0, h / 2.0), (-w / 2.0, h / 2.0))
         inv = None
-        A = self._img_cal_matrix()
+        A = self._img_cal_matrix(live)
         if A is not None:
             try:
                 inv = np.linalg.inv(A)
@@ -761,7 +850,9 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         c = self.stage_to_plate_rel(x_um, y_um)
         if c is None:
             return None
-        mm_per_px = self.effective_um_per_px() / 1000.0
+        mm_per_px = self.base_um_per_px * (
+            self._bin_now() if live else
+            acq.imaging_binning(self.channel_settings)) / 1000.0
         return [(c[0] + p[0] * mm_per_px, c[1] + p[1] * mm_per_px)
                 for p in px]
 
@@ -1557,6 +1648,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         return self.channel_settings[channel or self.selected_channel]
 
     def select_channel(self, channel: str):
+        if channel not in LIVE_CHANNELS:
+            return
         self.selected_channel = channel
         self._sync_channel_fields()
         self._refresh_shading_info()
@@ -1582,39 +1675,92 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         zstack_chk = ids.get('zstack_enabled_chk')
         if zstack_chk is not None:
             zstack_chk.active = cs.zstack.enabled
-        af_chk = ids.get('af_channel_chk')
-        if af_chk is not None:
-            self._af_chk_sync = True
-            af_chk.active = (self.selected_channel == self.af_channel)
-            self._af_chk_sync = False
         self._sync_channel_sliders()
         self._refresh_channel_marks()
         self.zman_refresh()   # marked colours, optical section of this one
 
-    # -------- which colours are imaged and which one focuses: the P and
-    # AF marks under each channel button
+    # -------- the Autofocus channel is set in the Channel settings panel:
+    # with it shown there, the panel's exposure, gain, LED, binning and
+    # "in protocol" are its own, and a row of buttons chooses its light
+
+    def show_af_channel(self):
+        """The Autofocus channel live, with its settings in view."""
+        self.set_live(AF_CHANNEL)
+        try:
+            panel = self.root.ids.channel_panel
+            panel.open = True
+            sv = panel.parent
+            while sv is not None and not hasattr(sv, 'scroll_to'):
+                sv = sv.parent if sv.parent is not sv else None
+            if sv is not None:
+                Clock.schedule_once(lambda dt: sv.scroll_to(panel), 0.1)
+        except Exception:
+            pass
+
+    def set_panel_binning(self, text: str):
+        """The binning list of the Channel settings panel: the Autofocus
+        channel's own while that is shown, else the one of all the imaged
+        colours."""
+        if self.selected_channel == AF_CHANNEL:
+            self.set_af_binning(text)
+        else:
+            self.set_binning(text)
+
+    # -------- which colours are imaged, and whether the Autofocus channel
+    # runs in protocols: the P mark under each channel button
+
+    def _af_cs(self) -> ChannelSettings:
+        """The Autofocus channel's settings."""
+        return self.channel_settings[AF_CHANNEL]
+
+    def af_channel_text(self) -> str:
+        """The Autofocus channel in words: light, binning, exposure."""
+        a = self._af_cs()
+        b = max(int(a.binning), 1)
+        return (f'{acq.led_channel(AF_CHANNEL, a)} light, {b}x{b} binned, '
+                f'{a.exposure_ms:g} ms')
 
     def _refresh_channel_marks(self, *_):
         if not getattr(self, 'channel_settings', None):
             return      # a setting changed before the app was built
-        marked =[ch for ch in CHANNELS if self.channel_settings[ch].enabled]
-        self.marked_channels = marked
-        af = self.af_channel
-        others = [ch for ch in marked if ch != af]
+        a = self._af_cs()
+        marked = [ch for ch in CHANNELS if self.channel_settings[ch].enabled]
+        self.marked_channels = marked + ([AF_CHANNEL] if a.enabled else [])
+        self.af_source = acq.led_channel(AF_CHANNEL, a)
+        self.af_binning_text = f'{a.binning}x{a.binning}'
+        img_bin = str(acq.imaging_binning(self.channel_settings))
+        if self.binning != img_bin:
+            self.binning = img_bin
+        # One switch, shown in three places (P under the Autofocus
+        # channel, "AF every cycle", the wizard's time-lapse step).
+        if self.af_each_cycle_on != a.enabled:
+            self.af_each_cycle_on = a.enabled
         text = ('Imaged: ' + ', '.join(marked) if marked
                 else 'No colour is imaged (press P under a colour)')
-        text += f'.  Autofocus: on {af} only'
-        if others:
-            text += ('; ' + ', '.join(others) + ' follow'
-                     + ('s' if len(others) == 1 else '') + ' by Z offset'
-                     if self.use_z_offsets_on else
-                     '; ' + ', '.join(others) + ' at the same Z')
-        if marked and af not in marked:
-            text += f'.  {af} focuses but is not imaged'
+        if img_bin != '1':
+            text += f', all {img_bin}x{img_bin} binned'
+        text += f'.  Autofocus channel ({self.af_channel_text()}): '
+        text += ('once per timepoint at the AF point; the focus map and '
+                 'every position follow what it finds' if a.enabled else
+                 'NOT in the protocol (press P under it): the focus stays '
+                 'where it was set')
+        offs = [ch for ch in marked
+                if abs(self.channel_settings[ch].z_offset_um) > 1e-6]
+        if offs and self.use_z_offsets_on:
+            text += '; ' + ', '.join(offs) + ' shifted by ' + \
+                ('its' if len(offs) == 1 else 'their') + ' colour Z offset'
         self.channel_summary = text + '.'
 
-    def on_af_channel(self, *_):
-        self._refresh_channel_marks()
+    def on_af_each_cycle_on(self, *_):
+        if not getattr(self, 'channel_settings', None):
+            return
+        a = self._af_cs()
+        if a.enabled != bool(self.af_each_cycle_on):
+            a.enabled = bool(self.af_each_cycle_on)
+            if self.root:
+                self._sync_channel_fields()
+            else:
+                self._refresh_channel_marks()
 
     def on_use_z_offsets_on(self, *_):
         self._refresh_channel_marks()
@@ -1626,23 +1772,99 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         cs.enabled = not cs.enabled
         self._sync_channel_fields()
         self._persist()
+        if channel == AF_CHANNEL:
+            self._set_status(
+                'Autofocus channel: runs once per timepoint at the AF point'
+                if cs.enabled else
+                'Autofocus channel: left out of protocols (no autofocus)')
+            return
         self._set_status(f'{channel} ' + ('is imaged' if cs.enabled
                                           else 'is left out') +
                          ' in protocols, marked stacks and scans')
 
-    def set_af_channel_to(self, channel: str):
-        """AF under a channel button: this is the colour autofocus runs
-        in (there is one; the others follow by their Z offsets)."""
-        if channel == self.af_channel:
-            self._set_status(f'Autofocus already runs in {channel}; press '
-                             f'AF under another colour to change it')
-            return
-        self.af_channel = channel
-        self.af_config.channel = channel
-        self.surface.anchor_channel = channel
+    def _af_changed(self, said: str):
+        """The Autofocus channel's light or binning was changed."""
         self._sync_channel_fields()
         self._persist()
-        self._set_status(f'Autofocus channel: {channel}')
+        try:
+            self._wiz_refresh_info()
+        except Exception:
+            pass
+        if self.live_channel == AF_CHANNEL and not self.worker_busy:
+            self._bg(self.hw.set_channel, AF_CHANNEL, self._af_cs())
+        self._set_status(said)
+
+    def _af_show(self) -> bool:
+        """The Autofocus channel becomes the live one (its box was used);
+        False while an acquisition runs."""
+        if self.worker_busy:
+            return False
+        self.live_channel = AF_CHANNEL
+        self.selected_channel = AF_CHANNEL
+        return True
+
+    def set_af_source(self, channel: str, show: bool = False):
+        """The light the Autofocus channel uses (any colour). ``show``:
+        pressed in its box, so the channel is lit with it at once."""
+        if not self.root or channel not in CHANNELS:
+            return      # (or the layout is being built: nothing chosen)
+        a = self._af_cs()
+        if channel == a.source and not show:
+            return
+        if self.worker_busy:
+            self._set_status('Busy: the Autofocus channel is not changed '
+                             'during an acquisition')
+            return
+        a.source = channel
+        if show:
+            self._af_show()
+        self._af_changed(
+            f'Autofocus channel: {channel} light, {a.exposure_ms:g} ms, '
+            f'gain {a.gain_db:g} dB, LED {a.led_power} mA. Dark or '
+            f'saturated? Set the exposure and LED below, or press '
+            f'"Start from the {channel} colour"')
+
+    def set_af_binning(self, text: str, show: bool = False):
+        """Pixels a side summed into one in the Autofocus channel: '2x2'
+        is four times as bright, so a quarter of the exposure does."""
+        try:
+            n = int(str(text).split('x')[0])
+        except ValueError:
+            return
+        a = self._af_cs()
+        if not self.root or n not in acq.AF_BINNINGS or \
+                (n == a.binning and not show):
+            return
+        if self.worker_busy:
+            self._set_status('Busy: the Autofocus channel is not changed '
+                             'during an acquisition')
+            return
+        a.binning = n
+        if show:
+            self._af_show()
+        self._af_changed(f'Autofocus channel: {n}x{n} binning ({n * n} '
+                         f'pixels summed into one)')
+
+    def af_take_from_light(self):
+        """The Autofocus channel starts from the settings of the colour
+        whose light it uses: its gain and LED current, and its exposure
+        made shorter by what the binning gains (16 pixels summed: a
+        sixteenth of the exposure gives the same brightness)."""
+        if not self.root or self.worker_busy:
+            return
+        a = self._af_cs()
+        ch = acq.led_channel(AF_CHANNEL, a)
+        src = self.channel_settings[ch]
+        gain = (max(int(a.binning), 1)
+                / acq.imaging_binning(self.channel_settings)) ** 2
+        a.exposure_ms = self._round_sig(min(max(
+            src.exposure_ms / gain, self.exp_min_ms), self.exp_max_ms))
+        a.gain_db = src.gain_db
+        a.led_power = src.led_power
+        self._af_show()
+        self._af_changed(f'Autofocus channel: started from {ch} '
+                         f'({self.af_channel_text()}, gain {a.gain_db:g} '
+                         f'dB, LED {a.led_power} mA)')
 
     @staticmethod
     def _f(widget_text, fallback):
@@ -1650,23 +1872,6 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             return float(widget_text)
         except Exception:
             return fallback
-
-    def set_af_channel(self, active: bool):
-        """Designate the selected channel as THE autofocus channel (single
-        choice: all other channels' protocol Z derives from its AF result
-        via focus points and the chromatic corrections)."""
-        if getattr(self, '_af_chk_sync', False):
-            return
-        if active:
-            self.af_channel = self.selected_channel
-            self.af_config.channel = self.af_channel
-            self.surface.anchor_channel = self.af_channel
-            self._refresh_channel_marks()
-            self._persist()
-            self._set_status(f'Autofocus channel: {self.af_channel}')
-        else:
-            # Re-check: exactly one AF channel must exist.
-            Clock.schedule_once(lambda dt: self._sync_channel_fields(), 0)
 
     def apply_channel_fields(self):
         """Read the per-channel fields into the selected channel's settings
@@ -1688,6 +1893,9 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         cs.zstack.step_um = self._f(ids.zstack_step_input.text, cs.zstack.step_um)
         cs.enabled = bool(ids.channel_enabled_chk.active)
         cs.zstack.enabled = bool(ids.zstack_enabled_chk.active)
+        if self.selected_channel == AF_CHANNEL:
+            cs.z_offset_um = 0.0       # the focus the offsets refer to
+            cs.zstack.enabled = False  # never imaged
         self._sync_channel_fields()   # show the clamped values
         self._refresh_shading_info()  # z-stack / offset change the planes
         self._persist()
@@ -1707,10 +1915,14 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self._set_status('All channels off')
             return
         self.live_channel = channel
+        # The Channel settings panel shows the channel that is live.
         self.selected_channel = channel
         self._sync_channel_fields()
         self._bg(self.hw.set_channel, channel, self._cs(channel))
-        self._set_status(f'Live: {channel}')
+        self._set_status(
+            f'Live: Autofocus channel ({self.af_channel_text()}): set it '
+            f'in Channel settings' if channel == AF_CHANNEL
+            else f'Live: {channel}')
 
     def cycle_channel(self):
         """Single-toggle channel skip: advance live view to the next channel
@@ -1816,9 +2028,10 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         self.gain_min_db, self.gain_max_db = glo, ghi
         self._sync_channel_sliders()
 
-    def nudge(self, kind: str, direction: int):
-        """Fine step buttons: exposure / LED by ~10 %, gain by 1 dB."""
-        cs = self._cs()
+    def nudge(self, kind: str, direction: int, channel: str | None = None):
+        """Fine step buttons: exposure / LED by ~10 %, gain by 1 dB (of
+        the colour shown in the panel, or of ``channel``)."""
+        cs = self._cs(channel)
         if kind == 'exposure':
             v = cs.exposure_ms * (1.1 if direction > 0 else 1 / 1.1)
             cs.exposure_ms = self._round_sig(
@@ -1855,30 +2068,41 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         self._bg(_apply)
 
     def set_binning(self, label: str):
-        cam = self.hw.camera
-        if cam is None or not self.camera_connected:
-            return
+        """Binning of the imaged colours: one value for all of them, so
+        every image of a protocol has the same size and pixel size. (The
+        Autofocus channel has its own, in its box.) Pixels are summed
+        after the camera has delivered the frame; the camera itself is
+        not reconfigured."""
         try:
-            size = int(label)
+            size = int(str(label).split('x')[0])
         except ValueError:
             return
-        def _apply():
-            try:
-                if cam.set_binning_size(size):
-                    self._set_status(f'Binning {size}x{size}')
-                else:
-                    self._set_status(f'Binning {size} rejected')
-            except Exception as e:
-                self._set_status(f'Binning error: {e}')
-        self._bg(_apply)
+        if not self.root or size not in acq.AF_BINNINGS or \
+                size == acq.imaging_binning(self.channel_settings):
+            return
+        if self.worker_busy:
+            self._set_status('Busy: the binning is not changed during an '
+                             'acquisition')
+            self.binning = ''       # (so that the list shows it again)
+            self.binning = str(acq.imaging_binning(self.channel_settings))
+            return
+        acq.set_imaging_binning(self.channel_settings, size)
+        self.binning = str(size)
+        self._refresh_channel_marks()
+        self._persist()
+        if self.live_channel in CHANNELS:
+            self._bg(self.hw.set_channel, self.live_channel,
+                     self._cs(self.live_channel))
+        self._set_status(
+            f'Imaged colours: {size}x{size} binning, '
+            f'{self.effective_um_per_px():.3f} um per pixel'
+            + (f' ({size * size} pixels summed: about {size * size} times '
+               f'as bright, shorten the exposures)' if size > 1 else ''))
 
     def effective_um_per_px(self) -> float:
-        bin_f = 1
-        try:
-            bin_f = int(self.binning)
-        except Exception:
-            pass
-        return self.base_um_per_px * max(bin_f, 1)
+        """Pixel size of the IMAGED colours (their binning included)."""
+        return self.base_um_per_px * acq.imaging_binning(
+            self.channel_settings)
 
     def set_um_per_px(self, text: str):
         self.base_um_per_px = self._f(text, self.base_um_per_px)
@@ -1912,6 +2136,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             CAMERA_PIXEL_UM * float(obj['focal_length']) / TUBE_FOCAL_MM, 4)
         # A measured pixel-to-stage mapping belongs to the previous lens.
         self.img_cal = None
+        self._img_cal_ok = False
         self.zplan['na'] = None
         ids = self.root.ids if self.root else {}
         if ids:
@@ -1944,8 +2169,9 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self._set_status('No frame to save')
             return
         os.makedirs(self._out_base(), exist_ok=True)
-        ch = self.live_channel if self.live_channel in CHANNELS else 'IMG'
-        path = os.path.join(self._out_base(),
+        ch = self.live_channel if self.live_channel in LIVE_CHANNELS \
+            else 'IMG'
+        path =os.path.join(self._out_base(),
                             f'snap_{ch}_{time.strftime("%Y%m%d_%H%M%S")}.tiff')
         acq.save_image(path, frame)
         if ch in CHANNELS:
@@ -2654,20 +2880,24 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         try:
             self.channel_settings = acq.channel_settings_from_dict(
                 d.get('channel_settings', {}))
+            if AF_CHANNEL not in (d.get('channel_settings') or {}):
+                # Saved before there was an Autofocus channel.
+                acq.adopt_af_channel(self.channel_settings,
+                                     d.get('af_channel', 'BF'),
+                                     bool(d.get('af_each_cycle', True)))
             af = d.get('af_config', {})
             self.af_config = AutofocusConfig(
                 z_bottom_um=float(af.get('z_bottom_um', 0.0)),
                 z_top_um=float(af.get('z_top_um', 200.0)),
                 step_um=float(af.get('step_um', 10.0)),
-                channel=af.get('channel', 'BF'))
+                channel=AF_CHANNEL)
             if d.get('surface'):
                 self.surface.from_dict(d['surface'])
             self.protocol_positions = [dict(p) for p in d.get('positions', [])]
-            self.af_each_cycle_on = bool(d.get('af_each_cycle', True))
-            self.af_channel = d.get('af_channel', 'BF')
+            self.af_each_cycle_on = self._af_cs().enabled
             if d.get('af_method') in acq.AF_METHODS:
                 self.af_method = d['af_method']
-            self.surface.anchor_channel = self.af_channel
+            self.surface.anchor_channel = AF_CHANNEL
             self.use_surface_on = bool(d.get('use_surface', True))
             self.use_z_offsets_on = bool(d.get('use_z_offsets', True))
             self.no_plate_on = bool(d.get('no_plate', False))
@@ -2812,17 +3042,22 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self._set_status(f'At {where}')
         self._bg(_move)
 
-    def _img_cal_matrix(self):
-        """Current px-shift-per-stage-um 2x2 (binning compensated), or None."""
+    def _img_cal_matrix(self, live: bool = False):
+        """Current px-shift-per-stage-um 2x2 (binning compensated), or None.
+        ``live``: in pixels of the frames handed out right now (binned
+        while the Autofocus channel is lit), not of the saved images."""
         if not self.img_cal or not self.img_cal.get('A'):
             return None
         A = np.asarray(self.img_cal['A'], dtype=np.float64)
         cal_bin = max(int(self.img_cal.get('binning', 1)), 1)
-        try:
-            cur_bin = max(int(self.binning), 1)
-        except Exception:
-            cur_bin = 1
+        cur_bin = self._bin_now() if live else \
+            acq.imaging_binning(self.channel_settings)
         return A * (cal_bin / cur_bin)
+
+    def _bin_now(self) -> int:
+        """Pixels a side summed into one in the frames handed out now (the
+        binning of the channel that is lit)."""
+        return max(int(getattr(self.hw, 'soft_bin', 1) or 1), 1)
 
     def _image_cal_sync(self, ch: str) -> bool:
         """Blocking pixel->stage calibration from two probe moves.
@@ -2853,11 +3088,9 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                 (abs(sx[0]) + abs(sx[1])) < 2 or (abs(sy[0]) + abs(sy[1])) < 2):
             return False
         A = [[sx[0] / D, sy[0] / D], [sx[1] / D, sy[1] / D]]
-        try:
-            cur_bin = max(int(self.binning), 1)
-        except Exception:
-            cur_bin = 1
+        cur_bin = self._bin_now()
         self.img_cal = {'A': A, 'binning': cur_bin}
+        self._img_cal_ok = True
         self._lens_measured_at = time.time()
         self._persist()
         return True
@@ -2869,7 +3102,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         if not (self.stage_connected and self.camera_connected):
             self._set_status('Image calibration needs stage + camera')
             return
-        ch = self.live_channel if self.live_channel in CHANNELS else self.selected_channel
+        ch = self.live_channel if self.live_channel in LIVE_CHANNELS else self.selected_channel
         def _job():
             if self._image_cal_sync(ch):
                 A = np.asarray(self.img_cal['A'])
@@ -2880,66 +3113,263 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                                  'with visible features (try focusing first)')
         self._bg(_job, busy_job=True)
 
+    def on_live_double_click(self, fx: float, fy: float):
+        """Double-click on the live image drawn on the plate map: the
+        same centering as on the camera view."""
+        f = self.latest_frame
+        if f is None:
+            return
+        h, w = f.shape[:2]
+        self.on_image_double_click(fx * w, fy * h)
+
+    def _lens_hint(self) -> str:
+        """A sentence for the status line when the measured image scale is
+        not that of the selected objective, else ''."""
+        try:
+            A = self._img_cal_matrix()
+            if A is None or not self.base_um_per_px:
+                return ''
+            um = 1.0 / float(np.linalg.norm(A[:, 0]))       # per pixel now
+            sel = self.effective_um_per_px()
+            if abs(um / sel - 1.0) <= 0.2:
+                return ''
+            b = max(sel / self.base_um_per_px, 1.0)
+            best, best_d = None, None
+            for name, obj in self.objectives.items():
+                try:
+                    nom = (CAMERA_PIXEL_UM * float(obj['focal_length'])
+                           / TUBE_FOCAL_MM) * b
+                    mag = float(obj.get('magnification'))
+                except Exception:
+                    continue
+                d = abs(float(np.log(um / nom)))
+                if best_d is None or d < best_d:
+                    best, best_d = mag, d
+            fits = f', which fits a {best:g}x objective' \
+                if best is not None else ''
+            return (f' THE IMAGE SCALE MEASURES {um:.3f} um/px{fits}, but '
+                    f'"{self.objective_name}" ({sel:.3f} um/px) is '
+                    f'selected: select the objective that is on the '
+                    f'microscope.')
+        except Exception:
+            return ''
+
+    def _center_log(self, msg: str):
+        """Append to logs/centering.log: what each double-click did."""
+        try:
+            os.makedirs(LOGS_DIR, exist_ok=True)
+            with open(os.path.join(LOGS_DIR, 'centering.log'), 'a',
+                      encoding='utf-8') as f:
+                f.write(f'{time.strftime("%Y-%m-%d %H:%M:%S")}  {msg}\n')
+        except Exception:
+            pass
+
+    # After a centering the picture has only just changed under the mouse:
+    # a double-click in this time would repeat the move from where the
+    # mouse still is, not go to something the user has seen and chosen.
+    CENTER_REST_S = 0.8
+
     def on_image_double_click(self, dx_px: float, dy_px: float):
         """Double-click on the live image: bring the clicked point to the
         center.
 
-        The whole move is planned up front from the calibrated
-        pixel->stage mapping and made as ONE straight vector move. The
-        result is then checked once by finding the clicked spot itself in
-        the new frame; if it is measurably off center, a single small trim
-        follows. There is no further iteration, so the stage never hunts.
-        The mapping is calibrated automatically on first use."""
+        One double-click is one centering: clicks that arrive while the
+        stage is still on its way, or in the moment after it, are ignored.
+
+        The move is planned from the calibrated pixel->stage mapping and
+        made as ONE straight move to the point. Afterwards it is checked
+        in the picture (how far the image moved; where the clicked spot
+        is now):
+
+        - The spot is a little off center (backlash): one small trim,
+          never a repeat of the move (acq.trim_allowed).
+        - The image moved much further than planned: the calibration is
+          not that of the lens on the microscope. It is corrected by what
+          was measured and the rest of the way is made with it.
+        - Until the calibration has been seen to be right once in this
+          session, a LONG move is made in two parts, the first (about
+          15 % of the field) measured, so that a wrong calibration cannot
+          throw the point out of view. After that: one move.
+
+        Every double-click is recorded in logs/centering.log."""
         if not self.stage_connected or self.worker_busy:
             return
         if getattr(self, '_centering', False):
-            return          # one centering move at a time
+            self._center_log(f'click ({dx_px:+.0f}, {dy_px:+.0f}) px '
+                             f'IGNORED: a centering move is under way')
+            return
+        since = time.time() - getattr(self, '_center_done_t', 0.0)
+        if since < self.CENTER_REST_S:
+            self._center_log(f'click ({dx_px:+.0f}, {dy_px:+.0f}) px '
+                             f'IGNORED: {since:.2f} s after the last '
+                             f'centering')
+            return
         self._centering = True
-        ch = self.live_channel if self.live_channel in CHANNELS else self.selected_channel
-        target_px = np.array([-dx_px, -dy_px])   # required content shift
+        self._set_status('Centering...')
+        ch = self.live_channel if self.live_channel in LIVE_CHANNELS else self.selected_channel
+        target_px = np.array([-dx_px, -dy_px], dtype=np.float64)
 
         def _job():
             try:
                 _center()
+            except Exception as e:
+                self._center_log(f'click ({dx_px:+.0f}, {dy_px:+.0f}) px '
+                                 f'ERROR {type(e).__name__}: {e}')
+                self._set_status(f'Centering failed: {e}')
             finally:
+                self._center_done_t = time.time()
                 self._centering = False
 
+        def _leg(shift_px, A):
+            """Move the stage so the image shifts by ``shift_px``; returns
+            (stage move, frame after the stage has come to rest, arrived)."""
+            s = np.linalg.solve(A, np.asarray(shift_px, dtype=np.float64))
+            self.hw.move_xy_rel(float(s[0]), float(s[1]))
+            arrived = self.hw.xy_arrived()
+            # Two new frames after the stage is at rest: the first may
+            # have been exposed while it was still moving.
+            return s, self.hw.grab_settled(settle_s=0.2, timeout_s=1.5), arrived
+
+        def _measured(fa, fb, planned_px):
+            """(image shift px, shift / plan, text for the log)."""
+            m = None
+            if fa is not None and fb is not None and fa.shape == fb.shape:
+                m = acq.measure_image_shift(fa, fb)
+            if m is None:
+                return None, None, 'image shift not measurable'
+            k = acq.centering_scale(planned_px, m[:2])
+            if m[2] < 0.08 or k is None:
+                return None, None, (f'image shift not measurable '
+                                    f'(response {m[2]:.2f})')
+            return (np.array(m[:2]), k,
+                    f'image moved ({m[0]:+.0f}, {m[1]:+.0f}) px = '
+                    f'{k:.2f} x plan (response {m[2]:.2f})')
+
         def _center():
-            if self._img_cal_matrix() is None:
+            if self._img_cal_matrix(True) is None:
                 self._set_status('First double-click: calibrating image '
                                  'motion (two short probe moves)...')
                 if not self._image_cal_sync(ch):
                     self._set_status('Centering calibration FAILED - light a '
                                      'featured field and try again')
                     return
-            A = self._img_cal_matrix()
+            A = self._img_cal_matrix(True)
             try:
-                stage = np.linalg.solve(A, target_px)
+                np.linalg.solve(A, target_px)
             except np.linalg.LinAlgError:
                 self._set_status('Centering: calibration degenerate - recalibrate')
                 return
             f0 = self.hw.grab_fresh(1.0)
-            self.hw.move_xy_rel(float(stage[0]), float(stage[1]))
-            time.sleep(0.2)                      # let the stage settle
-            f1 = self.hw.grab_fresh(1.0)
+            p0 = self.hw.get_pos()
+            log = f'click ({dx_px:+.0f}, {dy_px:+.0f}) px'
             note = ''
-            if f0 is not None and f1 is not None and f0.ndim == 2:
-                h, w = f0.shape
-                cx, cy = w / 2.0, h / 2.0
+            if f0 is None or f0.ndim != 2:
+                # No picture to measure with: the planned move, unchecked.
+                s, _f, arrived = _leg(target_px, A)
+                self._center_log(log + f'  no frame: moved ({s[0]:+.1f}, '
+                                       f'{s[1]:+.1f}) um unchecked')
+                self._set_status(f'Centered: moved dx={s[0]:.0f}, '
+                                 f'dy={s[1]:.0f} um (not checked: no image)')
+                return
+            h, w = f0.shape
+            cx, cy = w / 2.0, h / 2.0
+            dist = float(np.linalg.norm(target_px))
+            first = 0.15 * min(h, w)
+            # ONE move, straight to the point. Only while the calibration
+            # has not yet been seen to be right in this session (after the
+            # start, or a change of objective) does a long move begin with
+            # a first part that is measured: a calibration that is not the
+            # lens's would otherwise throw the point out of view.
+            proven = getattr(self, '_img_cal_ok', False)
+            part = target_px * (first / dist) \
+                if (dist > 1.5 * first and not proven) else target_px
+            s, f1, arrived = _leg(part, A)
+            log += (f'  first move ({s[0]:+.1f}, {s[1]:+.1f}) um for '
+                    f'({part[0]:+.0f}, {part[1]:+.0f}) px, arrived {arrived}')
+            seen, k, said = (None, None, 'too short to measure')
+            if abs(part[0]) > 0.4 * w or abs(part[1]) > 0.4 * h:
+                said = 'too far to measure (little overlap)'
+            elif float(np.linalg.norm(part)) >= 40.0:
+                seen, k, said = _measured(f0, f1, part)
+            log += '  ' + said
+            if seen is not None and k < 0.3:
+                # The image has hardly moved. Either the frame is still
+                # the view from before the move, or the move was lost in
+                # the drive's backlash: look once more, then go by the
+                # plan rather than by a picture that cannot be trusted.
+                f1 = self.hw.grab_settled(settle_s=0.4, timeout_s=1.5)
+                seen, k, said = _measured(f0, f1, part)
+                log += f'  looked again: {said}'
+                if seen is not None and k < 0.3:
+                    seen, k = None, None
+            last_px, last_f = part, f1
+            # Further than planned: backlash can only make a move shorter,
+            # so the calibration is not that of this lens. Shorter than
+            # planned by more than backlash can swallow (40 um of travel):
+            # the same, the other way round.
+            short_um = 0.0 if k is None else \
+                (1.0 - k) * float(np.linalg.norm(s))
+            off = seen is not None and arrived and (
+                k > 1.3 or (k < 0.75 and short_um > 40.0))
+            if seen is not None and arrived and 0.8 <= k <= 1.2:
+                self._img_cal_ok = True
+            if off:
+                # It is put right by what was just measured (no extra
+                # moves) and checked again at the next double-click.
+                A = A * k
+                try:
+                    stored = np.asarray(self.img_cal['A'], dtype=np.float64)
+                    self.img_cal = {'A': (stored * k).tolist(),
+                                    'binning': self.img_cal.get('binning', 1)}
+                    self._persist()
+                except Exception:
+                    pass
+                self._img_cal_ok = False
+                note = (f' (the image moved {k:.2g} times as far as '
+                        f'calibrated: calibration corrected)'
+                        + self._lens_hint())
+                log += f'  CALIBRATION SCALED by {k:.2f}'
+            rest = target_px - (seen if seen is not None else part)
+            if arrived and float(np.linalg.norm(rest)) > 3.0 and (
+                    part is not target_px or off):
+                # The rest of the way, from where the image really is. (A
+                # short move that went as planned is left to the trim.)
+                s2, f2, arrived = _leg(rest, A)
+                log += (f'  then ({s2[0]:+.1f}, {s2[1]:+.1f}) um for '
+                        f'({rest[0]:+.0f}, {rest[1]:+.0f}) px, '
+                        f'arrived {arrived}')
+                last_px, last_f = rest, f2
+            # The clicked spot itself: is it at the center now?
+            found = None
+            if last_f is not None and last_f.shape == f0.shape:
                 found = acq.locate_patch(f0, (cx + dx_px, cy + dy_px),
-                                         f1, (cx, cy))
-                if found is not None and found[2] >= 0.6:
-                    resid = np.array([found[0] - cx, found[1] - cy])
-                    err = float(np.linalg.norm(resid))
-                    if 3.0 < err < 0.12 * min(h, w):
-                        try:
-                            trim = np.linalg.solve(A, -resid)
-                            self.hw.move_xy_rel(float(trim[0]), float(trim[1]))
-                            note = f' (trimmed {err:.0f} px)'
-                        except np.linalg.LinAlgError:
-                            pass
-            self._set_status(f'Centered: moved dx={stage[0]:.0f}, '
-                             f'dy={stage[1]:.0f} um{note}')
+                                         last_f, (cx, cy))
+            if found is None:
+                log += '  spot not found for the check'
+            else:
+                resid = np.array([found[0] - cx, found[1] - cy])
+                err = float(np.linalg.norm(resid))
+                log += (f'  spot off by ({resid[0]:+.0f}, {resid[1]:+.0f}) '
+                        f'px, score {found[2]:.2f}')
+                # 25 um of travel, in pixels: what backlash may eat.
+                floor = 25.0 * float(np.linalg.norm(A[:, 0]))
+                if found[2] >= 0.6 and acq.trim_allowed(
+                        last_px, resid, min(h, w), arrived, floor_px=floor):
+                    trim = np.linalg.solve(A, -resid)
+                    self.hw.move_xy_rel(float(trim[0]), float(trim[1]))
+                    self.hw.xy_arrived()
+                    note += f' (trimmed {err:.0f} px)'
+                    log += f'  trimmed ({trim[0]:+.1f}, {trim[1]:+.1f}) um'
+                elif err > 3.0:
+                    log += '  not trimmed'
+                if found[2] >= 0.6 and err <= 0.03 * min(h, w) and arrived:
+                    self._img_cal_ok = True     # it landed where planned
+            p1 = self.hw.get_pos()
+            log += (f'  stage moved ({p1[0] - p0[0]:+.1f}, '
+                    f'{p1[1] - p0[1]:+.1f}) um in all')
+            self._center_log(log)
+            self._set_status(f'Centered: moved dx={p1[0] - p0[0]:.0f}, '
+                             f'dy={p1[1] - p0[1]:.0f} um{note}')
         self._bg(_job)
 
     def toggle_invert(self, which: str):
@@ -3055,7 +3485,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         cfg = AutofocusConfig(z_bottom_um=self.af_config.z_bottom_um,
                               z_top_um=self.af_config.z_top_um,
                               step_um=self.af_config.step_um,
-                              channel=self.surface.anchor_channel)
+                              channel=AF_CHANNEL)
         z = self.surface.anchor_z
         return cfg if z is None else acq.af_window(z, cfg)
 
@@ -3124,7 +3554,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         self.af_apply_fields()
         def _job():
             x, y = self.surface.anchor_xy
-            ch = self.surface.anchor_channel
+            ch = AF_CHANNEL
             self._set_status('AF cycle: moving to anchor...')
             self.hw.move_xy(x, y)
             cfg = self._anchor_af_cfg()
@@ -3201,6 +3631,11 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         """Capture a flat-field reference for the selected channel. Point the
         optics at an empty/uniform field first."""
         ch = self.selected_channel
+        if ch not in CHANNELS:
+            self._set_status('Shading references are for the imaged colours: '
+                             'select one (the Autofocus channel is not '
+                             'imaged)')
+            return
         def _job():
             self._set_status(f'Shading: capturing reference for {ch}...')
             self.hw.set_channel(ch, self._cs(ch))
@@ -3334,9 +3769,12 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         return max(rows, 1), max(cols, 1), min(max(overlap, 0.0), 60.0)
 
     def _fov_um(self) -> tuple[float, float]:
-        scale = self.effective_um_per_px()
+        # The field of view does not depend on the binning: the pixels
+        # of the frame times how many camera pixels each one holds.
+        scale = self.base_um_per_px
         if self.latest_frame is not None:
-            h, w = self.latest_frame.shape[:2]
+            b = max(int(getattr(self, '_live_bin', 1)), 1)
+            h, w = (n * b for n in self.latest_frame.shape[:2])
         else:
             w = h = 1900
         return w * scale, h * scale
@@ -3806,6 +4244,12 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         self._persist()
         self._refresh_channel_marks()
         self.zman_refresh()
+        if self.selected_channel == AF_CHANNEL:
+            self._set_status(
+                'Autofocus channel: runs once per timepoint at the AF point'
+                if cs.enabled else
+                'Autofocus channel: left out of protocols (no autofocus)')
+            return
         self._set_status(f'{self.selected_channel} '
                          + ('marked' if cs.enabled else 'not marked')
                          + ' for protocols and "Stack marked colours"')
@@ -4163,7 +4607,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         def do_measure(*_):
             if self.worker_busy:
                 return
-            ch = self.live_channel if self.live_channel in CHANNELS \
+            ch = self.live_channel if self.live_channel in LIVE_CHANNELS \
                 else self.selected_channel
             measure.disabled = run.disabled = True
             msg.text = 'Measuring the image scale...'
@@ -4220,7 +4664,9 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             # anything moves; the run starts from that window.
             self._objective_gate()
             return
-        do_af = (self.af_each_cycle_on and
+        # Autofocus is in the protocol when the Autofocus channel is (P),
+        # and there is an AF point to run it at.
+        do_af = (self._af_cs().enabled and
                  self.surface.anchor_xy is not None)
         af_every = max(int(self.af_every_n), 1)
         self.af_apply_fields()
@@ -4375,7 +4821,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                     self._safe_goto(ax, ay, None)
                     cfg = self._anchor_af_cfg()
                     best, af_ok = acq.autofocus_checked(
-                        self.hw, cfg, self._cs(self.surface.anchor_channel),
+                        self.hw, cfg, self._cs(AF_CHANNEL),
                         cancel=cancel, status_cb=self._set_status,
                         template=self.af_template,
                         high_stability=self.high_stability_on,
@@ -4609,6 +5055,11 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         try:
             self.channel_settings = acq.channel_settings_from_dict(
                 d.get('channel_settings', {}))
+            if AF_CHANNEL not in (d.get('channel_settings') or {}):
+                # Saved before there was an Autofocus channel.
+                acq.adopt_af_channel(self.channel_settings,
+                                     d.get('af_channel', 'BF'),
+                                     bool(d.get('af_each_cycle_on', True)))
             a1 = d.get('a1_stage_um')
             self.a1_stage_um = tuple(a1) if a1 else None
             self.plate_sign_x = float(d.get('plate_sign_x', 1.0))
@@ -4623,9 +5074,10 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                 z_bottom_um=float(af.get('z_bottom_um', 0.0)),
                 z_top_um=float(af.get('z_top_um', 200.0)),
                 step_um=float(af.get('step_um', 10.0)),
-                channel=af.get('channel', 'BF'))
+                channel=AF_CHANNEL)
             if d.get('surface'):
                 self.surface.from_dict(d['surface'])
+            self.surface.anchor_channel = AF_CHANNEL
             lw_name = d.get('labware_name')
             if lw_name and self.labware_lib.get(lw_name) is not None:
                 self.current_labware = self.labware_lib.get(lw_name)
@@ -4654,7 +5106,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self.focus_moves = dict(d.get('focus_moves') or {})
             self.af_every_n = max(int(d.get('af_every_n', 1)), 1)
             self.zplan.update(d.get('zplan') or {})
-            self.af_each_cycle_on = bool(d.get('af_each_cycle_on', True))
+            self.af_each_cycle_on = self._af_cs().enabled
             self.compose_on = bool(d.get('compose_on', False))
             self.stitch_on = bool(d.get('stitch_on', False))
             # Every launch starts with an empty plate: no selected wells,
@@ -4666,7 +5118,6 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self.surface.clear_points()
             self.travel_clearance_um = float(d.get('travel_clearance_um', 500.0))
             self.img_cal = d.get('img_cal')
-            self.af_channel = d.get('af_channel', 'BF')
             self.high_stability_on = bool(d.get('high_stability_on', False))
             if d.get('af_method') in acq.AF_METHODS:
                 self.af_method = d['af_method']
@@ -4677,8 +5128,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             # One-time migration: protocol membership became opt-in; clear
             # any enables carried over from older settings files.
             if not d.get('protocol_optin_v2'):
-                for cs in self.channel_settings.values():
-                    cs.enabled = False
+                for ch in CHANNELS:
+                    self.channel_settings[ch].enabled = False
         except Exception as e:
             # Not silent: the rest of the settings after the failing one
             # keep their defaults for this session.
@@ -4694,6 +5145,9 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                 pass
         self._keep_last_session()
         self.shading.load_all()
+        self.af_config.channel = AF_CHANNEL
+        self.surface.anchor_channel = AF_CHANNEL
+        self._refresh_channel_marks()   # the Autofocus channel's spinners
 
     def _keep_last_session(self):
         """The previous run's working state stays loadable as the

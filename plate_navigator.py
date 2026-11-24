@@ -401,6 +401,10 @@ class WellPlateMapWidget(Widget):
         self.live_corners_mm: list[tuple[float, float]] | None = None
         self.snapshots: list[dict] = []
         self.on_point_double_click = None  # callable(x_mm, y_mm, well|None)
+        # A double-click on the live image drawn on the map, at any zoom:
+        # callable(fx, fy), the point as a fraction of the image from its
+        # center (-0.5 .. 0.5, +x right, +y down in the image).
+        self.on_live_double_click = None
         # Ctrl + wheel zooms. The wheel alone focuses (as on the camera
         # view) while wheel_focus is on, i.e. when the map is the main
         # view; otherwise it is left to the panel to scroll.
@@ -587,6 +591,27 @@ class WellPlateMapWidget(Widget):
         self.live_texture = texture
         self.live_corners_mm = [(lw.a1_offset_x + x, lw.a1_offset_y + y)
                                 for x, y in corners_rel_mm]
+
+    def live_image_fraction(self, mm_x: float, mm_y: float):
+        """Where a plate point is in the live image: (fx, fy) from the
+        image center as a fraction of its width and height (+y down the
+        image), or None when the point is outside it or no image is
+        shown."""
+        c = self.live_corners_mm
+        if not c or len(c) != 4:
+            return None
+        (tlx, tly), (trx, try_), _br, (blx, bly) = c
+        ux, uy = trx - tlx, try_ - tly          # along the top edge
+        vx, vy = blx - tlx, bly - tly           # down the left edge
+        det = ux * vy - uy * vx
+        if abs(det) < 1e-12:
+            return None
+        px, py = mm_x - tlx, mm_y - tly
+        a = (px * vy - py * vx) / det
+        b = (ux * py - uy * px) / det
+        if not (0.0 <= a <= 1.0 and 0.0 <= b <= 1.0):
+            return None
+        return a - 0.5, b - 0.5
 
     # Preview images left on the plate wherever an image was taken or the
     # live view rested. A new one replaces those it lands on.
@@ -998,6 +1023,20 @@ class WellPlateMapWidget(Widget):
                 else:
                     self.on_point_click(*args)
             return True
+
+        if touch.is_double_tap and self.on_live_double_click is not None:
+            # On the live image: bring that pixel to the center, whatever
+            # the zoom (never the well center), by the image itself.
+            frac = self.live_image_fraction(*mm)
+            if frac is not None:
+                if self._pending is not None:
+                    self._pending[3].cancel()
+                    self._pending = None
+                elif self._last_toggle and self._last_toggle[0] == well:
+                    self._last_toggle[2]([well], not self._last_toggle[1])
+                self._last_toggle = None
+                self.on_live_double_click(*frac)
+                return True
 
         if touch.is_double_tap:
             if self.precise and self.on_point_double_click is not None:
