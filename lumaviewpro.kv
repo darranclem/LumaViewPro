@@ -970,6 +970,15 @@ LumaViewProMainLayout:
                                 text: 'Online stitch: ' + ('ON' if app.stitch_on else 'off')
                                 background_color: ACCENT if app.stitch_on else PANEL2
                                 on_press: app.toggle_online('stitch')
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Shading correction'
+                                size_hint_x: 0.7
+                            DarkSpinner:
+                                text: app.run_shading_label(app.run_shading)
+                                values: app.shading_labels
+                                background_color: ACCENT if app.run_shading != 'off' else PANEL2
+                                on_text: app.set_run_shading(self.text)
                         FlatButton:
                             text: 'Save as: ' + app.save_format_label(app.save_format)
                             on_press: app.cycle_save_format()
@@ -1843,6 +1852,15 @@ LumaViewProMainLayout:
                                         text: 'Online stitching (tiles of a well in one image, video of time-lapses): ' + ('ON' if app.stitch_on else 'off')
                                         background_color: ACCENT if app.stitch_on else PANEL2
                                         on_press: app.toggle_online('stitch')
+                                    FieldRow:
+                                        PanelLabel:
+                                            text: 'Shading correction (Automatic = Quark, from the images)'
+                                            size_hint_x: 2.2
+                                        DarkSpinner:
+                                            text: app.run_shading_label(app.run_shading)
+                                            values: app.shading_labels
+                                            background_color: ACCENT if app.run_shading != 'off' else PANEL2
+                                            on_text: app.set_run_shading(self.text)
                                     PanelLabel:
                                         text: 'Save'
                                         bold: True

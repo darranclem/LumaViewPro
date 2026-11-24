@@ -122,6 +122,13 @@ class ExperimentWizardMixin:
     zmark_on = BooleanProperty(False)     # navigator marks z-stack opt-outs
     compose_on = BooleanProperty(False)   # online: channels into one file
     stitch_on = BooleanProperty(False)    # online: tiles into one image
+    # Shading correction of a protocol run: 'off', 'auto' (measured from
+    # the run's own images by Quark) or 'reference' (the empty-field
+    # reference of each colour, applied as the frames are taken).
+    run_shading = StringProperty('off')
+    shading_labels = ['Off', 'Automatic (Quark)', 'Reference image']
+    _SHADING_BY_LABEL = {'Off': 'off', 'Automatic (Quark)': 'auto',
+                         'Reference image': 'reference'}
     zmark_scope = StringProperty('All channels')
 
     sampling_labels = [experiment.SAMPLING_LABELS[m]
@@ -1172,6 +1179,56 @@ class ExperimentWizardMixin:
         if self.wiz_active:
             self._wiz_refresh_info()
 
+    def run_shading_label(self, mode: str) -> str:
+        return {v: k for k, v in self._SHADING_BY_LABEL.items()}.get(
+            mode, 'Off')
+
+    def set_run_shading(self, label: str):
+        mode = self._SHADING_BY_LABEL.get(label, label)
+        if mode not in online_processing.SHADING_MODES or \
+                mode == self.run_shading:
+            return       # (also the spinner showing a loaded setting)
+        self.run_shading = mode
+        if mode == 'auto':
+            import quark_stitch
+            if not quark_stitch.available():
+                self._set_status('Automatic shading needs the Quark module: '
+                                 + quark_stitch.why_unavailable())
+            elif not online_processing.available():
+                self._set_status('Automatic shading needs the tifffile and '
+                                 'opencv-python packages in .venv')
+            else:
+                self._set_status(
+                    'Shading: measured by Quark from the images of the run '
+                    'after the first timepoint; corrected copy in '
+                    'shading_corrected/, raw data unchanged')
+        elif mode == 'reference':
+            missing = self._shading_missing()
+            self._set_status(
+                'Shading: the reference image of each colour is applied as '
+                'the frames are taken' + (
+                    f'. NO REFERENCE for {", ".join(missing)} (Shading '
+                    f'section): those are saved uncorrected'
+                    if missing else ''))
+        self._persist()
+        if self.wiz_active:
+            self._wiz_refresh_info()
+
+    def _shading_missing(self) -> list[str]:
+        chans = [ch for ch, cs in self.channel_settings.items()
+                 if getattr(cs, 'enabled', False)]
+        return [ch for ch in chans if not self.shading.has_reference(ch)]
+
+    def _shading_text(self) -> str:
+        if self.run_shading == 'auto':
+            return ('automatic (measured by Quark from the first timepoint; '
+                    'corrected copy in shading_corrected/)')
+        if self.run_shading == 'reference':
+            missing = self._shading_missing()
+            return 'reference image' + (
+                f' (NONE STORED for {", ".join(missing)})' if missing else '')
+        return 'off'
+
     def _online_text(self, cycles: int) -> str:
         parts = []
         if self.compose_on:
@@ -1252,6 +1309,7 @@ class ExperimentWizardMixin:
                 f'{every}; '
                 f'{surf}\n'
                 f'Online processing: {self._online_text(cycles)}\n'
+                f'Shading correction: {self._shading_text()}\n'
                 f'Images in total: {images}')
 
     def wiz_save(self):

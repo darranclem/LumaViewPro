@@ -10,10 +10,24 @@ Each product is made as soon as everything it needs has been acquired:
 - video: one per stitched group (or composited position), once the last
   timepoint is done.
 
+Shading correction (``shading``):
+
+- 'reference': the frames were corrected with the empty-field reference
+  while they were taken; nothing more is done here.
+- 'auto': Quark's algorithmic shading correction (``quark_stitch``, the
+  compiled Quark code through PyO3). Each colour's illumination pattern is
+  measured from the run's own images once the first timepoint is complete
+  (the per-pixel median over the plain fields; no reference image), stored
+  in ``shading/`` and divided out of every composite, stitch and video,
+  and a corrected copy of the run is written to ``shading_corrected/`` in
+  the run's save format. The raw data is never changed. Products wait for
+  the measurement, so the first ones appear after the first timepoint.
+
 The work runs on its own thread and reads the saved raw files back from
 disk, so it never delays the acquisition and never changes the raw data.
 Everything is written below the run folder: ``composites/``,
-``stitched/``, ``previews/`` and ``videos/``, with ``processing.log``.
+``stitched/``, ``previews/``, ``videos/``, ``shading/`` and
+``shading_corrected/``, with ``processing.log``.
 
 No hardware and no UI in here.
 """
@@ -55,6 +69,12 @@ MAX_STITCH_PIXELS = 120e6
 MAX_IMAGEJ_BYTES = 3.8e9
 PREVIEW_MAX_SIDE = 1600
 VIDEO_FPS = 5
+SHADING_MODES = ('off', 'auto', 'reference')
+# At most this many fields per colour are read to measure the shading
+# (spread evenly over the first timepoint), to bound the memory used.
+MAX_SHADING_FIELDS = 64
+# Quark needs at least this many plain fields to measure a pattern.
+MIN_SHADING_FIELDS = 4
 
 _TILE_SITE = re.compile(r'^(?:(R\d+)-)?T[A-Z]+\d+$')
 
@@ -284,6 +304,20 @@ def write_video(path: str, frame_paths: list[str],
 
 # --------------------------------------------------------------- files
 
+def describe_shading(info: dict) -> str:
+    """A few words on a measured gain map (as quark_stitch says it)."""
+    if 'error' in info:
+        return f"not measured ({info['error']})"
+    parts = ['measured from the images (Quark)']
+    if info.get('fields_used') is not None:
+        of = (f" of {info['fields_read']}"
+              if info.get('fields_read') is not None else '')
+        parts.append(f"{info['fields_used']}{of} fields")
+    if info.get('split_half_rms') is not None:
+        parts.append(f"known to {100.0 * float(info['split_half_rms']):.1f} %")
+    return ', '.join(parts)
+
+
 def _lut(rgb) -> np.ndarray:
     ramp = np.arange(256, dtype=np.float32)
     return np.stack([(ramp * t).astype(np.uint8) for t in rgb])
@@ -353,13 +387,22 @@ class OnlineProcessor:
     ``positions`` are the run's positions (dicts with ``well``, ``site``,
     ``x_um``, ``y_um``); they are referred to by index afterwards.
     ``px_per_um`` is the stage-to-canvas matrix of :func:`tile_offsets`.
+
+    ``shading='auto'`` measures and divides out the shading (see the module
+    notes). ``flat_field`` (tiles -> (gain, info)) and ``apply_gain``
+    ((tile, gain) -> tile) default to Quark's; ``corrected_saver`` (a
+    ``well_file.RunSaver``) receives the corrected copy of every frame.
     """
 
     def __init__(self, base_dir: str, positions: list[dict],
                  channels: list[str], *, compose: bool, stitch: bool,
                  px_per_um, um_per_px: float, z_step_um: float = 0.0,
                  cycles: int = 1, status_cb=None, done_cb=None,
-                 max_stitch_pixels: float = MAX_STITCH_PIXELS):
+                 max_stitch_pixels: float = MAX_STITCH_PIXELS,
+                 shading: str = 'off', flat_field=None, apply_gain=None,
+                 corrected_saver=None):
+        if shading not in SHADING_MODES:
+            raise ValueError(f'shading must be one of {SHADING_MODES}')
         self.base_dir = base_dir
         self.positions = [dict(p) for p in positions]
         self.channels = list(channels)
@@ -383,8 +426,25 @@ class OnlineProcessor:
         self._lock = threading.Lock()
         self._finishing = False
         self.counts = {'composites': 0, 'stitches': 0, 'videos': 0,
-                       'errors': 0}
+                       'corrected': 0, 'errors': 0}
         self.notes: list[str] = []
+        # Automatic shading: products are held until the pattern of every
+        # colour is measured from the first timepoint.
+        self.shading = shading
+        self.auto = shading == 'auto'
+        if self.auto and (flat_field is None or apply_gain is None):
+            import quark_stitch
+            flat_field = flat_field or quark_stitch.flat_field_from_tiles
+            apply_gain = apply_gain or quark_stitch.apply_flat_field
+        self._flat_field = flat_field
+        self._apply_gain = apply_gain
+        self.corrected_saver = corrected_saver if self.auto else None
+        self.gains: dict[str, np.ndarray | None] = {}
+        self.shading_text: dict[str, str] = {}
+        self._samples: dict[str, list[str]] = {}
+        self._first_done: set[int] = set()
+        self._held: list[tuple] = []
+        self._measured = not self.auto
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name='online-processing')
         self._thread.start()
@@ -401,6 +461,8 @@ class OnlineProcessor:
         files = {ch: list(v) for ch, v in files.items() if v}
         if not files:
             return
+        if self.auto:
+            self._put(('correct', index, timepoint, files))
         key = self._group_of.get(index)
         if key is not None:
             with self._lock:
@@ -410,9 +472,47 @@ class OnlineProcessor:
                 if ready:
                     del self._pending[(key, timepoint)]
             if ready:
-                self._q.put(('stitch', key, timepoint, got, elapsed_s))
+                self._put(('stitch', key, timepoint, got, elapsed_s))
         elif self.compose:
-            self._q.put(('composite', index, timepoint, files, elapsed_s))
+            self._put(('composite', index, timepoint, files, elapsed_s))
+        if self.auto:
+            # Sampled after the products are queued, so the last position
+            # of the first timepoint is held and released with the rest.
+            self._shading_sample(index, timepoint, files)
+
+    def _put(self, task: tuple) -> None:
+        with self._lock:
+            if not self._measured:
+                self._held.append(task)
+                return
+        self._q.put(task)
+
+    def _shading_sample(self, index: int, timepoint: int,
+                        files: dict) -> None:
+        """Keep the middle plane of every colour of the first timepoint
+        for the shading measurement; measure once all positions are in
+        (or the run is past its first timepoint)."""
+        with self._lock:
+            if timepoint == 1:
+                for ch, paths in files.items():
+                    self._samples.setdefault(ch, []).append(
+                        paths[len(paths) // 2])
+                self._first_done.add(index)
+            complete = (timepoint > 1 or
+                        len(self._first_done) >= len(self.positions))
+        if complete:
+            self._release()
+
+    def _release(self) -> None:
+        """Measure the shading now, then let the held products through."""
+        with self._lock:
+            if self._measured:
+                return
+            self._measured = True
+            held, self._held = self._held, []
+        self._q.put(('measure',))
+        for task in held:
+            self._q.put(task)
 
     def finish(self) -> None:
         """The acquisition is over (finished or stopped): make the videos
@@ -423,6 +523,9 @@ class OnlineProcessor:
         for key, tp in left:
             self.notes.append(f'{group_name(key) or "tiles"} t{tp:04d} not '
                               f'stitched: not all of its tiles were acquired')
+        if self.auto:
+            # Stopped during the first timepoint: measure from what is in.
+            self._release()
         self._finishing = True
         self._q.put(('videos',))
         self._q.put(None)
@@ -466,6 +569,13 @@ class OnlineProcessor:
             if self._finishing:
                 self._status(f'Acquisition done; processing, '
                              f'{self._q.qsize()} tasks left...')
+        if self.corrected_saver is not None:
+            try:
+                self.corrected_saver.close()
+            except Exception:
+                self.counts['errors'] += 1
+                self._log(f'ERROR closing the corrected copy\n'
+                          f'{traceback.format_exc()}')
         for n in self.notes:
             self._log(n)
         self._log(f'finished: {self.summary()}')
@@ -481,6 +591,11 @@ class OnlineProcessor:
         c = self.counts
         parts = [f'{c["composites"]} composites', f'{c["stitches"]} stitches',
                  f'{c["videos"]} videos']
+        if self.auto:
+            done = [ch for ch, g in self.gains.items() if g is not None]
+            parts.append(f'shading measured for '
+                         f'{", ".join(done) or "NO colour"}, '
+                         f'{c["corrected"]} images corrected')
         if c['errors']:
             parts.append(f'{c["errors"]} ERRORS (see processing.log)')
         if self.notes:
@@ -520,6 +635,87 @@ class OnlineProcessor:
                 self._log(f'video of {name} not updated at timepoint '
                           f'{timepoint} (is it open in a player?)')
 
+    # --- shading
+
+    def _read(self, path: str, ch: str) -> np.ndarray:
+        """A saved plane, with the measured shading divided out."""
+        img = tifffile.imread(path)
+        gain = self.gains.get(ch)
+        if gain is None or img.ndim != 2 or img.shape != gain.shape or \
+                img.dtype not in (np.uint8, np.uint16):
+            return img
+        fixed = self._apply_gain(img.astype(np.uint16), gain)
+        if img.dtype == np.uint8:
+            fixed = np.clip(fixed, 0, 255).astype(np.uint8)
+        return fixed
+
+    def _shading_info(self, chans: list[str]) -> str:
+        if not self.auto:
+            return ''
+        done = [ch for ch in chans if self.gains.get(ch) is not None]
+        if not done:
+            return ' No shading correction (not measured).'
+        return (f' Shading measured from the run (Quark) and divided out '
+                f'for {", ".join(done)}.')
+
+    def _do_measure(self) -> None:
+        """Each colour's shading from the first timepoint's fields."""
+        import json
+        folder = self._dir('shading')
+        record = {'format': 'lvp-shading-1', 'method': 'quark-flat-field',
+                  'channels': {}}
+        for ch in self.channels:
+            paths = self._samples.get(ch, [])
+            if len(paths) > MAX_SHADING_FIELDS:
+                step = len(paths) / MAX_SHADING_FIELDS
+                paths = [paths[int(k * step)]
+                         for k in range(MAX_SHADING_FIELDS)]
+            self._status(f'Measuring the shading of {ch} from '
+                         f'{len(paths)} images (Quark)...')
+            gain, info = None, {}
+            try:
+                tiles = [tifffile.imread(p) for p in paths]
+                tiles = [t for t in tiles if t.ndim == 2 and
+                         t.dtype in (np.uint8, np.uint16) and
+                         t.shape == tiles[0].shape]
+                if len(tiles) < MIN_SHADING_FIELDS:
+                    raise ValueError(
+                        f'{len(tiles)} fields; at least {MIN_SHADING_FIELDS}'
+                        f' are needed (more positions per colour)')
+                gain, info = self._flat_field(
+                    [t.astype(np.uint16) for t in tiles])
+                gain = np.asarray(gain, dtype=np.float32)
+                del tiles
+            except Exception as e:
+                gain, info = None, {'error': str(e)}
+            self.gains[ch] = gain
+            text = describe_shading(info)
+            self.shading_text[ch] = text
+            record['channels'][ch] = {'measured': text, 'info': info,
+                                      'fields': len(paths)}
+            if gain is not None:
+                np.save(os.path.join(folder, f'gain_{ch}.npy'), gain)
+            self._log(f'shading {ch}: {text}')
+        with open(os.path.join(folder, 'shading.json'), 'w',
+                  encoding='utf-8') as f:
+            json.dump(record, f, indent=1, default=str)
+        self._status('Shading: ' + '; '.join(
+            f'{ch} {t}' for ch, t in self.shading_text.items()))
+
+    def _do_correct(self, index: int, timepoint: int, files: dict) -> None:
+        """The corrected copy of one position's frames."""
+        if self.corrected_saver is None:
+            return
+        p = self.positions[index]
+        for ch in self.channels:
+            for zi, path in enumerate(files.get(ch, ()), 1):
+                self.corrected_saver.save(
+                    self._read(path, ch), well=p.get('well'),
+                    site=p.get('site') or 'P1', z_index=zi, channel=ch,
+                    timepoint=timepoint, x_um=p.get('x_um'),
+                    y_um=p.get('y_um'))
+                self.counts['corrected'] += 1
+
     def _do_composite(self, index: int, timepoint: int, files: dict,
                       elapsed_s: float) -> None:
         p = self.positions[index]
@@ -528,7 +724,7 @@ class OnlineProcessor:
                         if t)
         n_z = max(len(files[ch]) for ch in chans)
         mid = n_z // 2
-        mids = {ch: tifffile.imread(plane_path(files[ch], mid))
+        mids = {ch: self._read(plane_path(files[ch], mid), ch)
                 for ch in chans}
         first = mids[chans[0]]
         ranges = {ch: self._fixed_range(name, ch, mids[ch]) for ch in chans}
@@ -537,10 +733,11 @@ class OnlineProcessor:
             for z in range(n_z):
                 for ch in chans:
                     yield (mids[ch] if z == mid else
-                           tifffile.imread(plane_path(files[ch], z)))
+                           self._read(plane_path(files[ch], z), ch))
 
         single = [ch for ch in chans if len(files[ch]) == 1 and n_z > 1]
         info = (f'Composite of {", ".join(chans)}; Z001 is the top plane.'
+                + self._shading_info(chans)
                 + (f' {", ".join(single)} had no z-stack: its one plane is '
                    f'repeated on every z.' if single else ''))
         out = os.path.join(self._dir('composites', p.get('well') or
@@ -567,7 +764,7 @@ class OnlineProcessor:
               for i in members]
         n_z = max(len(got[i][ch]) for i in members for ch in chans)
         mid = n_z // 2
-        probe = {ch: tifffile.imread(plane_path(got[members[0]][ch], mid))
+        probe = {ch: self._read(plane_path(got[members[0]][ch], mid), ch)
                  for ch in chans}
         first = probe[chans[0]]
         th, tw = first.shape[:2]
@@ -582,7 +779,7 @@ class OnlineProcessor:
         pv = max(max(width, height) // PREVIEW_MAX_SIDE, 1)
 
         def one(ch, z):
-            tiles = (shrink(tifffile.imread(plane_path(got[i][ch], z)),
+            tiles = (shrink(self._read(plane_path(got[i][ch], z), ch),
                             factor) for i in members)
             plane = stitch_plane(tiles, offsets, margins, tw_s, th_s,
                                  first.dtype)
@@ -591,7 +788,7 @@ class OnlineProcessor:
             return plane
 
         info = (f'Stitched from {len(members)} tiles by stage position; '
-                f'Z001 is the top plane.'
+                f'Z001 is the top plane.' + self._shading_info(chans)
                 + (f' Reduced {factor}x to stay under '
                    f'{self.max_stitch_pixels / 1e6:.0f} megapixels; the '
                    f'tiles keep full resolution.' if factor > 1 else ''))

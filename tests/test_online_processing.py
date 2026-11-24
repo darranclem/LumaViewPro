@@ -185,7 +185,7 @@ def test_composite_is_written_when_a_position_is_done(tmp_path):
         assert np.array_equal(arr[z, 0], scenes[('BF', 0)][:TH, :TW])
         assert np.array_equal(arr[z, 1], scenes[('GREEN', z)][:TH, :TW])
     assert proc.counts == {'composites': 1, 'stitches': 0, 'videos': 0,
-                           'errors': 0}
+                           'corrected': 0, 'errors': 0}
 
 
 def test_stitch_waits_for_the_last_tile_and_holds_all_channels(tmp_path):
@@ -314,3 +314,159 @@ def test_an_incomplete_tile_group_is_reported_not_stitched(tmp_path):
     assert proc.counts['stitches'] == 0
     assert not (tmp_path / 'stitched').exists()
     assert 'incomplete' in proc.summary()
+
+
+# ------------------------------------------------- automatic shading
+
+def vignette(h=TH, w=TW, depth=0.4):
+    """A centred illumination fall-off, 1 in the middle, mean 1."""
+    yy, xx = np.mgrid[0:h, 0:w]
+    r2 = ((yy - h / 2) / (h / 2)) ** 2 + ((xx - w / 2) / (w / 2)) ** 2
+    g = 1.0 - depth * r2 / 2.0
+    return (g / g.mean()).astype(np.float32)
+
+
+def shaded_fields(folder, positions, ch, tp, gain, level=2000, seed=3):
+    """Plain textured fields with ``gain`` multiplied in, one per
+    position: {index: {ch: [path]}}."""
+    rng = np.random.default_rng(seed + tp)
+    files = {}
+    for i, p in enumerate(positions):
+        true = level + rng.normal(0, level * 0.03, size=gain.shape)
+        img = np.clip(true * gain, 0, 65535).astype(np.uint16)
+        path = os.path.join(folder, f'{p["site"]}_{ch}_t{tp:04d}.tiff')
+        tifffile.imwrite(path, img)
+        files[i] = {ch: [path]}
+    return files
+
+
+class FakeSaver:
+    def __init__(self):
+        self.frames, self.closed = [], False
+
+    def save(self, frame, **kw):
+        self.frames.append((frame, kw))
+
+    def close(self):
+        self.closed = True
+
+
+def fake_quark(gain):
+    def flat_field(tiles):
+        assert len(tiles) >= op.MIN_SHADING_FIELDS
+        return gain, {'fields_used': len(tiles), 'fields_read': len(tiles)}
+
+    def apply_gain(tile, g):
+        return np.clip(np.rint(tile / g), 0, 65535).astype(np.uint16)
+    return flat_field, apply_gain
+
+
+def separate_positions(n, well='C4'):
+    return [{'well': well, 'site': f'P{i + 1}', 'x_um': i * 5000.0,
+             'y_um': 0.0} for i in range(n)]
+
+
+def test_auto_shading_waits_for_the_first_timepoint_then_corrects(tmp_path):
+    gain = vignette()
+    pos = separate_positions(6)
+    files = shaded_fields(str(tmp_path), pos, 'BF', 1, gain)
+    saver = FakeSaver()
+    ff, ap = fake_quark(gain)
+    proc = op.OnlineProcessor(str(tmp_path), pos, ['BF'], compose=True,
+                              stitch=False, px_per_um=PX, um_per_px=1.0,
+                              shading='auto', flat_field=ff, apply_gain=ap,
+                              corrected_saver=saver)
+    for i in range(len(pos) - 1):
+        proc.position_done(i, 1, files[i])
+    assert proc._q.empty()              # held until every field is in
+    proc.position_done(len(pos) - 1, 1, files[len(pos) - 1])
+    run(proc)
+    assert np.allclose(np.load(tmp_path / 'shading' / 'gain_BF.npy'), gain)
+    assert (tmp_path / 'shading' / 'shading.json').exists()
+    out = tifffile.imread(str(tmp_path / 'composites' / 'C4' /
+                              'C4_P1_composite_t0001.tiff'))
+    raw = tifffile.imread(files[0]['BF'][0])
+    corner, middle = (slice(0, 6), slice(0, 6)), (slice(27, 33), slice(37, 43))
+    # the raw field is darker in the corner; the composite is not
+    assert raw[corner].mean() < 0.8 * raw[middle].mean()
+    assert abs(out[corner].mean() / out[middle].mean() - 1) < 0.05
+    assert len(saver.frames) == 6 and saver.closed
+    frame, kw = saver.frames[0]
+    assert kw['well'] == 'C4' and kw['channel'] == 'BF' and \
+        kw['timepoint'] == 1 and kw['z_index'] == 1
+    assert np.array_equal(frame, ap(raw, gain))
+    assert np.array_equal(tifffile.imread(files[0]['BF'][0]), raw)  # raw kept
+    assert proc.counts['corrected'] == 6
+    assert 'shading measured for BF' in proc.summary()
+
+
+def test_auto_shading_with_too_few_fields_leaves_images_as_stored(tmp_path):
+    pos = separate_positions(2)
+    files = shaded_fields(str(tmp_path), pos, 'BF', 1, vignette())
+    saver = FakeSaver()
+    ff, ap = fake_quark(vignette())
+    proc = op.OnlineProcessor(str(tmp_path), pos, ['BF'], compose=True,
+                              stitch=False, px_per_um=PX, um_per_px=1.0,
+                              shading='auto', flat_field=ff, apply_gain=ap,
+                              corrected_saver=saver)
+    for i in range(len(pos)):
+        proc.position_done(i, 1, files[i])
+    run(proc)
+    assert proc.gains['BF'] is None
+    assert 'not measured' in proc.shading_text['BF']
+    out = tifffile.imread(str(tmp_path / 'composites' / 'C4' /
+                              'C4_P1_composite_t0001.tiff'))
+    assert np.array_equal(out, tifffile.imread(files[0]['BF'][0]))
+    assert 'NO colour' in proc.summary()
+
+
+def test_a_run_stopped_in_its_first_timepoint_still_gets_its_products(
+        tmp_path):
+    gain = vignette()
+    pos = separate_positions(8)
+    files = shaded_fields(str(tmp_path), pos, 'BF', 1, gain)
+    ff, ap = fake_quark(gain)
+    proc = op.OnlineProcessor(str(tmp_path), pos, ['BF'], compose=True,
+                              stitch=False, px_per_um=PX, um_per_px=1.0,
+                              shading='auto', flat_field=ff, apply_gain=ap)
+    for i in range(5):                   # stopped after 5 of 8
+        proc.position_done(i, 1, files[i])
+    run(proc)
+    assert proc.counts['composites'] == 5
+    assert proc.gains['BF'] is not None
+
+
+def test_reference_shading_does_nothing_in_the_processor(tmp_path):
+    proc = op.OnlineProcessor(str(tmp_path), [], ['BF'], compose=True,
+                              stitch=False, px_per_um=PX, um_per_px=1.0,
+                              shading='reference')
+    assert not proc.auto and proc._measured
+    run(proc)
+    with pytest.raises(ValueError):
+        op.OnlineProcessor(str(tmp_path), [], ['BF'], compose=True,
+                           stitch=False, px_per_um=PX, um_per_px=1.0,
+                           shading='sometimes')
+
+
+def test_auto_shading_with_quark_divides_out_the_vignette(tmp_path):
+    """The real Quark module (PyO3), as the Quark app uses on Etaluma
+    plates: the pattern measured from plain fields and divided out."""
+    import quark_stitch
+    if not quark_stitch.available():
+        pytest.skip(quark_stitch.why_unavailable())
+    gain = vignette()
+    pos = separate_positions(16)
+    files = shaded_fields(str(tmp_path), pos, 'PC', 1, gain)
+    proc = op.OnlineProcessor(str(tmp_path), pos, ['PC'], compose=True,
+                              stitch=False, px_per_um=PX, um_per_px=1.0,
+                              shading='auto')
+    for i in range(len(pos)):
+        proc.position_done(i, 1, files[i])
+    run(proc)
+    measured = proc.gains['PC']
+    assert measured is not None, proc.shading_text
+    assert np.abs(measured / gain - 1).mean() < 0.03
+    out = tifffile.imread(str(tmp_path / 'composites' / 'C4' /
+                              'C4_P3_composite_t0001.tiff')).astype(float)
+    raw = tifffile.imread(files[2]['PC'][0]).astype(float)
+    assert out.std() < 0.5 * raw.std()     # the fall-off is gone

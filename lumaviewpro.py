@@ -2808,6 +2808,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             'zstack_optout': self.zstack_optout,
             'compose_on': bool(self.compose_on),
             'stitch_on': bool(self.stitch_on),
+            'run_shading': self.run_shading,
             'objective_name': self.objective_name,
             'positions_objective': getattr(self, 'positions_objective', ''),
             'travel_clearance_um': self.travel_clearance_um,
@@ -2914,6 +2915,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self.zstack_optout = dict(d.get('zstack_optout') or {})
             self.compose_on = bool(d.get('compose_on', False))
             self.stitch_on = bool(d.get('stitch_on', False))
+            if d.get('run_shading') in online_processing.SHADING_MODES:
+                self.run_shading = d['run_shading']
             self.positions_objective = (d.get('positions_objective')
                                         or d.get('objective_name') or '')
             self.travel_clearance_um = float(d.get('travel_clearance_um', 500.0))
@@ -4702,16 +4705,49 @@ class LumaViewProApp(ExperimentWizardMixin, App):
 
         # Online compositing / stitching: told about every completed
         # position, it works on its own thread from the saved files.
+        # Shading correction of this run (the pulldown beside the online
+        # processing): 'reference' divides each colour's empty-field
+        # reference out as the frames are taken; 'auto' has Quark measure
+        # the pattern from the run's own images (online processing).
+        run_shading = self.run_shading
+        if run_shading == 'auto':
+            import quark_stitch
+            if not quark_stitch.available():
+                self._set_status('Automatic shading is not possible ('
+                                 + quark_stitch.why_unavailable()
+                                 + ') - running without')
+                run_shading = 'off'
+        ref_missing = (set(ch for ch in channels
+                           if not self.shading.has_reference(ch))
+                       if run_shading == 'reference' else set())
+        if ref_missing:
+            self._set_status('Shading: no reference image for '
+                             + ', '.join(sorted(ref_missing))
+                             + ' - those colours are saved uncorrected')
         proc = None
-        if self.compose_on or self.stitch_on:
+        if self.compose_on or self.stitch_on or run_shading == 'auto':
             if online_processing.available():
                 A = self._img_cal_matrix()
                 scale = max(self.effective_um_per_px(), 1e-6)
                 stacked = [self.channel_settings[ch] for ch in channels
                            if self.channel_settings[ch].zstack.enabled]
+                corrected = None
+                if run_shading == 'auto':
+                    # The corrected copy of the run, in its save format.
+                    corrected = well_file.RunSaver(
+                        os.path.join(base_dir, 'shading_corrected'),
+                        self.save_format, um_per_px=scale,
+                        z_step_um=(stacked[0].zstack.step_um
+                                   if stacked else 0.0),
+                        info={'protocol': self.protocol_name or '',
+                              'objective': self.objective_name or '',
+                              'shading': 'measured from the run (Quark)'},
+                        single_writer=acq.save_image,
+                        name_of=experiment.file_name)
                 proc = online_processing.OnlineProcessor(
                     base_dir, positions, channels,
                     compose=self.compose_on, stitch=self.stitch_on,
+                    shading=run_shading, corrected_saver=corrected,
                     # A is the image shift per um of stage travel; a tile
                     # sits on the canvas the opposite way.
                     px_per_um=(-A if A is not None else np.eye(2) / scale),
@@ -4728,6 +4764,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             else:
                 self._set_status('Online processing needs the tifffile and '
                                  'opencv-python packages - running without')
+        apply_reference = run_shading == 'reference'
         t_run = time.time()
         stacked_all = [self.channel_settings[ch] for ch in channels
                        if self.channel_settings[ch].zstack.enabled]
@@ -4889,7 +4926,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                             if frame is None:
                                 complete = False
                                 continue
-                            if self.shading_on:
+                            if apply_reference and ch not in ref_missing:
                                 frame = self.shading.apply(frame, ch, z)
                             path = saver.save(
                                 frame, well=p['well'], site=p['site'],
@@ -5004,6 +5041,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             'zstack_optout': self.zstack_optout,
             'compose_on': bool(self.compose_on),
             'stitch_on': bool(self.stitch_on),
+            'run_shading': self.run_shading,
         }
         try:
             acq.save_settings(payload)
@@ -5113,6 +5151,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self.af_each_cycle_on = self._af_cs().enabled
             self.compose_on = bool(d.get('compose_on', False))
             self.stitch_on = bool(d.get('stitch_on', False))
+            if d.get('run_shading') in online_processing.SHADING_MODES:
+                self.run_shading = d['run_shading']
             # Every launch starts with an empty plate: no selected wells,
             # positions, z-stack opt-outs or focus map from the last run.
             # (Instrument settings and the plate calibration are kept; a
