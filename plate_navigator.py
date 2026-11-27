@@ -1,7 +1,7 @@
 from __future__ import annotations
 import math
 import numpy as np
-from kivy.graphics import (Color, Line, Rectangle, Ellipse, Mesh,
+from kivy.graphics import (Color, Line, Rectangle, Mesh,
                            StencilPush, StencilUse, StencilUnUse, StencilPop)
 from kivy.graphics.texture import Texture
 from kivy.properties import BooleanProperty, NumericProperty, StringProperty
@@ -592,6 +592,13 @@ class WellPlateMapWidget(Widget):
         self.live_corners_mm = [(lw.a1_offset_x + x, lw.a1_offset_y + y)
                                 for x, y in corners_rel_mm]
 
+    @staticmethod
+    def selected_line_width(well_radius_px: float) -> float:
+        """Half-thickness of the green line around a selected well: thick
+        (3 px each side), thinner on wells drawn very small so the line
+        does not fill them."""
+        return float(min(3.0, max(1.5, 0.3 * well_radius_px)))
+
     def live_image_fraction(self, mm_x: float, mm_y: float):
         """Where a plate point is in the live image: (fx, fy) from the
         image center as a fraction of its width and height (+y down the
@@ -822,11 +829,6 @@ class WellPlateMapWidget(Widget):
                     if (sx + well_rx < left or sx - well_rx > right or
                             sy + well_ry < bottom or sy - well_ry > top):
                         continue        # outside the zoomed view
-                    if (r, c) in self.active_wells:
-                        Color(0.1, 0.75, 0.45, 0.55)
-                        fill = Rectangle if shape == 'square' else Ellipse
-                        fill(pos=(sx - well_rx, sy - well_ry),
-                             size=(2 * well_rx, 2 * well_ry))
                     if (r, c) in self.flagged_wells:
                         Color(1.0, 0.3, 0.25, 1)
                         Line(points=[sx - well_rx, sy - well_ry,
@@ -843,6 +845,19 @@ class WellPlateMapWidget(Widget):
                     else:
                         Line(ellipse=(sx - well_rx, sy - well_ry,
                                       2 * well_rx, 2 * well_ry), width=1.0)
+                    if (r, c) in self.active_wells:
+                        # Selected for the experiment: a thick green line
+                        # along the well edge (no fill: the previews and
+                        # the live image inside stay visible).
+                        w = self.selected_line_width(min(well_rx, well_ry))
+                        Color(0.15, 0.9, 0.4, 1)
+                        if shape == 'square':
+                            Line(rectangle=(sx - well_rx, sy - well_ry,
+                                            2 * well_rx, 2 * well_ry),
+                                 width=w, joint='miter')
+                        else:
+                            Line(ellipse=(sx - well_rx, sy - well_ry,
+                                          2 * well_rx, 2 * well_ry), width=w)
             # Protocol position markers
             # Many positions (tiles): small dots, so the pattern inside
             # each well stays readable instead of merging into a blob.

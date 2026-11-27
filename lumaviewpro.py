@@ -180,6 +180,8 @@ PARKED_FLAG = os.path.join(LOGS_DIR, 'parked.flag')
 # logs/errors.log (see run_guard).
 import run_guard
 run_guard.install(LOGS_DIR)
+import run_mirror
+import fast_timelapse
 
 
 class _LogAndContinue(ExceptionHandler):
@@ -310,6 +312,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
     run_active = BooleanProperty(False)
     run_fraction = NumericProperty(0.0)
     run_line = StringProperty('')
+    fast_info = StringProperty('')        # fast time-lapse: the last one
     map_big = BooleanProperty(False)      # plate map fills the image area
     pos_edit_mode = StringProperty('')    # map clicks: '', 'move' or 'add'
     zman_info = StringProperty('')        # manual z-stack: what will be run
@@ -323,7 +326,10 @@ class LumaViewProApp(ExperimentWizardMixin, App):
     # How protocol runs and z-stacks are saved: one file per well / stack
     # ('ome-tiff' or 'zarr'), one file for the whole run ('run-ome-tiff',
     # 'run-zarr'), or single-page TIFFs ('single').
-    save_format = StringProperty('ome-tiff')
+    save_format = StringProperty('position')
+    # Where runs kept on a network drive are written first ('' = the
+    # local disk run_mirror chooses): see run_mirror.
+    spool_dir = StringProperty('')
     lens_pos_info = StringProperty('')    # work position of the lens in use
     work_at_start_on = BooleanProperty(True)   # raise to it after homing
     # The plate map is drawn as a plate is always drawn: A1 top left. (It
@@ -510,6 +516,29 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             return
         if found:
             Clock.schedule_once(lambda dt: self._last_run_popup(found), 1.0)
+        # Runs written to the local disk whose copying to where they are
+        # kept was cut short (after their files were finished, above).
+        try:
+            roots = {r for r in (self.spool_dir.strip(),
+                                 run_mirror.default_spool_root(),
+                                 self._spool_fallback()) if r}
+            for root in sorted(roots):
+                self._mirrors.extend(run_mirror.resume_pending(
+                    root, status_cb=self._set_status,
+                    skip=[m.src for m in self._mirrors]))
+        except Exception as e:
+            run_guard.log_error(f'carrying on the copying of earlier runs '
+                                f'failed: {e}')
+
+    _mirrors: list = []
+
+    def _spool_fallback(self) -> str:
+        """This account's own folder for runs, when the local disk's
+        cannot be written."""
+        try:
+            return os.path.join(acq.user_documents_dir(), 'runs')
+        except Exception:
+            return ''
 
     def _last_run_popup(self, found: dict):
         try:
@@ -1751,6 +1780,190 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         self.worker.request_cancel()
         self._set_status('Cancel requested...')
 
+    # ------------------------------------------------- fast time-lapse
+
+    def fast_plan(self, channel: str, frames_text: str, duration_text: str,
+                  cycle_text: str) -> str:
+        """What "Record" will do with the fields as they are, in words."""
+        frames = int(self._f(frames_text, 0) or 0)
+        duration = float(self._f(duration_text, 0.0) or 0.0)
+        cycle = max(float(self._f(cycle_text, 0.0) or 0.0), 0.0)
+        if channel not in CHANNELS:
+            return ('Choose the colour to record in LIVE CHANNEL (the '
+                    'Autofocus channel is not recorded).')
+        ends = [f'{frames} frames'] if frames > 0 else []
+        if duration > 0:
+            ends.append(f'{duration:g} s')
+        end = (' or '.join(ends) + (', whichever comes first'
+                                    if len(ends) == 2 else '')
+               if ends else 'until Stop')
+        return (f'{channel}, where the stage is now: '
+                f'{fast_timelapse.describe_cycle(cycle)}; {end}.')
+
+    def run_fast_timelapse(self):
+        """Record the channel shown in Channel settings as a time-lapse at
+        the place the stage is: fast_timelapse (cycle time from the start
+        of a frame to the start of the next; 0 = as fast as the camera)."""
+        if self.worker_busy:
+            self._set_status('Busy: another acquisition is running')
+            return
+        ch = self.selected_channel
+        if ch not in CHANNELS:
+            self._set_status('Fast time-lapse: choose the colour to record '
+                             'in LIVE CHANNEL first')
+            return
+        if not self.camera_connected:
+            self._set_status('Fast time-lapse: no camera')
+            return
+        ids = self.root.ids
+        frames = int(self._f(ids.fast_frames_input.text, 0) or 0)
+        duration = float(self._f(ids.fast_duration_input.text, 0.0) or 0.0)
+        cycle = max(float(self._f(ids.fast_cycle_input.text, 0.0) or 0.0), 0.0)
+        cs = self.channel_settings[ch]
+        # Written to the local disk first when it is kept on a network
+        # drive, as a protocol run is (run_mirror).
+        keep_root = (self.output_dir or '').strip() or CAPTURES_DIR
+        spool = run_mirror.spool_for(keep_root, self.spool_dir,
+                                     self._spool_fallback())
+        mirror = None
+        if spool:
+            folder = acq.timestamp_dir(spool, 'fast')
+            mirror = run_mirror.Mirror(
+                folder, os.path.join(keep_root, os.path.basename(folder)),
+                status_cb=self._set_status)
+            self._mirrors.append(mirror)
+        else:
+            folder = acq.timestamp_dir(self._out_base(), 'fast')
+        path = os.path.join(folder, f'{ch}.ome.tiff')
+        cancel = self.worker.cancel
+        pulsed = cycle >= fast_timelapse.LIGHT_OFF_FROM_S
+        x_um, y_um, z_um = self.stage_x_um, self.stage_y_um, self.stage_z_um
+        self.live_channel = ch
+        shown = {'t': 0.0}
+
+        def _grab():
+            if pulsed:
+                # A long gap: the light is only on for the frame.
+                self.hw.set_channel(ch, cs)
+                frame = self.hw.grab_settled(settle_s=0.1)
+                self.hw.leds_off()
+                return frame
+            return self.hw.grab_fresh()
+
+        def _progress(taken, t_s, last_cycle):
+            self.watchdog.beat('run', 600.0, f'fast time-lapse frame {taken}')
+            now = time.time()
+            if now - shown['t'] < 0.25:
+                return
+            shown['t'] = now
+            frac = 0.0
+            if frames > 0:
+                frac = max(frac, taken / frames)
+            if duration > 0:
+                frac = max(frac, t_s / duration)
+            line = (f'Fast time-lapse {ch}: frame {taken}'
+                    + (f' of {frames}' if frames > 0 else '')
+                    + f'   |   {t_s:.1f} s'
+                    + (f' of {duration:g} s' if duration > 0 else '')
+                    + (f'   |   {last_cycle * 1000:.0f} ms from start to start'
+                       if last_cycle > 0 else '')
+                    + (f'   |   {rec.waiting} frames waiting for the disk'
+                       if rec.waiting > 20 else ''))
+            Clock.schedule_once(lambda dt: (
+                setattr(self, 'run_fraction', min(frac, 1.0)),
+                setattr(self, 'run_line', line)), 0)
+
+        rec = None
+
+        def _job():
+            nonlocal rec
+            result, failed = {}, ''
+            Clock.schedule_once(lambda dt: (
+                setattr(self, 'run_fraction', 0.0),
+                setattr(self, 'run_line', f'Fast time-lapse {ch}: starting'),
+                setattr(self, 'run_active', True)), 0)
+            run_guard.keep_awake(True)
+            try:
+                rec = fast_timelapse.Recorder(
+                    path, ch, um_per_px=self.effective_um_per_px(),
+                    x_um=x_um, y_um=y_um, z_um=z_um,
+                    exposure_ms=cs.exposure_ms,
+                    info={'objective': self.objective_name or ''},
+                    should_stop=cancel.is_set,
+                    describe={
+                        'started': time.strftime('%Y-%m-%d %H:%M:%S'),
+                        'objective': self.objective_name or '',
+                        'um_per_px': self.effective_um_per_px(),
+                        'asked_for': {'frames': frames or None,
+                                      'duration_s': duration or None,
+                                      'cycle_s': cycle},
+                        'light': ('on for each frame only' if pulsed
+                                  else 'on throughout'),
+                        'colour_settings': acq.channel_settings_to_dict(
+                            {ch: cs})[ch]})
+                if mirror is not None:
+                    mirror.start()
+                # Light and camera as the colour is set; the first frames
+                # after a change are not used.
+                self.hw.set_channel(ch, cs)
+                self.hw.grab_settled(settle_s=0.2)
+                if pulsed:
+                    self.hw.leds_off()
+                result = fast_timelapse.record(
+                    _grab, rec.put, frames=frames, duration_s=duration,
+                    cycle_s=cycle, should_stop=cancel.is_set,
+                    progress=_progress)
+            except Exception as e:
+                failed = f'{type(e).__name__}: {e}'
+                run_guard.log_error(f'fast time-lapse: {failed}')
+            finally:
+                try:
+                    self.hw.leds_off()
+                except Exception:
+                    pass
+                Clock.schedule_once(
+                    lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
+                if rec is not None:
+                    if rec.waiting:
+                        self._set_status(f'Fast time-lapse: writing the last '
+                                         f'{rec.waiting} frames...')
+                    try:
+                        rec.close(result)
+                    except Exception as e:
+                        failed = failed or f'{type(e).__name__}: {e}'
+                        run_guard.log_error(f'fast time-lapse, saving: {e}')
+                if mirror is not None:
+                    mirror.finish()
+                run_guard.keep_awake(False)
+                self.watchdog.rest('run')
+                Clock.schedule_once(
+                    lambda dt: setattr(self, 'run_active', False), 0)
+            n = rec.written if rec is not None else 0
+            mean = result.get('mean_cycle_s', 0.0)
+            text = (f'{n} frames of {ch}'
+                    + (f', {mean * 1000:.1f} ms from start to start on average '
+                       f'({1.0 / mean:.1f} frames a second)' if mean > 0 else '')
+                    + (f', over {result.get("elapsed_s", 0.0):.1f} s'
+                       if n > 1 else '')
+                    + (f'; {result["missed"]} frames the camera did not give'
+                       if result.get('missed') else '')
+                    + (f'; the camera waited for the disk at '
+                       f'{rec.waited_for_disk} frames'
+                       if rec is not None and rec.waited_for_disk else '')
+                    + f' -> {path}')
+            how = result.get('how', '')
+            head = ('FAST TIME-LAPSE STOPPED by an error (' + failed + '): '
+                    if failed else
+                    'FAST TIME-LAPSE STOPPED (no frames from the camera): '
+                    if how == 'no frames from the camera' else
+                    'Fast time-lapse stopped: ' if how == 'stopped' else
+                    'Fast time-lapse finished: ')
+            Clock.schedule_once(
+                lambda dt: setattr(self, 'fast_info', head + text), 0)
+            self._set_status(head + text)
+
+        self._bg(_job, busy_job=True)
+
     # ------------------------------------------------------ channel control
 
     def _cs(self, channel: str | None = None) -> ChannelSettings:
@@ -1909,6 +2122,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         if self.worker_busy:
             return False
         self.live_channel = AF_CHANNEL
+        self.af_source = acq.led_channel(AF_CHANNEL, self._af_cs())
         self.selected_channel = AF_CHANNEL
         return True
 
@@ -1924,14 +2138,38 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self._set_status('Busy: the Autofocus channel is not changed '
                              'during an acquisition')
             return
-        a.source = channel
+        # What is typed in the panel for the light it leaves counts.
+        if self.selected_channel == AF_CHANNEL:
+            ids = self.root.ids
+            a.exposure_ms = min(max(self._f(ids.exposure_input.text,
+                                            a.exposure_ms),
+                                    self.exp_min_ms), self.exp_max_ms)
+            a.gain_db = min(max(self._f(ids.gain_input.text, a.gain_db),
+                                self.gain_min_db), self.gain_max_db)
+        fresh = acq.af_use_light(self.channel_settings, channel,
+                                 self.exp_min_ms, self.exp_max_ms)
+        a.exposure_ms = self._round_sig(a.exposure_ms)
         if show:
             self._af_show()
         self._af_changed(
-            f'Autofocus channel: {channel} light, {a.exposure_ms:g} ms, '
-            f'gain {a.gain_db:g} dB, LED {a.led_power} mA. Dark or '
-            f'saturated? Set the exposure and LED below, or press '
-            f'"Start from the {channel} colour"')
+            f'Autofocus channel uses {channel}: {a.exposure_ms:g} ms, gain '
+            f'{a.gain_db:g} dB, LED {a.led_power} mA '
+            + (f'(started from the {channel} colour; change them here, '
+               f'the {channel} colour itself is not touched)' if fresh
+               else '(its own settings for this light)'))
+
+    def panel_channel_picked(self, text: str):
+        """The Channel pulldown of the Channel settings panel. With the
+        Autofocus channel shown it chooses the light autofocus uses (the
+        panel stays the Autofocus channel's); otherwise it chooses the
+        colour whose settings are shown."""
+        if not self.root or text not in CHANNELS:
+            return
+        if self.selected_channel == AF_CHANNEL:
+            if text != acq.led_channel(AF_CHANNEL, self._af_cs()):
+                self.set_af_source(text, True)
+        else:
+            self.select_channel(text)
 
     def set_af_binning(self, text: str, show: bool = False):
         """Pixels a side summed into one in the Autofocus channel: '2x2'
@@ -2024,7 +2262,11 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self._set_status('All channels off')
             return
         self.live_channel = channel
-        # The Channel settings panel shows the channel that is live.
+        # The Channel settings panel shows the channel that is live. (Its
+        # pulldown shows the Autofocus light while that channel is shown:
+        # it must be the present one before the panel changes over, or
+        # the change would be taken for a choice.)
+        self.af_source = acq.led_channel(AF_CHANNEL, self._af_cs())
         self.selected_channel = channel
         self._sync_channel_fields()
         self._bg(self.hw.set_channel, channel, self._cs(channel))
@@ -2510,10 +2752,69 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         self._set_status(f'Protocol data directory: {self.output_dir}'
                          + self._dir_note(self.output_dir))
 
+    # ------------------------------------- local folder runs are written to
+
+    def spool_default(self) -> str:
+        return run_mirror.default_spool_root()
+
+    def spool_note(self, spool_dir: str, output_dir: str) -> str:
+        """What a run does with the two folders as they are set now."""
+        keep = (output_dir or '').strip() or CAPTURES_DIR
+        chosen = (spool_dir or '').strip()
+        if chosen and run_mirror.is_network_path(chosen):
+            return (f'{chosen} is a network drive and is not used as the '
+                    f'local folder.')
+        try:
+            a = os.path.normcase(os.path.abspath(chosen)) if chosen else ''
+            b = os.path.normcase(os.path.abspath(keep))
+        except Exception:
+            a = b = ''
+        if chosen and (a == b or a.startswith(b.rstrip('\\/') + os.sep)):
+            return f'A run is written straight to {keep}.'
+        if chosen or run_mirror.is_network_path(keep):
+            return (f'A run is written to {chosen or self.spool_default()} '
+                    f'while it is taken, and copied (checked) to {keep} in '
+                    f'the background. The local copy is kept.')
+        return (f'A run is written straight to {keep} (a local disk). Set a '
+                f'local folder to have it written there first.')
+
+    def set_spool_dir(self, text: str):
+        """The local folder a run is written to while it is taken ('' =
+        chosen by the program when the data folder is a network drive)."""
+        text = text.strip()
+        if text and run_mirror.is_network_path(text):
+            self._set_status(f'{text} is a network drive: choose a folder on '
+                             f'a disk of this PC for the local saving')
+            return
+        self.spool_dir = text
+        self._persist()
+        if not text:
+            self._set_status('Local folder for runs: chosen automatically ('
+                             + self.spool_default() + ' when the data folder '
+                             'is a network drive)')
+            return
+        free = run_guard.free_disk_gb(text if os.path.isdir(text)
+                                      else os.path.splitdrive(text)[0] + os.sep)
+        self._set_status(
+            f'Runs are written to {text} first'
+            + (f' ({free:.0f} GB free)' if free is not None else '')
+            + ('' if acq.dir_writable(text) else
+               ' - CANNOT WRITE THERE NOW: another local folder is used '
+               'until it can'))
+
+    def open_spool_dir(self):
+        try:
+            path = self.spool_dir.strip() or self.spool_default()
+            os.makedirs(path, exist_ok=True)
+            os.startfile(path)
+        except Exception as e:
+            self._set_status(f'Open folder failed: {e}')
+
     def browse_dir(self, which: str):
-        """Pick the data ('output') or autosave ('protocol') folder in the
-        Windows folder window."""
+        """Pick the data ('output'), local ('spool') or autosave
+        ('protocol') folder in the Windows folder window."""
         current = {'output': self.output_dir,
+                   'spool': self.spool_dir or self.spool_default(),
                    'zstack': self.zstack_dir or self.output_dir
                    }.get(which, self.protocol_dir)
         try:
@@ -2525,7 +2826,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             path = filedialog.askdirectory(
                 parent=root, mustexist=False,
                 initialdir=current if os.path.isdir(current) else None,
-                title={'output': 'Folder for the image data',
+                title={'output': 'Final destination of the image data',
+                       'spool': 'Local folder runs are written to first',
                        'zstack': 'Folder for z-stacks taken by hand'
                        }.get(which, 'Folder for autosaved and saved protocols'))
             root.destroy()
@@ -2538,10 +2840,55 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         path = os.path.normpath(path)
         if which == 'output':
             self.set_output_dir(path)
+        elif which == 'spool':
+            self.set_spool_dir(path)
         elif which == 'zstack':
             self.set_zstack_dir(path)
         else:
             self.set_protocol_dir(path)
+
+    def open_protocol_dir(self):
+        try:
+            os.makedirs(self.protocol_dir, exist_ok=True)
+            os.startfile(self.protocol_dir)
+        except Exception as e:
+            self._set_status(f'Open folder failed: {e}')
+
+    def ask_protocol_file(self, name: str, load: bool = False):
+        """Windows "Save as" (or, with ``load``, "Open") window for a
+        protocol file: (folder, name without .json), or None when it was
+        closed."""
+        try:
+            import tkinter
+            from tkinter import filedialog
+            root = tkinter.Tk()
+            root.withdraw()
+            root.attributes('-topmost', True)
+            start = (self.protocol_dir
+                     if os.path.isdir(self.protocol_dir) else None)
+            if load:
+                path = filedialog.askopenfilename(
+                    parent=root, title='Load a protocol', initialdir=start,
+                    filetypes=[('Protocol', '*.json')])
+            else:
+                path = filedialog.asksaveasfilename(
+                    parent=root, title='Save the protocol as',
+                    initialdir=start,
+                    initialfile=(name or 'protocol1') + '.json',
+                    defaultextension='.json',
+                    filetypes=[('Protocol', '*.json')])
+            root.destroy()
+        except Exception as e:
+            self._set_status(f'File window not available ({e}): type the '
+                             f'protocol folder, then use the name or list')
+            return None
+        if not path:
+            return None
+        path = os.path.normpath(path)
+        stem = os.path.basename(path)
+        if stem.lower().endswith('.json'):
+            stem = stem[:-5]
+        return os.path.dirname(path), stem
 
     def open_output_dir(self):
         try:
@@ -4808,13 +5155,46 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             positions,
             (lambda p: self._pos_well_name(p['x_um'], p['y_um']))
             if self._use_wells() else None)
-        base_dir = acq.timestamp_dir(self._out_base(), 'protocol')
+        # Local first: a run that is kept on a network drive is written to
+        # a local disk and copied there in the background (run_mirror), so
+        # that a drive that stops answering cannot stop or delay the run.
+        keep_root = (self.output_dir or '').strip() or CAPTURES_DIR
+        spool = run_mirror.spool_for(keep_root, self.spool_dir,
+                                     self._spool_fallback())
+        mirror = None
+        if spool:
+            base_dir = acq.timestamp_dir(spool, 'protocol')
+            keep_dir = os.path.join(keep_root, os.path.basename(base_dir))
+            mirror = run_mirror.Mirror(base_dir, keep_dir,
+                                       status_cb=self._set_status)
+            self._mirrors.append(mirror)
+            self._set_status(f'This run is written to {base_dir} and copied '
+                             f'to {keep_dir} in the background')
+        else:
+            base_dir = acq.timestamp_dir(self._out_base(), 'protocol')
+            keep_dir = base_dir
         try:
             import json
             manifest = self._protocol_payload(self.protocol_name)
             manifest['positions'] = positions
             manifest['file_name_order'] = ['well', 'tile_or_position',
                                            'z_plane', 'colour', 'timepoint']
+            manifest['run'] = {
+                'started': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'timepoints': cycles, 'interval_s': interval_s,
+                'colours': list(channels),
+                'objective': self.objective_name or '',
+                'um_per_px': self.effective_um_per_px(),
+                'save_format': self.save_format,
+                'saved_as': well_file.SAVE_FORMAT_LABEL.get(
+                    self.save_format, self.save_format),
+                'files': ('<well>/<well>_<site>_t<timepoint>.ome.tiff: every '
+                          'colour and z plane of one position at one '
+                          'timepoint; <same name>.json beside it describes it'
+                          if self.save_format == 'position' else ''),
+                'written_to': base_dir, 'kept_in': keep_dir,
+                'shading': self.run_shading,
+            }
             with open(os.path.join(base_dir, 'experiment.json'), 'w',
                       encoding='utf-8') as f:
                 json.dump(manifest, f, indent=2)
@@ -4877,6 +5257,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                         # The planes kept for the processing are no longer
                         # needed: the well files are the data.
                         saver.remove_planes(),
+                        mirror.finish() if mirror is not None else None,
                         Clock.schedule_once(
                         lambda dt: self._processing_done_popup(
                             base_dir, summary, videos), 0)))
@@ -4897,7 +5278,22 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             info={'protocol': self.protocol_name or '',
                   'objective': self.objective_name or ''},
             single_writer=acq.save_image,
-            name_of=experiment.file_name)
+            name_of=experiment.file_name,
+            # A drive that stops answering: the run waits and carries on
+            # (well_file.retry_io); Stop ends the waiting.
+            on_wait=self._set_status, should_stop=cancel.is_set,
+            # What was being done, for the sidecar of every position file.
+            describe={
+                'protocol': self.protocol_name or '',
+                'objective': self.objective_name or '',
+                'timepoints': cycles, 'interval_s': interval_s,
+                'shading': run_shading,
+                'colours': {ch: dict(v) for ch, v in
+                            acq.channel_settings_to_dict(
+                                {c: self.channel_settings[c]
+                                 for c in channels}).items()}})
+        if mirror is not None:
+            mirror.start()
 
         # What the run will take, for the progress strip: the images of
         # one timepoint, the wells in the order they are visited, and each
@@ -4974,8 +5370,20 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self._active_run = (saver, run_log)
             # Windows must not go to sleep part way through.
             run_guard.keep_awake(True)
+            stopped = ''
             try:
                 _run()
+            except OSError as e:
+                # Saving failed for good (the waiting ran out, or Stop was
+                # pressed while it waited). What was taken is kept.
+                stopped = (f'PROTOCOL STOPPED: the images could not be '
+                           f'saved to {base_dir} ({e}). ')
+                state['how'] = f'stopped: the images could not be saved ({e})'
+                run_log.error('the run stopped: saving failed', e)
+                try:
+                    self.hw.leds_off()
+                except Exception:
+                    pass
             except Exception as e:
                 state['how'] = f'stopped by an error: {type(e).__name__}: {e}'
                 run_log.error('the run stopped', e)
@@ -4989,15 +5397,29 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                 # The well files get their metadata now, whatever happened.
                 try:
                     saver.close()
+                    if stopped:
+                        self._set_status(stopped + 'The images taken until '
+                                         'then are saved.')
                 except Exception as e:
                     run_log.error('closing the well files failed', e)
-                    self._set_status(f'Closing the well files failed: {e}')
+                    self._set_status(stopped + f'Closing the well files: {e}')
                 if state['missing']:
                     run_log.write(f'{state["missing"]} images could not be '
                                   f'taken (no frame from the camera)')
                 run_log.end(state['how'] or (
                     'stopped by the user' if cancel.is_set() else 'finished'))
                 self._active_run = None
+                if mirror is not None:
+                    if proc is None or not state.get('proc_told'):
+                        # Nothing more is written to the run folder.
+                        mirror.finish()
+                    if not mirror.complete:
+                        run_log.write('copying: ' + mirror.progress())
+                        Clock.schedule_once(lambda dt: self._set_status(
+                            f'The run is in {base_dir}; '
+                            f'{mirror.progress()}. Leave LumaViewPro open '
+                            f'until it says the run is on the drive (it '
+                            f'carries on at the next start otherwise).'), 3.0)
 
         def _position_failed(what: str, exc: BaseException | None = None):
             """One position went wrong: log it and go on with the next,
@@ -5099,6 +5521,14 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                     except Exception as e:
                         _position_failed(f'{where} failed', e)
                         continue
+                    finally:
+                        # 'position' format: this position's file is
+                        # complete and closed now, whatever happened.
+                        try:
+                            saver.end_position()
+                        except Exception as e:
+                            state['log'].error(
+                                f'{where}: closing its file failed', e)
                     if taken is None:
                         continue            # cancelled part way
                     if taken == 0:
@@ -5134,6 +5564,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             if proc is not None:
                 # Videos need every timepoint, so they are made now; the
                 # processing thread reports when it is through.
+                state['proc_told'] = True
                 proc.finish()
 
         def _position(cyc, pi, p, drift, t0):
@@ -5189,7 +5620,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                         frame, well=p['well'], site=p['site'],
                         z_index=zi, channel=ch, timepoint=cyc + 1,
                         x_um=p['x_um'], y_um=p['y_um'], z_um=z,
-                        t_s=time.time() - t_run)
+                        t_s=time.time() - t_run,
+                        exposure_ms=cs.exposure_ms)
                     taken += 1
                     if path is not None:
                         files.setdefault(ch, []).append(path)
@@ -5204,6 +5636,9 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                         plane=zi, planes=len(planes),
                         file=os.path.basename(
                             path if (path and fmt == 'single')
+                            else saver.last_path if fmt == 'position'
+                            else well_file.run_path(base_dir, fmt)
+                            if well_file.whole_run(fmt)
                             else well_file.well_path(
                                 base_dir, p['well'], fmt)))
                     # The image stays on the plate map where it
@@ -5260,6 +5695,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             'protocol_dir': self.protocol_dir,
             'zstack_dir': self.zstack_dir,
             'save_format': self.save_format,
+            'save_format_v2': True,
+            'spool_dir': self.spool_dir,
             'zman_mode': self.zman_mode,
             'zman_order': self.zman_order,
             'panel_widths': self.panel_widths,
@@ -5303,8 +5740,13 @@ class LumaViewProApp(ExperimentWizardMixin, App):
             self.protocol_dir = d['protocol_dir']
         if isinstance(d.get('zstack_dir'), str):
             self.zstack_dir = d['zstack_dir'].strip()
-        if d.get('save_format') in well_file.SAVE_FORMATS:
+        # (settings from before the 'position' format start with it: it is
+        # the default now; a choice made since is kept)
+        if d.get('save_format') in well_file.SAVE_FORMATS and \
+                d.get('save_format_v2'):
             self.save_format = d['save_format']
+        if isinstance(d.get('spool_dir'), str):
+            self.spool_dir = d['spool_dir'].strip()
         self.zman_mode = ('centre' if d.get('zman_mode') == 'centre'
                           else 'ends')
         self.zman_order = ('channel' if d.get('zman_order') == 'channel'

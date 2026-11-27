@@ -1,6 +1,9 @@
 """One file per well, or one for a whole run: every tile, z plane, colour
 and timepoint in a single OME-TIFF (multi-page BigTIFF) or OME-Zarr store,
-instead of one single-page TIFF per image.
+instead of one single-page TIFF per image. Or (the 'position' save format,
+the default for protocol runs) one small OME-TIFF per position and
+timepoint, written once and closed, with a JSON sidecar: see
+:class:`RunSaver`.
 
 Two ways in:
 
@@ -41,11 +44,20 @@ gzip chunk per plane; a well's store lists the tiles as the fields of a
 well, a run's store is a plate (``<row>/<column>/<tile>``). The metadata is
 rewritten at every new timepoint, so the store is readable during a run.
 
+Storage that drops out (a network drive that stops answering for a
+moment): every write is tried again (``retry_io``) for up to
+``PATIENCE_S``. An OME-TIFF whose write failed part-way is taken back to
+its last whole frame and carried on from there (``WellWriter._reopen``),
+so a frame is in the file whole or not at all. A file that was never
+closed is completed from its ``.index.json`` by ``finish`` (command line
+``well_file.py <folder> --finish``).
+
 No hardware and no UI in here. Needs ``numpy``; OME-TIFF needs ``tifffile``.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -76,6 +88,49 @@ CHANNEL_RGB = {
     'BF': (1.0, 1.0, 1.0), 'PC': (1.0, 1.0, 1.0), 'DF': (1.0, 1.0, 1.0),
     'BLUE': (0.0, 0.0, 1.0), 'GREEN': (0.0, 1.0, 0.0), 'RED': (1.0, 0.0, 0.0),
 }
+
+
+# How long a write that fails is tried again before the error is passed
+# on (seconds). A run waits rather than stops: the stage and the lamps are
+# idle meanwhile.
+PATIENCE_S = 1800.0
+_sleep = time.sleep
+
+
+class WellFileDamaged(RuntimeError):
+    """What is on the disk is less than what was written: not something
+    another try can mend."""
+
+
+def retry_io(fn, *, what: str = '', patience_s: float | None = None,
+             on_wait=None, should_stop=None):
+    """``fn()``, tried again while it raises ``OSError`` (the folder not
+    answering, a file held by another program), with growing pauses up to
+    10 s, for ``patience_s`` (default ``PATIENCE_S``) or until
+    ``should_stop()``; then the error is raised. ``on_wait(text)`` is told
+    about every wait."""
+    limit = PATIENCE_S if patience_s is None else float(patience_s)
+    t0 = time.monotonic()
+    pause, tries = 0.5, 0
+    while True:
+        try:
+            return fn()
+        except OSError as e:
+            tries += 1
+            waited = time.monotonic() - t0
+            if waited >= limit or (should_stop is not None and should_stop()):
+                raise
+            if on_wait is not None:
+                try:
+                    on_wait(f'SAVING IS WAITING: {what or "the image folder"} '
+                            f'is not answering ({e}). Try {tries}, '
+                            f'{waited:.0f} s so far; it carries on by itself '
+                            f'when the drive is back. Images already taken '
+                            f'are kept. Stop ends the run.')
+                except Exception:
+                    pass
+            _sleep(min(pause, max(limit - waited, 0.05)))
+            pause = min(pause * 2.0, 10.0)
 
 
 def well_path(folder: str, well: str | None, fmt: str) -> str:
@@ -120,7 +175,9 @@ class WellWriter:
     def __init__(self, path: str, fmt: str = 'ome-tiff', *,
                  um_per_px: float = 0.0, z_step_um: float = 0.0,
                  well: str | None = None, info: dict | None = None,
-                 run: bool = False, levels: bool = True):
+                 run: bool = False, levels: bool = True,
+                 patience_s: float | None = None, on_wait=None,
+                 should_stop=None):
         if fmt not in FORMATS:
             raise ValueError(f'format must be one of {FORMATS}, not {fmt!r}')
         if fmt == 'ome-tiff' and tifffile is None:
@@ -145,13 +202,90 @@ class WellWriter:
         self.closed = False
         self._seen: set[tuple] = set()
         self._last_t = 0
-        if fmt == 'ome-tiff':
-            self._tw = tifffile.TiffWriter(path, bigtiff=True)
-            self._index = open(path + '.index.json', 'w', encoding='utf-8')
-        else:
-            os.makedirs(path, exist_ok=True)
-            self._tw = None
-            self._index = None
+        self.patience_s = patience_s
+        self.on_wait = on_wait
+        self.should_stop = should_stop
+        self._tw = None
+        self._index = None
+        # After the last whole frame: (length of the OME-TIFF, where its
+        # last page's pointer to the next page is).
+        self._good: tuple[int, int] | None = None
+        self._broken = True                 # nothing is open yet
+        self._io(lambda: None)
+
+    # ----------------------------------------------------------- storage
+
+    def _io(self, fn):
+        """``fn()`` with the files open; a failure is retried after the
+        files were opened again at the last whole frame."""
+        def attempt():
+            if self._broken:
+                self._reopen()
+                self._broken = False
+            try:
+                return fn()
+            except OSError:
+                self._broken = True
+                raise
+        return retry_io(attempt, what=os.path.basename(_bare(self.path)),
+                        patience_s=self.patience_s, on_wait=self.on_wait,
+                        should_stop=self.should_stop)
+
+    def _drop_handles(self) -> None:
+        for h in (getattr(self._tw, '_fh', None), self._index):
+            try:
+                if h is not None:
+                    h.close()
+            except Exception:
+                pass
+        self._tw = self._index = None
+
+    def _index_lines(self) -> str:
+        if not self.planes:
+            return ''
+        return ''.join(json.dumps(d) + '\n' for d in
+                       [{'header': self._header()}] + self.planes)
+
+    def _reopen(self) -> None:
+        """Open the files (again). An OME-TIFF that has frames is cut back
+        to the end of its last whole frame, the chain of pages ended
+        there, and writing carries on behind it; the index is written out
+        again from what is known to be in the file."""
+        if self.fmt != 'ome-tiff':
+            os.makedirs(self.path, exist_ok=True)
+            return
+        self._drop_handles()
+        if not self.planes:
+            self._tw = tifffile.TiffWriter(self.path, bigtiff=True)
+            self._index = open(self.path + '.index.json', 'w', encoding='utf-8')
+            return
+        size, ifd = self._good
+        have = os.path.getsize(self.path)
+        if have < size:
+            raise WellFileDamaged(
+                f'{self.path} is {have} bytes long, {size} were written: the '
+                f'storage lost data that it had taken. The frames listed in '
+                f'{os.path.basename(self.path)}.index.json up to that length '
+                f'are readable ("well_file.py <folder> --finish").')
+        with open(self.path, 'r+b') as f:
+            if have > size:
+                f.truncate(size)
+            f.seek(ifd)
+            f.write(b'\0' * 8)             # the last whole page is the last
+            f.flush()
+            os.fsync(f.fileno())
+        # A writer that carries on at the end of the file. (tifffile's own
+        # append mode is not used: when it cannot read the file it starts
+        # a new one over it.)
+        tw = tifffile.TiffWriter(io.BytesIO(), bigtiff=True)
+        fh = tifffile.FileHandle(self.path, mode='r+', size=0)
+        fh.seek(0, os.SEEK_END)
+        tw._fh = fh
+        tw._ifdoffset = ifd
+        self._tw = tw
+        with open(self.path + '.index.json', 'w', encoding='utf-8') as f:
+            f.write(self._index_lines())
+        self._index = open(self.path + '.index.json', 'a', encoding='utf-8')
 
     @property
     def tiles(self) -> list[str]:
@@ -229,6 +363,21 @@ class WellWriter:
                 rec[name] = float(value)
         frame = np.ascontiguousarray(frame)
         small = [reduced(frame, 2 ** k) for k in range(1, len(self.levels))]
+        try:
+            self._io(lambda: self._store(frame, small, rec, image, first))
+        except BaseException:
+            # Not in the file: the same plane may be given again.
+            self._seen.discard(key)
+            raise
+        self.planes.append(rec)
+        if self.fmt == 'zarr' and (first or int(timepoint) > self._last_t):
+            # Readable while the run goes on: what is there so far is stated
+            # at the start of every timepoint.
+            self._io(self._zarr_metadata)
+        self._last_t = max(self._last_t, int(timepoint))
+
+    def _store(self, frame, small, rec, image, first) -> None:
+        """One frame and its reduced copies onto the disk (one try)."""
         if self.fmt == 'ome-tiff':
             kwargs: dict = {}
             if self.um_per_px > 0:
@@ -249,31 +398,28 @@ class WellWriter:
                                     contiguous=False, returnoffset=True, subfiletype=1)
                 offsets.append(int(at[0]))
             rec['offsets'] = offsets
-            # On disk before the index says it is there (a reader may open
-            # the file while the run goes on).
-            try:
-                self._tw._fh.flush()
-            except Exception:
-                pass
+            # With the storage before the index says it is there (a reader
+            # may open the file while the run goes on, and a later failure
+            # goes back to exactly here).
+            fh = self._tw._fh
+            fh.flush()
+            os.fsync(fh.fileno())
+            fh.seek(0, os.SEEK_END)
+            good = (int(fh.tell()), int(self._tw._ifdoffset))
             if first:
                 self._index.write(json.dumps({'header': self._header()}) + '\n')
             self._index.write(json.dumps(rec) + '\n')
             self._index.flush()
+            self._good = good
         else:
-            ci = self.channels.index(channel)
+            ci = self.channels.index(rec['c'])
             for k, plane in enumerate([frame] + small):
                 chunk = os.path.join(self.path, self._image_path(image), str(k),
-                                     str(int(timepoint)), str(ci), str(int(z)), '0')
+                                     str(rec['t']), str(ci), str(rec['z']), '0')
                 os.makedirs(chunk, exist_ok=True)
                 data = plane.astype(plane.dtype.newbyteorder('<'), copy=False).tobytes()
                 with open(os.path.join(chunk, '0'), 'wb') as f:
                     f.write(gzip.compress(data, 1, mtime=0))
-        self.planes.append(rec)
-        if self.fmt == 'zarr' and (first or int(timepoint) > self._last_t):
-            # Readable while the run goes on: what is there so far is stated
-            # at the start of every timepoint.
-            self._zarr_metadata()
-        self._last_t = max(self._last_t, int(timepoint))
 
     # ------------------------------------------------------------- sizes
 
@@ -333,14 +479,27 @@ class WellWriter:
     # ------------------------------------------------------------- close
 
     def close(self) -> dict:
+        """Finish the file. When this fails for good (the storage stayed
+        away), the frames are still all there and listed in
+        ``.index.json``; ``close()`` may be called again, or ``finish``
+        completes the file later."""
         if self.closed:
             return self.summary()
-        self.closed = True
         if self.fmt == 'ome-tiff':
-            self._tw.close()
-            self._index.close()
+            def shut():
+                self._tw.close()
+                self._index.close()
+            # A file left part-way by a failed write is first taken back
+            # to its last whole frame (_io opens it again).
+            self._io(shut)
+            self._broken = True             # nothing is open any more
+            self._tw = self._index = None
             if self.planes:
-                tifffile.tiffcomment(self.path, self._ome_xml().encode('utf-8'))
+                xml = self._ome_xml().encode('utf-8')
+                retry_io(lambda: tifffile.tiffcomment(self.path, xml),
+                         what=os.path.basename(self.path),
+                         patience_s=self.patience_s, on_wait=self.on_wait,
+                         should_stop=self.should_stop)
                 # The index was the safeguard against a crash: the OME-XML
                 # now says the same.
                 try:
@@ -354,7 +513,8 @@ class WellWriter:
                     except OSError:
                         pass
         elif self.planes:
-            self._zarr_metadata()
+            self._io(self._zarr_metadata)
+        self.closed = True
         return self.summary()
 
     def __enter__(self):
@@ -560,8 +720,9 @@ class WellWriter:
             })
 
 
-SAVE_FORMATS = ('ome-tiff', 'zarr', 'run-ome-tiff', 'run-zarr', 'single')
-SAVE_FORMAT_LABEL = {'ome-tiff': 'one OME-TIFF per well / stack',
+SAVE_FORMATS = ('position', 'ome-tiff', 'zarr', 'run-ome-tiff', 'run-zarr', 'single')
+SAVE_FORMAT_LABEL = {'position': 'one OME-TIFF per position and timepoint',
+                     'ome-tiff': 'one OME-TIFF per well / stack',
                      'zarr': 'one OME-Zarr per well / stack',
                      'run-ome-tiff': 'one OME-TIFF for the whole run',
                      'run-zarr': 'one OME-Zarr for the whole run',
@@ -569,7 +730,10 @@ SAVE_FORMAT_LABEL = {'ome-tiff': 'one OME-TIFF per well / stack',
 
 
 def container(fmt: str) -> str:
-    """The file format of a save format ('run-zarr' is 'zarr')."""
+    """The file format of a save format ('run-zarr' is 'zarr'; 'position'
+    files are OME-TIFFs, and so is a stack or a tile scan saved with it)."""
+    if fmt == 'position':
+        return 'ome-tiff'
     return fmt[4:] if fmt.startswith('run-') else fmt
 
 
@@ -582,6 +746,25 @@ def run_path(base_dir: str, fmt: str) -> str:
     with the format's extension."""
     name = re.sub(r'[^A-Za-z0-9_-]+', '_', os.path.basename(_bare(base_dir))) or 'run'
     return os.path.join(base_dir, name + EXTENSION[container(fmt)])
+
+
+def _clean(value) -> str:
+    return re.sub(r'[^A-Za-z0-9_-]+', '', str(value or ''))
+
+
+def position_path(base_dir: str, well: str | None, site: str, timepoint: int) -> str:
+    """The file of one position at one timepoint ('position' format):
+    ``<run folder>/<well>/<well>_<site>_t0001.ome.tiff``; without a well
+    (a dish, a slide) ``<run folder>/positions/<site>_t0001.ome.tiff``.
+    ``timepoint`` counts from 1."""
+    w, s_ = _clean(well), _clean(site) or 'P'
+    name = '_'.join(([w] if w else []) + [s_, f't{int(timepoint):04d}'])
+    return os.path.join(base_dir, w or 'positions', name + '.ome.tiff')
+
+
+def sidecar_path(path: str) -> str:
+    """The metadata file beside a 'position' file: ``<name>.json``."""
+    return (path[:-len('.ome.tiff')] if path.endswith('.ome.tiff') else path) + '.json'
 
 
 def storable(frame) -> np.ndarray | None:
@@ -608,9 +791,21 @@ def _bare(folder: str) -> str:
 
 
 class RunSaver:
-    """Where a protocol run's frames go: one file per well (``fmt``
-    'ome-tiff' or 'zarr'), one file for the whole run ('run-ome-tiff',
-    'run-zarr'), or single-page TIFFs as before ('single').
+    """Where a protocol run's frames go: one file per position and
+    timepoint (``fmt`` 'position'), one file per well ('ome-tiff' or
+    'zarr'), one file for the whole run ('run-ome-tiff', 'run-zarr'), or
+    single-page TIFFs as before ('single').
+
+    'position': ``<well>/<well>_<site>_t0001.ome.tiff`` holds every colour
+    and z plane of that position at that timepoint (``position_path``). It
+    is opened at the position's first frame and closed, complete with its
+    OME-XML, at ``end_position()`` (or when a frame of another position
+    arrives): no file stays open between positions, so what is on the disk
+    is whole files plus at most the one being taken. Beside each,
+    ``<name>.json`` says in plain JSON what the file holds (well, site,
+    timepoint, stage position, pixel size, every plane's colour, height,
+    time and exposure) and what was being done (``describe``: the
+    protocol's name, the objective, each colour's settings).
 
     With a per-well format, ``keep_planes`` also writes each frame as a
     single-page TIFF below ``<base_dir>/_processing_planes`` for the online
@@ -622,9 +817,24 @@ class RunSaver:
 
     def __init__(self, base_dir: str, fmt: str, *, um_per_px: float = 0.0,
                  z_step_um: float = 0.0, keep_planes: bool = False,
-                 info: dict | None = None, single_writer=None, name_of=None):
+                 info: dict | None = None, single_writer=None, name_of=None,
+                 patience_s: float | None = None, on_wait=None,
+                 should_stop=None, describe: dict | None = None):
         if fmt not in SAVE_FORMATS:
             raise ValueError(f'format must be one of {SAVE_FORMATS}, not {fmt!r}')
+        # 'position': the file being written (key, writer), those that
+        # could not be finished when their position ended, how often each
+        # position and timepoint was started, and how many are done.
+        self.describe = dict(describe or {})
+        self._pos: tuple[tuple, WellWriter] | None = None
+        self._unfinished: list[WellWriter] = []
+        self._started: dict[tuple, int] = {}
+        self.files_written = 0
+        self.last_path = ''
+        # A write that fails is tried again (retry_io): for how long, who
+        # is told, and what ends the waiting.
+        self._retry = {'patience_s': patience_s, 'on_wait': on_wait,
+                       'should_stop': should_stop}
         self.base_dir = base_dir
         self.fmt = fmt
         self.um_per_px = um_per_px
@@ -640,6 +850,17 @@ class RunSaver:
         # is stuck in a driver call: one at a time.
         self._lock = threading.Lock()
         self.closed = False
+
+    def _write_single_file(self, folder: str, well, site, z_index, channel,
+                           timepoint, frame) -> str:
+        """A frame as a single-page file of its own (tried again while the
+        folder does not answer; the same file is simply written anew)."""
+        def write():
+            path = self._single_path(folder, well, site, z_index, channel, timepoint)
+            self._single(path, frame)
+            return path
+        return retry_io(write, what=os.path.basename(_bare(self.base_dir)),
+                        **self._retry)
 
     def _single_path(self, folder: str, well, site, z_index, channel, timepoint) -> str:
         os.makedirs(folder, exist_ok=True)
@@ -669,58 +890,181 @@ class RunSaver:
               x_um, y_um, z_um, t_s, exposure_ms) -> str | None:
         folder = os.path.join(self.base_dir, well or 'positions')
         if self.fmt == 'single':
-            path = self._single_path(folder, well, site, z_index, channel, timepoint)
-            self._single(path, frame)
-            return path
+            return self._write_single_file(folder, well, site, z_index,
+                                           channel, timepoint, frame)
         plane = storable(frame)
         if plane is None:
             # Not a grey image: kept as its own file, the old way.
             self.fallback += 1
-            path = self._single_path(folder, well, site, z_index, channel, timepoint)
-            self._single(path, frame)
-            return path
+            return self._write_single_file(folder, well, site, z_index,
+                                           channel, timepoint, frame)
+        if self.fmt == 'position':
+            writer = self._position_writer(well, site, timepoint)
+            # One timepoint to a file: it is plane 0 in time there, the
+            # timepoint itself is in the name, the OME-XML and the sidecar.
+            writer.add(plane, tile=site, z=int(z_index) - 1, channel=channel,
+                       timepoint=0, x_um=x_um, y_um=y_um, z_um=z_um,
+                       t_s=t_s, exposure_ms=exposure_ms)
+            if not self.keep_planes:
+                return None
+            return self._write_single_file(
+                os.path.join(self.base_dir, self.PLANES_DIR, well or 'positions'),
+                well, site, z_index, channel, timepoint, frame)
         run = whole_run(self.fmt)
         key = '' if run else (well or '')
         writer = self.writers.get(key)
         if writer is None:
-            os.makedirs(self.base_dir, exist_ok=True)
+            retry_io(lambda: os.makedirs(self.base_dir, exist_ok=True),
+                     what=os.path.basename(_bare(self.base_dir)), **self._retry)
             if run:
                 writer = WellWriter(run_path(self.base_dir, self.fmt), container(self.fmt),
                                     um_per_px=self.um_per_px, z_step_um=self.z_step_um,
-                                    info=self.info, run=True)
+                                    info=self.info, run=True, **self._retry)
             else:
                 writer = WellWriter(well_path(self.base_dir, well, self.fmt), self.fmt,
                                     um_per_px=self.um_per_px, z_step_um=self.z_step_um,
-                                    well=well, info=self.info)
+                                    well=well, info=self.info, **self._retry)
             self.writers[key] = writer
         writer.add(plane, tile=site, z=int(z_index) - 1, channel=channel,
                    timepoint=int(timepoint) - 1, x_um=x_um, y_um=y_um, z_um=z_um,
                    t_s=t_s, exposure_ms=exposure_ms, well=well or '')
         if not self.keep_planes:
             return None
-        path = self._single_path(os.path.join(self.base_dir, self.PLANES_DIR, well or 'positions'),
-                                 well, site, z_index, channel, timepoint)
-        self._single(path, frame)
-        return path
+        return self._write_single_file(
+            os.path.join(self.base_dir, self.PLANES_DIR, well or 'positions'),
+            well, site, z_index, channel, timepoint, frame)
+
+    # ------------------------------------- one file per position ('position')
+
+    def _position_writer(self, well, site, timepoint) -> WellWriter:
+        key = (well or '', str(site), int(timepoint))
+        if self._pos is not None and self._pos[0] != key:
+            self._end_position()
+        if self._pos is None:
+            path = position_path(self.base_dir, well, site, timepoint)
+            again = self._started.get(key, 0)
+            if again:
+                # Never over a file that is already there.
+                path = path[:-len('.ome.tiff')] + f'_{again + 1}.ome.tiff'
+            self._started[key] = again + 1
+            retry_io(lambda: os.makedirs(os.path.dirname(path), exist_ok=True),
+                     what=os.path.basename(_bare(self.base_dir)), **self._retry)
+            info = dict(self.info)
+            info.update({'site': str(site), 'timepoint': int(timepoint)})
+            self._pos = (key, WellWriter(
+                path, 'ome-tiff', um_per_px=self.um_per_px,
+                z_step_um=self.z_step_um, well=well or None, info=info,
+                **self._retry))
+            self.last_path = path
+        return self._pos[1]
+
+    def _finish_position_file(self, writer: WellWriter) -> dict:
+        summary = writer.close()
+        if writer.planes:
+            self.files_written += 1
+            try:
+                self._write_sidecar(writer)
+            except Exception:
+                pass                # the OME-XML in the file says the same
+        return summary
+
+    def _end_position(self) -> None:
+        """Close the position's file. One that cannot be finished now is
+        kept for ``close()`` to try again (its frames are in it)."""
+        if self._pos is None:
+            return
+        writer = self._pos[1]
+        self._pos = None
+        try:
+            self._finish_position_file(writer)
+        except Exception:
+            self._unfinished.append(writer)
+
+    def end_position(self) -> None:
+        """The position is through (every colour and plane given, or it was
+        given up): its file is closed now. Nothing to do for the other
+        formats."""
+        with self._lock:
+            self._end_position()
+
+    def _sidecar(self, writer: WellWriter) -> dict:
+        h, w = writer.shape
+        xy = writer.image_xy.get(0)
+        planes = []
+        for p in writer.planes:
+            row = {'page': p['page'], 'channel': p['c'], 'z_index': p['z'] + 1}
+            for name in ('z_um', 't_s', 'exposure_ms'):
+                if name in p:
+                    row[name] = p[name]
+            planes.append(row)
+        return {
+            'lumaviewpro_position_file': 1,
+            'file': os.path.basename(writer.path),
+            'written': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'well': writer.well or '',
+            'site': writer.info.get('site', ''),
+            'timepoint': writer.info.get('timepoint'),
+            'stage_x_um': xy[0] if xy else None,
+            'stage_y_um': xy[1] if xy else None,
+            'width_px': w, 'height_px': h,
+            'bits': 8 if writer.dtype == np.uint8 else 16,
+            'um_per_px': writer.um_per_px, 'z_step_um': writer.z_step_um,
+            'channels': list(writer.channels),
+            'z_planes': 1 + max((p['z'] for p in writer.planes), default=0),
+            'axes': 'one OME image: colour, z, y, x (one timepoint); t_s is '
+                    'seconds since the run started',
+            'planes': planes,
+            'acquisition': self.describe or dict(self.info),
+            'run_description': 'experiment.json in the run folder (the whole '
+                               'protocol, every position)',
+        }
+
+    def _write_sidecar(self, writer: WellWriter) -> None:
+        path = sidecar_path(writer.path)
+        text = json.dumps(self._sidecar(writer), indent=1)
+
+        def write():
+            with open(path + '.tmp', 'w', encoding='utf-8') as f:
+                f.write(text)
+            os.replace(path + '.tmp', path)
+        retry_io(write, what=os.path.basename(path), patience_s=30.0)
 
     def close(self, timeout_s: float | None = None) -> list[dict]:
-        """Finish every well file (their metadata is written now); one that
-        fails does not stop the others (the first error is raised after).
+        """Finish every file (their metadata is written now). Each file on
+        its own: one that cannot be finished does not keep the others from
+        it. Those that could not are named in the ``OSError`` raised at the
+        end (their frames are safe, see ``finish``).
         With ``timeout_s``, gives up (returns []) when a frame being saved
         does not finish in that time. Saving afterwards raises."""
         if not self._lock.acquire(timeout=-1 if timeout_s is None else timeout_s):
             return []
         try:
             self.closed = True
-            out, first = [], None
+            done, failed = [], []
+            positions = list(self._unfinished)
+            if self._pos is not None:
+                positions.append(self._pos[1])
+                self._pos = None
+            self._unfinished = []
+            for w in positions:
+                try:
+                    done.append(self._finish_position_file(w))
+                except Exception as e:
+                    self._unfinished.append(w)
+                    failed.append(f'{os.path.basename(_bare(w.path))} ({e})')
             for w in self.writers.values():
                 try:
-                    out.append(w.close())
+                    done.append(w.close())
                 except Exception as e:
-                    first = first or e
-            if first is not None:
-                raise first
-            return out
+                    failed.append(f'{os.path.basename(_bare(w.path))} ({e})')
+            if failed:
+                raise OSError(
+                    f'{len(failed)} of {len(self.writers) + len(positions)} '
+                    f'files could not be '
+                    f'finished: ' + '; '.join(failed) + '. The images are in them '
+                    'and listed in their .index.json; "python well_file.py '
+                    '<run folder> --finish" completes them.')
+            return done
         finally:
             self._lock.release()
 
@@ -782,6 +1126,31 @@ def _text(value) -> str:
 
 # ------------------------------------------------------------- reading
 
+def _index_file_lines(path: str) -> list[dict]:
+    """The lines of ``<path>.index.json`` (header, then a record per
+    frame). A line that is not whole (the write was cut off) ends it, and
+    so does a frame that the OME-TIFF is too short to hold."""
+    out: list[dict] = []
+    with open(path + '.index.json', encoding='utf-8') as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                break
+    if not out or 'header' not in out[0]:
+        raise ValueError(f'{path}.index.json: no header')
+    head = out[0]['header']
+    item = 1 if head['dtype'] == 'uint8' else 2
+    sizes = [lh * lw * item for lh, lw in head['levels']]
+    have = os.path.getsize(path)
+    for i, r in enumerate(out[1:], 1):
+        if any(at + n > have for at, n in zip(r.get('offsets', ()), sizes)):
+            return out[:i]
+    return out
+
+
 def read_index(path: str) -> dict:
     """The index of a well or run file (``WellWriter._index_doc``): from
     the Zarr store's root, from the OME-TIFF's annotation, or, for an
@@ -790,8 +1159,7 @@ def read_index(path: str) -> dict:
         with open(os.path.join(path, '.zattrs'), encoding='utf-8') as f:
             return json.load(f)['lumaviewpro_well_file']
     if os.path.exists(path + '.index.json'):
-        with open(path + '.index.json', encoding='utf-8') as f:
-            lines = [json.loads(line) for line in f if line.strip()]
+        lines = _index_file_lines(path)
         doc = dict(lines[0]['header'])
         doc['channels'], doc['images'], doc['planes'] = [], [], []
         place: dict = {}
@@ -1067,7 +1435,9 @@ def finish(path: str) -> bool:
             w.image_xy.setdefault(image, (r['x_um'], r['y_um']))
         w.planes.append(r)
     w.closed = True
-    tifffile.tiffcomment(path, w._ome_xml().encode('utf-8'))
+    xml = w._ome_xml().encode('utf-8')
+    retry_io(lambda: tifffile.tiffcomment(path, xml),
+             what=os.path.basename(path), patience_s=60.0)
     os.remove(index)
     return True
 
@@ -1102,7 +1472,7 @@ if __name__ == '__main__':                          # pragma: no cover
     import argparse
     ap = argparse.ArgumentParser(description='Pack single-page TIFFs into one file per well or stack.')
     ap.add_argument('folder')
-    ap.add_argument('--format', choices=[f for f in SAVE_FORMATS if f != 'single'], default='ome-tiff')
+    ap.add_argument('--format', choices=[f for f in SAVE_FORMATS if f not in ('single', 'position')], default='ome-tiff')
     ap.add_argument('--um-per-px', type=float, default=0.0)
     ap.add_argument('--out')
     ap.add_argument('--finish', action='store_true',

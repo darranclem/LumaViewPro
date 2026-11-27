@@ -44,6 +44,8 @@ import traceback
 
 import numpy as np
 
+import well_file
+
 try:
     import cv2
 except Exception:                                   # pragma: no cover
@@ -639,7 +641,9 @@ class OnlineProcessor:
 
     def _read(self, path: str, ch: str) -> np.ndarray:
         """A saved plane, with the measured shading divided out."""
-        img = tifffile.imread(path)
+        # A drive that does not answer for a moment is asked again.
+        img = well_file.retry_io(lambda: tifffile.imread(path),
+                                 what=os.path.basename(path), patience_s=300.0)
         gain = self.gains.get(ch)
         if gain is None or img.ndim != 2 or img.shape != gain.shape or \
                 img.dtype not in (np.uint8, np.uint16):

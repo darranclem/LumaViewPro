@@ -11,6 +11,7 @@ inspected and adjusted there.
 from __future__ import annotations
 
 import math
+import os
 import time
 
 from kivy.clock import Clock
@@ -769,6 +770,19 @@ class ExperimentWizardMixin:
         self.load_protocol(name)
         self._wiz_refresh_info()
 
+    def wiz_load_file(self):
+        """Choose a protocol file anywhere (Windows "Open" window) and
+        load it. Its folder becomes the protocol folder, so "Update" and
+        the autosave go where the file is."""
+        chosen = self.ask_protocol_file('', load=True)
+        if chosen is None:
+            return
+        folder, name = chosen
+        if os.path.normcase(folder) != os.path.normcase(
+                os.path.normpath(self.protocol_dir)):
+            self.set_protocol_dir(folder)
+        self.wiz_load(name)
+
     def wiz_focus_update(self):
         """Refresh the focus of the current (loaded) configuration without
         redefining it: autofocus at its AF point, then revisit each of its
@@ -1312,10 +1326,37 @@ class ExperimentWizardMixin:
                 f'Shading correction: {self._shading_text()}\n'
                 f'Images in total: {images}')
 
+    def _wiz_use_typed_dirs(self):
+        """Folders typed in the last step count without Enter."""
+        ids = self.root.ids
+        out = ids.wiz_output_dir.text.strip()
+        if out and out != self.output_dir:
+            self.set_output_dir(out)
+        prot = ids.wiz_protocol_dir.text.strip()
+        if prot and prot != self.protocol_dir:
+            self.set_protocol_dir(prot)
+
     def wiz_save(self):
+        self._wiz_use_typed_dirs()
         self.save_protocol(self.root.ids.wiz_name.text)
         self._wiz_refresh_info()
 
+    def wiz_save_as(self):
+        """Choose folder and name in the Windows "Save as" window. That
+        folder becomes the protocol folder (where it is listed for
+        loading, and where the autosave goes from now on)."""
+        self._wiz_use_typed_dirs()
+        chosen = self.ask_protocol_file(self.root.ids.wiz_name.text.strip())
+        if chosen is None:
+            return
+        folder, name = chosen
+        if os.path.normcase(folder) != os.path.normcase(
+                os.path.normpath(self.protocol_dir)):
+            self.set_protocol_dir(folder)
+        self.save_protocol(name)
+        self._wiz_refresh_info()
+
     def wiz_run(self):
+        self._wiz_use_typed_dirs()
         self.save_protocol(self.root.ids.wiz_name.text)
         self.run_protocol()

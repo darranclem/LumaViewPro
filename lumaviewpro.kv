@@ -341,56 +341,22 @@ LumaViewProMainLayout:
                         Collapsible:
                             show_header: False
                             open: app.selected_channel == 'AF'
-                            PanelLabel:
-                                text: 'Everything below is the AUTOFOCUS channel. Its light:'
+                            WrapLabel:
+                                text: 'Everything below is the AUTOFOCUS channel only: choose the channel it uses and its binning, then set exposure, gain and LED. No imaged colour is changed. (To leave: press a colour above.)'
                                 color: (1.0, 0.72, 0.1, 1)
-                            GridLayout:
-                                cols: 6
-                                spacing: '2dp'
-                                size_hint_y: None
-                                height: '26dp'
-                                FlatButton:
-                                    text: 'BF'
-                                    background_color: (1.0, 0.72, 0.1, 1) if app.af_source == 'BF' else PANEL2
-                                    color: (0.05, 0.05, 0.05, 1) if app.af_source == 'BF' else TXT
-                                    on_press: app.set_af_source('BF', True)
-                                FlatButton:
-                                    text: 'PC'
-                                    background_color: (1.0, 0.72, 0.1, 1) if app.af_source == 'PC' else PANEL2
-                                    color: (0.05, 0.05, 0.05, 1) if app.af_source == 'PC' else TXT
-                                    on_press: app.set_af_source('PC', True)
-                                FlatButton:
-                                    text: 'DF'
-                                    background_color: (1.0, 0.72, 0.1, 1) if app.af_source == 'DF' else PANEL2
-                                    color: (0.05, 0.05, 0.05, 1) if app.af_source == 'DF' else TXT
-                                    on_press: app.set_af_source('DF', True)
-                                FlatButton:
-                                    text: 'Blue'
-                                    background_color: (1.0, 0.72, 0.1, 1) if app.af_source == 'BLUE' else PANEL2
-                                    color: (0.05, 0.05, 0.05, 1) if app.af_source == 'BLUE' else TXT
-                                    on_press: app.set_af_source('BLUE', True)
-                                FlatButton:
-                                    text: 'Grn'
-                                    background_color: (1.0, 0.72, 0.1, 1) if app.af_source == 'GREEN' else PANEL2
-                                    color: (0.05, 0.05, 0.05, 1) if app.af_source == 'GREEN' else TXT
-                                    on_press: app.set_af_source('GREEN', True)
-                                FlatButton:
-                                    text: 'Red'
-                                    background_color: (1.0, 0.72, 0.1, 1) if app.af_source == 'RED' else PANEL2
-                                    color: (0.05, 0.05, 0.05, 1) if app.af_source == 'RED' else TXT
-                                    on_press: app.set_af_source('RED', True)
                             FlatButton:
-                                text: 'Start from the ' + app.af_source + ' colour (exposure, gain, LED)'
+                                text: 'Copy exposure, gain, LED from the ' + app.af_source + ' colour'
                                 on_press: app.af_take_from_light()
                         FieldRow:
                             PanelLabel:
-                                text: 'Channel'
+                                text: 'Autofocus uses' if app.selected_channel == 'AF' else 'Channel'
+                                color: (1.0, 0.72, 0.1, 1) if app.selected_channel == 'AF' else TXT_DIM
                                 size_hint_x: 0.45
                             DarkSpinner:
                                 id: channel_spinner
-                                text: app.selected_channel
+                                text: app.af_source if app.selected_channel == 'AF' else app.selected_channel
                                 values: ['BF', 'PC', 'DF', 'BLUE', 'GREEN', 'RED']
-                                on_text: app.select_channel(self.text)
+                                on_text: app.panel_channel_picked(self.text)
                         FieldRow:
                             PanelLabel:
                                 text: 'Binning (Autofocus only)' if app.selected_channel == 'AF' else 'Binning (all imaged colours)'
@@ -929,7 +895,7 @@ LumaViewProMainLayout:
                     Collapsible:
                         title: 'PROTOCOL / TIMELAPSE'
                         PanelLabel:
-                            text: 'Output directory'
+                            text: 'Final destination (image data folder)'
                         SmallInput:
                             id: output_dir_input
                             text: app.output_dir
@@ -944,6 +910,25 @@ LumaViewProMainLayout:
                             FlatButton:
                                 text: 'Open folder'
                                 on_press: app.open_output_dir()
+                        PanelLabel:
+                            text: 'Local folder (runs are written here first)'
+                        SmallInput:
+                            id: spool_dir_input
+                            text: app.spool_dir
+                            hint_text: 'automatic: ' + app.spool_default()
+                            on_text_validate: app.set_spool_dir(self.text)
+                        FieldRow:
+                            FlatButton:
+                                text: 'Browse...'
+                                on_press: app.browse_dir('spool')
+                            FlatButton:
+                                text: 'Set directory'
+                                on_press: app.set_spool_dir(spool_dir_input.text)
+                            FlatButton:
+                                text: 'Open folder'
+                                on_press: app.open_spool_dir()
+                        WrapLabel:
+                            text: app.spool_note(app.spool_dir, app.output_dir)
                         FieldRow:
                             PanelLabel:
                                 text: 'Timepoints'
@@ -985,6 +970,47 @@ LumaViewProMainLayout:
                         AccentButton:
                             text: 'Run protocol' + ('' if protocol_cycles_input.text.strip() in ('', '0', '1') else ' (time-lapse, %s timepoints)' % protocol_cycles_input.text.strip())
                             on_press: app.run_protocol()
+
+                    Collapsible:
+                        title: 'FAST TIME-LAPSE (one colour, here)'
+                        WrapLabel:
+                            text: app.fast_plan(app.selected_channel, fast_frames_input.text, fast_duration_input.text, fast_cycle_input.text)
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Frames'
+                                size_hint_x: 0.5
+                            SmallInput:
+                                id: fast_frames_input
+                                text: '100'
+                            PanelLabel:
+                                text: 'or for (s)'
+                                size_hint_x: 0.6
+                            SmallInput:
+                                id: fast_duration_input
+                                text: ''
+                                hint_text: 'no limit'
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Cycle time, start to start (s)'
+                                size_hint_x: 2.2
+                            SmallInput:
+                                id: fast_cycle_input
+                                text: '0'
+                        PanelLabel:
+                            text: '0 = full speed.  Frames 0 and no time = until Stop.'
+                            font_size: '9sp'
+                            height: '13dp'
+                        FieldRow:
+                            AccentButton:
+                                text: 'Record ' + app.selected_channel
+                                disabled: app.worker_busy
+                                on_press: app.run_fast_timelapse()
+                            FlatButton:
+                                text: 'Stop'
+                                on_press: app.cancel_job()
+                        WrapLabel:
+                            text: app.fast_info
+                            color: (0.3, 0.85, 1.0, 1)
 
                     Collapsible:
                         title: 'SAVED PROTOCOLS'
@@ -1370,6 +1396,11 @@ LumaViewProMainLayout:
                                             size_hint_x: None
                                             width: '52dp'
                                             on_press: app.wiz_load(wiz_cfg_spinner.text)
+                                        FlatButton:
+                                            text: 'Browse...'
+                                            size_hint_x: None
+                                            width: '70dp'
+                                            on_press: app.wiz_load_file()
 
                                 # ---- 2 calibrate
                                 Collapsible:
@@ -1862,8 +1893,45 @@ LumaViewProMainLayout:
                                             background_color: ACCENT if app.run_shading != 'off' else PANEL2
                                             on_text: app.set_run_shading(self.text)
                                     PanelLabel:
-                                        text: 'Save'
+                                        text: 'Where the images go'
                                         bold: True
+                                    WrapLabel:
+                                        text: 'Final destination of the image data. Every run makes its own dated folder in it, with the images and a copy of the protocol (experiment.json). ' + app.spool_note(app.spool_dir, app.output_dir) + ' (The local folder is set under PROTOCOL / TIMELAPSE in the side panel.)'
+                                    SmallInput:
+                                        id: wiz_output_dir
+                                        text: app.output_dir
+                                        on_text_validate: app.set_output_dir(self.text)
+                                    FieldRow:
+                                        height: '28dp'
+                                        FlatButton:
+                                            text: 'Browse...'
+                                            on_press: app.browse_dir('output')
+                                        FlatButton:
+                                            text: 'Use typed folder'
+                                            on_press: app.set_output_dir(wiz_output_dir.text)
+                                        FlatButton:
+                                            text: 'Open folder'
+                                            on_press: app.open_output_dir()
+                                    PanelLabel:
+                                        text: 'Where the protocol is saved'
+                                        bold: True
+                                    WrapLabel:
+                                        text: 'Protocol folder. Saved protocols go here, and the setup is autosaved here at every change (_autosave; the one before the last start is kept as _last_session).'
+                                    SmallInput:
+                                        id: wiz_protocol_dir
+                                        text: app.protocol_dir
+                                        on_text_validate: app.set_protocol_dir(self.text)
+                                    FieldRow:
+                                        height: '28dp'
+                                        FlatButton:
+                                            text: 'Browse...'
+                                            on_press: app.browse_dir('protocol')
+                                        FlatButton:
+                                            text: 'Use typed folder'
+                                            on_press: app.set_protocol_dir(wiz_protocol_dir.text)
+                                        FlatButton:
+                                            text: 'Open folder'
+                                            on_press: app.open_protocol_dir()
                                     FieldRow:
                                         PanelLabel:
                                             text: 'Protocol name'
@@ -1875,6 +1943,12 @@ LumaViewProMainLayout:
                                         AccentButton:
                                             text: 'Save protocol'
                                             on_press: app.wiz_save()
+                                        FlatButton:
+                                            text: 'Save as...'
+                                            on_press: app.wiz_save_as()
+                                        FlatButton:
+                                            text: 'Load...'
+                                            on_press: app.wiz_load_file()
                                         AccentButton:
                                             text: 'Save and run'
                                             disabled: app.worker_busy

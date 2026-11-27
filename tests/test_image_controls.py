@@ -535,3 +535,30 @@ def test_imaged_colours_share_one_binning_and_autofocus_keeps_its_own():
     d['RED']['binning'] = 8
     mixed = acq.channel_settings_from_dict(d)
     assert {mixed[ch].binning for ch in acq.CHANNELS} == {2}
+
+
+def test_autofocus_keeps_its_own_settings_for_every_light():
+    cs = acq.default_channel_settings()
+    cs['BLUE'] = acq.ChannelSettings(exposure_ms=80.0, gain_db=10.0,
+                                     led_power=200)
+    af = cs[acq.AF_CHANNEL]
+    af.source, af.binning = 'BF', 2
+    af.exposure_ms, af.gain_db, af.led_power = 0.5, 0.0, 12
+    # A light it has not used: a copy of that colour, shortened by what
+    # the binning gains (2x2 = 4 times as bright).
+    assert acq.af_use_light(cs, 'BLUE') is True
+    assert (af.source, af.exposure_ms, af.gain_db, af.led_power) == \
+        ('BLUE', 20.0, 10.0, 200)
+    af.exposure_ms, af.led_power = 7.0, 300        # set for autofocus
+    # ... the colour itself is untouched
+    assert (cs['BLUE'].exposure_ms, cs['BLUE'].led_power) == (80.0, 200)
+    # Back to brightfield: what it had there; and blue is remembered.
+    assert acq.af_use_light(cs, 'BF') is False
+    assert (af.exposure_ms, af.gain_db, af.led_power) == (0.5, 0.0, 12)
+    assert acq.af_use_light(cs, 'BLUE') is False
+    assert (af.exposure_ms, af.led_power) == (7.0, 300)
+    assert acq.af_use_light(cs, 'BLUE') is False   # same light: unchanged
+    assert (af.exposure_ms, af.led_power) == (7.0, 300)
+    back = acq.channel_settings_from_dict(acq.channel_settings_to_dict(cs))
+    assert back[acq.AF_CHANNEL].lights['BF'] == [0.5, 0.0, 12]
+    assert back['BLUE'].lights == {}

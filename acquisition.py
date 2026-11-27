@@ -120,6 +120,9 @@ class ChannelSettings:
     # pixels a side are summed into one (1, 2, 4 or 8).
     source: str = ''
     binning: int = 1
+    # The Autofocus channel only: its own exposure (ms), gain (dB) and LED
+    # current for each light it has been used with, {light: [e, g, led]}.
+    lights: dict = field(default_factory=dict)
 
 
 def led_channel(channel: str, settings: ChannelSettings | None) -> str:
@@ -173,6 +176,40 @@ def set_imaging_binning(cs: dict, n: int) -> int:
         if ch in cs:
             cs[ch].binning = n
     return n
+
+
+def af_use_light(cs: dict, light: str, min_ms: float = 0.02,
+                 max_ms: float = 1000.0) -> bool:
+    """The Autofocus channel changes to ``light``. Its exposure, gain and
+    LED current for the light it leaves are kept, and those it last had
+    with the new light come back. With a light it has not used yet it
+    starts from that colour's settings (the exposure shortened by what
+    its binning gains): a copy, the colour itself is never changed.
+    Returns True when it started from the colour."""
+    af = cs[AF_CHANNEL]
+    light = light if light in CHANNELS else 'BF'
+    old = led_channel(AF_CHANNEL, af)
+    af.lights[old] = [af.exposure_ms, af.gain_db, af.led_power]
+    kept = af.lights.get(light)
+    fresh = True
+    if kept is not None and old != light:
+        try:
+            af.exposure_ms, af.gain_db, af.led_power = (
+                float(kept[0]), float(kept[1]), int(kept[2]))
+            fresh = False
+        except (TypeError, ValueError, IndexError):
+            pass
+    elif old == light:
+        fresh = False
+    if fresh:
+        src = cs.get(light) or ChannelSettings()
+        gain = (max(int(af.binning), 1) / imaging_binning(cs)) ** 2
+        af.exposure_ms = float(min(max(src.exposure_ms / gain, min_ms),
+                                   max_ms))
+        af.gain_db = src.gain_db
+        af.led_power = src.led_power
+    af.source = light
+    return fresh
 
 
 def adopt_af_channel(cs: dict, source: str, enabled: bool = True) -> None:
@@ -2479,6 +2516,13 @@ def channel_settings_from_dict(d: dict) -> dict[str, ChannelSettings]:
             a.zstack.enabled = False
             a.source = v.get('source') if v.get('source') in CHANNELS \
                 else 'BF'
+            for light, kept in (v.get('lights') or {}).items():
+                try:
+                    if light in CHANNELS:
+                        a.lights[light] = [float(kept[0]), float(kept[1]),
+                                           int(kept[2])]
+                except (TypeError, ValueError, IndexError):
+                    pass
     # One binning for all the imaged colours.
     set_imaging_binning(out, imaging_binning(out))
     return out
