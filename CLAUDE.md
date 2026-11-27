@@ -18,7 +18,9 @@ Custom control application for an Etaluma Lumascope microscope, built on top of 
 ## Logs (read these before guessing at a hardware-side problem)
 
 - `logs/LVP_Log/lumaviewpro.log`: the stock drivers log every stage move and LED/camera call with thread and time; it shows what the user actually did in a run.
-- `logs/calibration.log` (every plate-calibration button press and mark), `logs/errors.log` (exceptions caught by the app), `logs/park_guard.log`.
+- `logs/calibration.log` (every plate-calibration button press and mark), `logs/errors.log` (exceptions caught by the app, uncaught ones on any thread, watchdog stalls, the report on a run that died), `logs/park_guard.log` (also the app's exit code when it ended: access violation, killed, ...).
+- `logs/crash.log`: Python's fault handler (stacks of all threads at a native crash) and the watchdog's stack dumps when the window or a run stops making progress.
+- `<run folder>/run.log`: every position of a protocol run with memory and free disk, errors, and how the run ended. `logs/run_active.json` exists while a run goes on; if it is still there at the next start, the run died: `run_guard.previous_run_died` adds Windows' own record of that time (Application Error / Hang for python.exe with the faulting DLL, sleep, restart, power loss) to run.log and errors.log, and finishes the run's unclosed OME-TIFFs (`well_file.finish_folder`; CLI `well_file.py <folder> --finish`).
 
 ## Environment
 
@@ -39,6 +41,7 @@ The custom app is a handful of top-level files; most work happens here:
 - `experiment_wizard.py`: the experiment setup wizard, mixed into the app class; its panel is in `lumaviewpro.kv`
 - `online_processing.py`: composites, stitched tile scans and timelapse videos made on a background thread while a protocol runs (needs `tifffile`); `run_protocol` reports each completed position to it
 - `park_guard.py`: separate process started by the app once the real stage is connected; if the app ends without parking (crash, killed), it lowers the objective, confirms it is down, then centers the stage. `ScopeHW.park()` uses the same routine.
+- `run_guard.py`: staying up through long runs (fault handler, thread excepthook, watchdog, run log, Windows kept awake during a run, the report on a run that died). In a run, an error at one position is logged and the run goes on (it stops cleanly after 3 failing positions in a row, a full disk, or the disk nearly full); while a job runs, the live view does not call the camera (only the job's thread does); closing the window during a run asks first, and `on_stop` finishes the well files itself if the run thread is stuck.
 - `image_utils.py`, `luma_sim.py`, `hw_debug.py`
 
 Autofocus runs in a channel of its own, `acq.AF_CHANNEL` ('AF'): a `ChannelSettings` entry beside the six colours (`acq.CHANNELS` stays the imaged colours) with its own light (`source`, any colour), exposure, gain, LED current and `binning` (1, 2, 4, 8). Its `enabled` (P under the AF button) is whether a protocol autofocuses, once per timepoint at the one AF point; the focus map and all positions are offsets from what it finds. The binning is done in software (`acq.bin_sum`, pixels summed, in `ScopeHW.grab_fresh` and the live view while `hw.soft_bin > 1`): the camera is not reconfigured, so the two binnings are independent. The imaged colours share ONE binning (`acq.set_imaging_binning`, the "Binning (all imaged colours)" list in Channel settings; `effective_um_per_px()` includes it), done the same way; the old camera-side "Bin:" list in the top bar is gone. It is set in the Channel settings panel like a colour (owner's wish, 2026-11-23: no separate box): showing it live selects it there, the panel's exposure, gain, LED, binning and "in protocol" are then its own, and a row of buttons chooses its light.
@@ -62,7 +65,7 @@ Autofocus runs in a channel of its own, `acq.AF_CHANNEL` ('AF'): a `ChannelSetti
 - `tests/` holds over 800 upstream test files. Do not run the whole suite; run the specific files for the code you changed.
 - Pass `--noconftest`: the upstream `tests/conftest.py` imports `modules.scope_session`, which currently fails (`modules/protocol.py` imports `FilePath`, which `modules/api_surface.py` no longer defines). Example:
   `.venv\Scripts\python -m pytest --noconftest tests/test_af_global_vcurve_fit.py`
-- Tests for this fork's own code: `test_af_global_vcurve_fit.py`, `test_image_controls.py`, `test_labware_designer.py`, `test_shading_zstack.py`, `test_plate_well_selection.py`, `test_experiment_plan.py`, `test_online_processing.py`, `test_user_settings.py`.
+- Tests for this fork's own code: `test_af_global_vcurve_fit.py`, `test_image_controls.py`, `test_labware_designer.py`, `test_shading_zstack.py`, `test_plate_well_selection.py`, `test_experiment_plan.py`, `test_online_processing.py`, `test_user_settings.py`, `test_run_guard.py`.
 
 ## Git
 

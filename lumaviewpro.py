@@ -175,6 +175,12 @@ LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
 # process parks the stage itself when the app ends without leaving it.
 PARKED_FLAG = os.path.join(LOGS_DIR, 'parked.flag')
 
+# A native crash (camera, LED or graphics driver) leaves the stack of every
+# thread in logs/crash.log; an error on a background thread goes to
+# logs/errors.log (see run_guard).
+import run_guard
+run_guard.install(LOGS_DIR)
+
 
 class _LogAndContinue(ExceptionHandler):
     """An error in a button handler or a scheduled callback used to close
@@ -482,6 +488,100 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         threading.Thread(target=self._position_poller, daemon=True).start()
         from kivy.core.window import Window
         Window.bind(on_key_down=self._on_key_down, on_key_up=self._on_key_up)
+        Window.bind(on_request_close=self._on_request_close)
+        # A window that stops drawing for a minute (frozen) leaves every
+        # thread's stack in logs/crash.log.
+        self.watchdog = run_guard.Watchdog()
+        Clock.schedule_interval(
+            lambda dt: self.watchdog.beat('window', 60.0, 'drawing'), 2.0)
+        # A protocol run that never ended (the program died during it).
+        threading.Thread(target=self._check_last_run, daemon=True).start()
+
+    # ------------------------------------------- runs that did not end
+
+    def _check_last_run(self):
+        """If the last protocol run never ended, find out what Windows
+        recorded about it, finish its well files and say so."""
+        try:
+            found = run_guard.previous_run_died(LOGS_DIR,
+                                                well_file.finish_folder)
+        except Exception as e:
+            run_guard.log_error(f'checking the last run failed: {e}')
+            return
+        if found:
+            Clock.schedule_once(lambda dt: self._last_run_popup(found), 1.0)
+
+    def _last_run_popup(self, found: dict):
+        try:
+            from kivy.metrics import dp
+            from kivy.uix.button import Button
+            from kivy.uix.scrollview import ScrollView
+            self._set_status('The last protocol run did not end: see '
+                             'run.log in its folder and logs/errors.log')
+            box = BoxLayout(orientation='vertical', spacing=dp(8),
+                            padding=dp(10))
+            scroll = ScrollView()
+            msg = Label(text=found['report'], halign='left', valign='top',
+                        size_hint_y=None, font_size='13sp')
+            msg.bind(width=lambda w, v: setattr(w, 'text_size', (v, None)),
+                     texture_size=lambda w, s: setattr(w, 'height', s[1]))
+            scroll.add_widget(msg)
+            row = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(6))
+            open_b = Button(text='Open the run folder')
+            ok = Button(text='OK')
+            row.add_widget(open_b)
+            row.add_widget(ok)
+            box.add_widget(scroll)
+            box.add_widget(row)
+            popup = Popup(title='The last protocol run did not end',
+                          content=box, size_hint=(0.7, 0.75))
+
+            def _open(*_):
+                try:
+                    os.startfile(found['run_dir'])
+                except Exception as e:
+                    self._set_status(f'Open folder failed: {e}')
+            open_b.bind(on_press=_open)
+            ok.bind(on_press=popup.dismiss)
+            popup.open()
+        except Exception:
+            pass
+
+    def _on_request_close(self, *args, **kwargs):
+        """Closing the window while a protocol runs asks first (a stray
+        click or Alt+F4 used to end a multi-day run)."""
+        if not self.run_active or getattr(self, '_close_confirmed', False):
+            return False
+        try:
+            from kivy.metrics import dp
+            from kivy.uix.button import Button
+            box = BoxLayout(orientation='vertical', spacing=dp(8),
+                            padding=dp(10))
+            msg = Label(text='A protocol is running. Closing LumaViewPro '
+                             'stops it (what was taken so far is kept).',
+                        halign='center', valign='middle')
+            msg.bind(size=lambda w, s: setattr(w, 'text_size', s))
+            row = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(6))
+            stop_b = Button(text='Stop the run and close')
+            keep = Button(text='Keep running')
+            row.add_widget(stop_b)
+            row.add_widget(keep)
+            box.add_widget(msg)
+            box.add_widget(row)
+            popup = Popup(title='Close LumaViewPro?', content=box,
+                          size_hint=(None, None), size=(dp(520), dp(200)))
+
+            def _close(*_):
+                popup.dismiss()
+                self._close_confirmed = True
+                run_guard.log_error('window closed by the user during a run')
+                self.stop()
+            stop_b.bind(on_press=_close)
+            keep.bind(on_press=popup.dismiss)
+            popup.open()
+        except Exception:
+            return False
+        return True
 
     def _bring_to_front(self, *_):
         """Put the application window above every other window and give
@@ -723,10 +823,15 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         cam = self.hw.camera
         if cam is None or not getattr(cam, 'active', False):
             return
-        try:
-            cam.grab()   # non-blocking: refresh cam.array from the grab loop
-        except Exception as e:
-            self.last_cam_err = f'grab err: {e}'
+        # While a job (protocol, scan, autofocus) runs, its thread is the
+        # only one that talks to the camera: two threads in the camera
+        # driver at once can crash it. The window shows the frame that
+        # thread took last (cam.array).
+        if not self.worker_busy:
+            try:
+                cam.grab()   # non-blocking: refresh cam.array from the grab loop
+            except Exception as e:
+                self.last_cam_err = f'grab err: {e}'
         arr = getattr(cam, 'array', None)
         if not isinstance(arr, np.ndarray) or arr.size == 0:
             return
@@ -2107,6 +2212,20 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         """Pixel size of the IMAGED colours (their binning included)."""
         return self.base_um_per_px * acq.imaging_binning(
             self.channel_settings)
+
+    def _plane_mb_estimate(self) -> float | None:
+        """Disk space of one imaged frame in a well file (MB): the camera
+        frame at the imaged colours' binning, 16-bit unless the camera
+        gives 8, plus its reduced copies (a third more). None before the
+        camera has given a frame."""
+        f = self.latest_frame
+        if f is None:
+            return None
+        b_live = max(int(getattr(self, '_live_bin', 1)), 1)
+        b_img = max(int(acq.imaging_binning(self.channel_settings)), 1)
+        h, w = (n * b_live // b_img for n in f.shape[:2])
+        item = 1 if self.significant_bits <= 8 else 2
+        return h * w * item * 4.0 / 3.0 / 2 ** 20
 
     def set_um_per_px(self, text: str):
         self.base_um_per_px = self._f(text, self.base_um_per_px)
@@ -4822,21 +4941,88 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                 self.run_line = line
             Clock.schedule_once(_show, 0)
 
+        # Will it fit on the disk? (Each frame with its reduced copies,
+        # the planes kept for online processing, the corrected copy.)
+        plane_mb = self._plane_mb_estimate()
+        copies = (1 + (1 if proc is not None and fmt != 'single' else 0)
+                  + (1 if run_shading == 'auto' else 0))
+        need_gb = (plane_mb * copies * total / 1024.0
+                   if plane_mb is not None else None)
+        free_gb = run_guard.free_disk_gb(base_dir)
+        # Stop cleanly (files closed) rather than fill the disk.
+        reserve_gb = max(1.0, (plane_mb or 0) * copies * cycle_total / 1024.0
+                         / max(len(positions), 1) * 3)
+        about = (f'{cycles} timepoints x {len(positions)} positions, '
+                 f'{total} images, save format {fmt}, channels '
+                 f'{",".join(channels)}'
+                 + (f', needs about {need_gb:.1f} GB' if need_gb else ''))
+        if need_gb is not None and free_gb is not None and \
+                need_gb > free_gb - reserve_gb:
+            self._set_status(
+                f'WARNING: this run needs about {need_gb:.0f} GB and the disk '
+                f'has {free_gb:.0f} GB free: it will stop (files closed) when '
+                f'the disk is nearly full')
+        state = {'how': None, 'failed': 0, 'missing': 0}
+
         def _job():
             Clock.schedule_once(lambda dt: (
                 setattr(self, 'run_fraction', 0.0),
                 setattr(self, 'run_line', f'0%   |   {total} images to take'),
                 setattr(self, 'run_active', True)), 0)
+            run_log = run_guard.RunLog(base_dir, LOGS_DIR, about)
+            state['log'] = run_log
+            self._active_run = (saver, run_log)
+            # Windows must not go to sleep part way through.
+            run_guard.keep_awake(True)
             try:
                 _run()
+            except Exception as e:
+                state['how'] = f'stopped by an error: {type(e).__name__}: {e}'
+                run_log.error('the run stopped', e)
+                self._set_status(f'PROTOCOL STOPPED by an error: {e} '
+                                 f'(details in run.log)')
             finally:
+                run_guard.keep_awake(False)
+                self.watchdog.rest('run')
                 Clock.schedule_once(
                     lambda dt: setattr(self, 'run_active', False), 0)
                 # The well files get their metadata now, whatever happened.
                 try:
                     saver.close()
                 except Exception as e:
+                    run_log.error('closing the well files failed', e)
                     self._set_status(f'Closing the well files failed: {e}')
+                if state['missing']:
+                    run_log.write(f'{state["missing"]} images could not be '
+                                  f'taken (no frame from the camera)')
+                run_log.end(state['how'] or (
+                    'stopped by the user' if cancel.is_set() else 'finished'))
+                self._active_run = None
+
+        def _position_failed(what: str, exc: BaseException | None = None):
+            """One position went wrong: log it and go on with the next,
+            unless it keeps happening or the disk is full."""
+            state['failed'] += 1
+            state['log'].error(what, exc)
+            try:
+                self.hw.leds_off()
+            except Exception:
+                pass
+            full = isinstance(exc, OSError) and (
+                getattr(exc, 'errno', None) == 28
+                or getattr(exc, 'winerror', None) in (39, 112))
+            if full:
+                state['how'] = 'stopped: the disk is full'
+            elif state['failed'] >= 3:
+                state['how'] = (f'stopped: {state["failed"]} positions in a '
+                                f'row failed (last: {what})')
+            if state['how']:
+                self._set_status(f'PROTOCOL STOPPED - {state["how"]} '
+                                 f'(see run.log in {base_dir})')
+                cancel.set()
+            else:
+                self._set_status(f'Protocol: {what} - skipped, going on '
+                                 f'(see run.log)')
 
         # The autofocus range is centered on the Z kept with the AF point,
         # which follows the focus found there: a slow drift over a long
@@ -4855,18 +5041,28 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                 # Autofocus at the one AF point (every af_every-th
                 # timepoint). Its result moves the whole focus surface up
                 # or down by the measured drift.
+                state['log'].state(f'timepoint {cyc + 1} of {cycles} starts;')
                 if do_af and cyc % af_every == 0:
                     _progress(cyc, note=f'timepoint {cyc + 1} of {cycles}: '
                                         f'autofocus at the AF point')
-                    ax, ay = self.surface.anchor_xy
-                    self._safe_goto(ax, ay, None)
-                    cfg = self._anchor_af_cfg()
-                    best, af_ok = acq.autofocus_checked(
-                        self.hw, cfg, self._cs(AF_CHANNEL),
-                        cancel=cancel, status_cb=self._set_status,
-                        template=self.af_template,
-                        high_stability=self.high_stability_on,
-                        method=self.af_method)
+                    self.watchdog.beat('run', 600.0,
+                                       f'autofocus, timepoint {cyc + 1}')
+                    try:
+                        ax, ay = self.surface.anchor_xy
+                        self._safe_goto(ax, ay, None)
+                        cfg = self._anchor_af_cfg()
+                        best, af_ok = acq.autofocus_checked(
+                            self.hw, cfg, self._cs(AF_CHANNEL),
+                            cancel=cancel, status_cb=self._set_status,
+                            template=self.af_template,
+                            high_stability=self.high_stability_on,
+                            method=self.af_method)
+                    except Exception as e:
+                        # Imaged at the focus of the last good autofocus.
+                        state['log'].error(
+                            f'autofocus at timepoint {cyc + 1} failed', e)
+                        best, af_ok = None, False
+                        af_state['missed'] += 1
                     if best is not None and af_ok:
                         if self.surface.ref_z is None:
                             self.surface.set_reference_z(best)
@@ -4886,80 +5082,32 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                 for pi, p in enumerate(positions):
                     if cancel.is_set():
                         break
-                    files: dict = {}
-                    complete = True
-                    base_z = None
-                    if self.use_surface_on and self.surface.points and \
-                            self.surface.current_z is not None:
-                        base_z = self.surface.z_at(p['x_um'], p['y_um'])
-                    if base_z is None:
-                        base_z = p['z_um'] + drift
-                    self._set_status(f'Timepoint {cyc + 1}/{cycles}: '
-                                     f'{p["name"]}...')
-                    self._safe_goto(p['x_um'], p['y_um'], base_z)
-                    at_z = base_z
-                    for ch in channels:
-                        if cancel.is_set():
-                            break
-                        cs = self.channel_settings[ch]
-                        # The channel's z-stack, centered on the focus
-                        # surface (plus the chromatic offset) and taken
-                        # from the top of the range down - or that one
-                        # center plane where the well opted out.
-                        opt = self.zstack_optout.get(p['well'] or '', ())
-                        if '*' in opt or ch in opt:
-                            planes = [base_z + (cs.z_offset_um if
-                                                self.use_z_offsets_on else 0.0)]
-                        else:
-                            planes = acq.zstack_planes(
-                                base_z, cs, self.use_z_offsets_on)[::-1]
-                        self.hw.set_channel(ch, cs)
-                        for zi, z in enumerate(planes, 1):
-                            if cancel.is_set():
-                                break
-                            z = max(float(z), 0.0)
-                            if abs(z - at_z) > 0.01:
-                                self.hw.move_z(z)
-                                at_z = z
-                            frame = self.hw.grab_settled(
-                                settle_s=0.2 if zi == 1 else 0.1)
-                            if frame is None:
-                                complete = False
-                                continue
-                            if apply_reference and ch not in ref_missing:
-                                frame = self.shading.apply(frame, ch, z)
-                            path = saver.save(
-                                frame, well=p['well'], site=p['site'],
-                                z_index=zi, channel=ch, timepoint=cyc + 1,
-                                x_um=p['x_um'], y_um=p['y_um'], z_um=z,
-                                t_s=time.time() - t_run)
-                            if path is not None:
-                                files.setdefault(ch, []).append(path)
-                            prog['done'] += 1
-                            prog['cyc_done'] += 1
-                            _progress(
-                                cyc, well=p['well'],
-                                well_i=well_order.index(p['well'] or '') + 1,
-                                wells=len(well_order), site=p['site'],
-                                site_i=site_no[pi],
-                                sites=in_well[p['well'] or ''], channel=ch,
-                                plane=zi, planes=len(planes),
-                                file=os.path.basename(
-                                    path if (path and fmt == 'single')
-                                    else well_file.well_path(
-                                        base_dir, p['well'], fmt)))
-                            # The image stays on the plate map where it
-                            # was taken (middle plane of a z-stack).
-                            if zi == (len(planes) + 1) // 2:
-                                self.leave_preview(ch, frame, p['x_um'],
-                                                   p['y_um'])
-                    self.hw.leds_off()
-                    # All colours and planes of this position are on
-                    # disk: it can be composited, and it counts toward
-                    # its well's stitch.
-                    if proc is not None and complete and not cancel.is_set():
-                        proc.position_done(pi, cyc + 1, files, t0 - t_run)
+                    free = run_guard.free_disk_gb(base_dir)
+                    if free is not None and free < reserve_gb:
+                        state['how'] = (f'stopped: the disk is nearly full '
+                                        f'({free:.1f} GB free)')
+                        state['log'].error(state['how'])
+                        self._set_status(f'PROTOCOL STOPPED - {state["how"]}; '
+                                         f'everything taken so far is saved')
+                        cancel.set()
+                        break
+                    where = (f't{cyc + 1} {p["name"]} '
+                             f'({p["well"] or "-"} {p["site"]})')
+                    self.watchdog.beat('run', 600.0, where)
+                    try:
+                        taken = _position(cyc, pi, p, drift, t0)
+                    except Exception as e:
+                        _position_failed(f'{where} failed', e)
+                        continue
+                    if taken is None:
+                        continue            # cancelled part way
+                    if taken == 0:
+                        _position_failed(f'{where}: no image from the camera')
+                    else:
+                        state['failed'] = 0
+                        state['log'].write(f'{where}: {taken} images')
                 self._persist()
+                self.watchdog.rest('run')
 
                 if cyc < cycles - 1:
                     while time.time() - t0 < interval_s:
@@ -4976,16 +5124,103 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                     if cancel.is_set():
                         break
             Clock.schedule_once(lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
-            self._set_status(
-                f'Protocol finished -> {base_dir}' + (
-                    f'  |  AUTOFOCUS FOUND NO FOCUS at '
-                    f'{af_state["missed"]} of {cycles} timepoints: those '
-                    f'were imaged at the last good focus'
-                    if af_state['missed'] else ''))
+            if not state['how']:        # else the status says why it stopped
+                self._set_status(
+                    f'Protocol finished -> {base_dir}' + (
+                        f'  |  AUTOFOCUS FOUND NO FOCUS at '
+                        f'{af_state["missed"]} of {cycles} timepoints: those '
+                        f'were imaged at the last good focus'
+                        if af_state['missed'] else ''))
             if proc is not None:
                 # Videos need every timepoint, so they are made now; the
                 # processing thread reports when it is through.
                 proc.finish()
+
+        def _position(cyc, pi, p, drift, t0):
+            """Image one position at one timepoint: every colour and plane.
+            Returns how many images were taken, or None when cancelled."""
+            files: dict = {}
+            complete = True
+            taken = 0
+            base_z = None
+            if self.use_surface_on and self.surface.points and \
+                    self.surface.current_z is not None:
+                base_z = self.surface.z_at(p['x_um'], p['y_um'])
+            if base_z is None:
+                base_z = p['z_um'] + drift
+            self._set_status(f'Timepoint {cyc + 1}/{cycles}: '
+                             f'{p["name"]}...')
+            self._safe_goto(p['x_um'], p['y_um'], base_z)
+            at_z = base_z
+            for ch in channels:
+                if cancel.is_set():
+                    break
+                cs = self.channel_settings[ch]
+                # The channel's z-stack, centered on the focus
+                # surface (plus the chromatic offset) and taken
+                # from the top of the range down - or that one
+                # center plane where the well opted out.
+                opt = self.zstack_optout.get(p['well'] or '', ())
+                if '*' in opt or ch in opt:
+                    planes = [base_z + (cs.z_offset_um if
+                                        self.use_z_offsets_on else 0.0)]
+                else:
+                    planes = acq.zstack_planes(
+                        base_z, cs, self.use_z_offsets_on)[::-1]
+                self.hw.set_channel(ch, cs)
+                for zi, z in enumerate(planes, 1):
+                    if cancel.is_set():
+                        break
+                    self.watchdog.beat('run', 600.0, f'{p["name"]} {ch} '
+                                       f'plane {zi}, timepoint {cyc + 1}')
+                    z = max(float(z), 0.0)
+                    if abs(z - at_z) > 0.01:
+                        self.hw.move_z(z)
+                        at_z = z
+                    frame = self.hw.grab_settled(
+                        settle_s=0.2 if zi == 1 else 0.1)
+                    if frame is None:
+                        complete = False
+                        state['missing'] += 1
+                        continue
+                    if apply_reference and ch not in ref_missing:
+                        frame = self.shading.apply(frame, ch, z)
+                    path = saver.save(
+                        frame, well=p['well'], site=p['site'],
+                        z_index=zi, channel=ch, timepoint=cyc + 1,
+                        x_um=p['x_um'], y_um=p['y_um'], z_um=z,
+                        t_s=time.time() - t_run)
+                    taken += 1
+                    if path is not None:
+                        files.setdefault(ch, []).append(path)
+                    prog['done'] += 1
+                    prog['cyc_done'] += 1
+                    _progress(
+                        cyc, well=p['well'],
+                        well_i=well_order.index(p['well'] or '') + 1,
+                        wells=len(well_order), site=p['site'],
+                        site_i=site_no[pi],
+                        sites=in_well[p['well'] or ''], channel=ch,
+                        plane=zi, planes=len(planes),
+                        file=os.path.basename(
+                            path if (path and fmt == 'single')
+                            else well_file.well_path(
+                                base_dir, p['well'], fmt)))
+                    # The image stays on the plate map where it
+                    # was taken (middle plane of a z-stack).
+                    if zi == (len(planes) + 1) // 2:
+                        self.leave_preview(ch, frame, p['x_um'],
+                                           p['y_um'])
+            self.hw.leds_off()
+            # All colours and planes of this position are on
+            # disk: it can be composited, and it counts toward
+            # its well's stitch.
+            if cancel.is_set():
+                return None
+            if proc is not None and complete:
+                proc.position_done(pi, cyc + 1, files, t0 - t_run)
+            return taken
+
         self._bg(_job, busy_job=True)
 
     # -------------------------------------------------------- persistence
@@ -5224,6 +5459,16 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                 job.join(10.0)      # let it stop moving before we park
         except Exception:
             pass
+        # A run whose thread is stuck in a driver call: its well files are
+        # finished from here, so they are complete files.
+        active = getattr(self, '_active_run', None)
+        if active is not None:
+            saver, run_log = active
+            try:
+                saver.close(timeout_s=10.0)
+            except Exception as e:
+                run_log.error('closing the well files at exit failed', e)
+            run_log.end('LumaViewPro was closed during the run')
         try:
             self.hw.leds_off()
         except Exception:

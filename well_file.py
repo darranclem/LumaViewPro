@@ -51,6 +51,8 @@ import os
 import re
 import time
 import gzip
+import struct
+import threading
 from xml.sax.saxutils import quoteattr
 
 import numpy as np
@@ -633,6 +635,11 @@ class RunSaver:
         self._name = name_of
         self.writers: dict[str, WellWriter] = {}
         self.fallback = 0
+        # save() runs on the acquisition thread; close() may come from the
+        # window's thread when the application is closed while that one
+        # is stuck in a driver call: one at a time.
+        self._lock = threading.Lock()
+        self.closed = False
 
     def _single_path(self, folder: str, well, site, z_index, channel, timepoint) -> str:
         os.makedirs(folder, exist_ok=True)
@@ -650,6 +657,16 @@ class RunSaver:
         in the file names). Returns the path of a single-page file holding
         this frame, when one was written (always for 'single'; with
         ``keep_planes``; or for a frame a well file cannot hold)."""
+        with self._lock:
+            if self.closed:
+                raise RuntimeError("the run's files are closed")
+            return self._save(frame, well=well, site=site, z_index=z_index,
+                              channel=channel, timepoint=timepoint, x_um=x_um,
+                              y_um=y_um, z_um=z_um, t_s=t_s,
+                              exposure_ms=exposure_ms)
+
+    def _save(self, frame, *, well, site, z_index, channel, timepoint,
+              x_um, y_um, z_um, t_s, exposure_ms) -> str | None:
         folder = os.path.join(self.base_dir, well or 'positions')
         if self.fmt == 'single':
             path = self._single_path(folder, well, site, z_index, channel, timepoint)
@@ -686,9 +703,26 @@ class RunSaver:
         self._single(path, frame)
         return path
 
-    def close(self) -> list[dict]:
-        """Finish every well file (their metadata is written now)."""
-        return [w.close() for w in self.writers.values()]
+    def close(self, timeout_s: float | None = None) -> list[dict]:
+        """Finish every well file (their metadata is written now); one that
+        fails does not stop the others (the first error is raised after).
+        With ``timeout_s``, gives up (returns []) when a frame being saved
+        does not finish in that time. Saving afterwards raises."""
+        if not self._lock.acquire(timeout=-1 if timeout_s is None else timeout_s):
+            return []
+        try:
+            self.closed = True
+            out, first = [], None
+            for w in self.writers.values():
+                try:
+                    out.append(w.close())
+                except Exception as e:
+                    first = first or e
+            if first is not None:
+                raise first
+            return out
+        finally:
+            self._lock.release()
 
     def remove_planes(self) -> None:
         import shutil
@@ -928,6 +962,142 @@ def pack_run(folder: str, fmt: str = 'ome-tiff', out_dir: str | None = None,
     return out
 
 
+# ------------------------------------------------- finishing after a crash
+
+def _bigtiff_chain_end(fh, n_pages: int) -> int | None:
+    """Byte position of the next-page pointer of main page ``n_pages - 1``
+    of a little-endian BigTIFF, or None when the chain is shorter."""
+    fh.seek(0)
+    head = fh.read(16)
+    if len(head) < 16 or head[:4] != b'II+\x00':
+        return None
+    off = struct.unpack('<Q', head[8:16])[0]
+    size = fh.seek(0, 2)
+    for k in range(n_pages):
+        if off <= 0 or off + 8 > size:
+            return None
+        fh.seek(off)
+        count = struct.unpack('<Q', fh.read(8))[0]
+        ptr = off + 8 + 20 * count
+        if ptr + 8 > size:
+            return None
+        if k == n_pages - 1:
+            return ptr
+        fh.seek(ptr)
+        off = struct.unpack('<Q', fh.read(8))[0]
+    return None
+
+
+def finish(path: str) -> bool:
+    """Finish an OME-TIFF well or run file that was never closed (the
+    process died during the run): its OME-XML is written from
+    ``<file>.index.json``, a page that was half written when it died is
+    cut off, and the index file is removed. The frames are not touched.
+    True when the file was finished; False when there was nothing to do
+    (no index file; one that holds no frames is removed with its file)."""
+    index = path + '.index.json'
+    if not os.path.exists(index) or not os.path.exists(path):
+        return False
+    if tifffile is None:
+        raise RuntimeError('OME-TIFF needs the tifffile package')
+    header, recs = None, []
+    with open(index, encoding='utf-8') as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                break                    # the line being written when it died
+            if 'header' in d:
+                header = d['header']
+            else:
+                recs.append(d)
+    if header is None or not recs:
+        for p in (path, index):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        return False
+    levels = [tuple(s) for s in header['levels']]
+    item = 1 if header['dtype'] == 'uint8' else 2
+    size = os.path.getsize(path)
+    good = []
+    for r in recs:
+        offs = r.get('offsets') or []
+        if len(offs) != len(levels) or any(
+                o + h * w * item > size for o, (h, w) in zip(offs, levels)):
+            break                        # not (all) on disk
+        good.append(r)
+    if not good:
+        return False
+    # The pages after the last one in the index were cut short: end the
+    # chain of pages there, so that every reader sees the same frames.
+    with open(path, 'r+b') as fh:
+        ptr = _bigtiff_chain_end(fh, len(good))
+        if ptr is not None:
+            fh.seek(ptr)
+            if struct.unpack('<Q', fh.read(8))[0] != 0:
+                fh.seek(ptr)
+                fh.write(struct.pack('<Q', 0))
+    w = WellWriter.__new__(WellWriter)
+    w.path, w.fmt = path, 'ome-tiff'
+    w.um_per_px = float(header.get('um_per_px') or 0.0)
+    w.z_step_um = float(header.get('z_step_um') or 0.0)
+    w.well = header.get('well') or None
+    w.run = header.get('scope') == 'run'
+    w.info = dict(header.get('info') or {})
+    w.info['finished'] = ('after the run stopped, from its index, '
+                          + time.strftime('%Y-%m-%d %H:%M:%S'))
+    w.shape = tuple(header['shape'])
+    w.dtype = np.dtype(header['dtype'])
+    w.levels = levels
+    w.with_levels = len(levels) > 1
+    w.images, w.channels, w.image_xy, w.planes = [], [], {}, []
+    w._seen, w._last_t, w._tw, w._index = set(), 0, None, None
+    for r in good:
+        well = r.get('well', '')
+        if (well, r['tile']) not in w.images:
+            w.images.append((well, r['tile']))
+        image = w.images.index((well, r['tile']))
+        if r['c'] not in w.channels:
+            w.channels.append(r['c'])
+        if 'x_um' in r and 'y_um' in r:
+            w.image_xy.setdefault(image, (r['x_um'], r['y_um']))
+        w.planes.append(r)
+    w.closed = True
+    tifffile.tiffcomment(path, w._ome_xml().encode('utf-8'))
+    os.remove(index)
+    return True
+
+
+def unfinished(folder: str) -> list[str]:
+    """The OME-TIFF well and run files below ``folder`` that were never
+    closed."""
+    out = []
+    for root, _dirs, names in os.walk(folder):
+        for name in names:
+            if name.endswith('.ome.tiff.index.json'):
+                path = os.path.join(root, name[:-len('.index.json')])
+                if os.path.exists(path):
+                    out.append(path)
+    return sorted(out)
+
+
+def finish_folder(folder: str) -> list[str]:
+    """:func:`finish` every unclosed OME-TIFF below ``folder`` (a run
+    folder); returns those that were finished."""
+    done = []
+    for path in unfinished(folder):
+        try:
+            if finish(path):
+                done.append(path)
+        except Exception:
+            pass
+    return done
+
+
 if __name__ == '__main__':                          # pragma: no cover
     import argparse
     ap = argparse.ArgumentParser(description='Pack single-page TIFFs into one file per well or stack.')
@@ -935,7 +1105,18 @@ if __name__ == '__main__':                          # pragma: no cover
     ap.add_argument('--format', choices=[f for f in SAVE_FORMATS if f != 'single'], default='ome-tiff')
     ap.add_argument('--um-per-px', type=float, default=0.0)
     ap.add_argument('--out')
+    ap.add_argument('--finish', action='store_true',
+                    help='finish the well / run files of a run that stopped '
+                         'without closing them (OME-XML written from their index)')
     a = ap.parse_args()
+    if a.finish:
+        left = unfinished(a.folder)
+        done = finish_folder(a.folder)
+        for p in left:
+            print(('finished  ' if p in done else 'FAILED    ') + p)
+        if not left:
+            print('nothing to finish')
+        raise SystemExit(0 if len(done) == len(left) else 1)
     has_stack = any(_ZSTACK_NAME.match(n) for n in os.listdir(a.folder))
     if has_stack:
         print(json.dumps(pack_zstack(a.folder, a.format, a.out, a.um_per_px, print), indent=1))

@@ -10,3 +10,4 @@ jgo
 scyjava
 imglyb
 pyimagej
+psutil

@@ -37,18 +37,25 @@ def _log(path: str, msg: str) -> None:
 
 
 def wait_for_exit(pid: int) -> None:
-    """Block until the process with this id has ended."""
+    """Block until the process with this id has ended. Returns its exit
+    code when it can be read (Windows), which says how it ended (see
+    run_guard.EXIT_CODES), else None."""
     if os.name == 'nt':
         import ctypes
         SYNCHRONIZE = 0x00100000
+        QUERY_LIMITED = 0x00001000
         k32 = ctypes.windll.kernel32
         k32.OpenProcess.restype = ctypes.c_void_p
-        handle = k32.OpenProcess(SYNCHRONIZE, False, int(pid))
+        handle = k32.OpenProcess(SYNCHRONIZE | QUERY_LIMITED, False, int(pid))
         if not handle:
-            return                       # already gone
+            handle = k32.OpenProcess(SYNCHRONIZE, False, int(pid))
+        if not handle:
+            return None                  # already gone
         k32.WaitForSingleObject(ctypes.c_void_p(handle), 0xFFFFFFFF)
+        code = ctypes.c_ulong(0)
+        ok = k32.GetExitCodeProcess(ctypes.c_void_p(handle), ctypes.byref(code))
         k32.CloseHandle(ctypes.c_void_p(handle))
-        return
+        return int(code.value) if ok else None
     while True:
         try:
             os.kill(pid, 0)
@@ -156,7 +163,13 @@ def main(argv: list[str]) -> int:
 
     if pid is not None:
         log(f'guarding LumaViewPro (pid {pid})')
-        wait_for_exit(pid)
+        code = wait_for_exit(pid)
+        try:
+            import run_guard
+            how = run_guard.exit_code_text(code)
+        except Exception:
+            how = f'exit code {code}'
+        log(f'LumaViewPro (pid {pid}) ended: {how}')
         if app_parked(flag_path, pid):
             log('application closed and parked the stage itself')
             try:
