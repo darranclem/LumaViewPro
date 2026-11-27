@@ -974,7 +974,7 @@ LumaViewProMainLayout:
                     Collapsible:
                         title: 'FAST TIME-LAPSE (one colour, here)'
                         WrapLabel:
-                            text: app.fast_plan(app.selected_channel, fast_frames_input.text, fast_duration_input.text, fast_cycle_input.text)
+                            text: app.fast_plan(app.selected_channel, fast_frames_input.text, fast_duration_input.text, fast_cycle_input.text, fast_lines_input.text)
                         FieldRow:
                             PanelLabel:
                                 text: 'Frames'
@@ -996,6 +996,18 @@ LumaViewProMainLayout:
                             SmallInput:
                                 id: fast_cycle_input
                                 text: '0'
+                        FieldRow:
+                            PanelLabel:
+                                text: 'Lines the camera reads (height)'
+                                size_hint_x: 2.2
+                            SmallInput:
+                                id: fast_lines_input
+                                text: ''
+                                hint_text: 'all'
+                        PanelLabel:
+                            text: 'Fewer lines = faster (a strip across the middle).  Empty = whole frame.'
+                            font_size: '9sp'
+                            height: '13dp'
                         PanelLabel:
                             text: '0 = full speed.  Frames 0 and no time = until Stop.'
                             font_size: '9sp'

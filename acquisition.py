@@ -522,6 +522,97 @@ class ScopeHW:
         self.grab_fresh(timeout_s)
         return self.grab_fresh(timeout_s)
 
+    def grab_next(self, timeout_s: float = 3.0) -> np.ndarray | None:
+        """The next frame the camera has that was not handed out yet: the
+        one waiting if there is one, else the one being taken. Unlike
+        ``grab_fresh`` it does not throw a waiting frame away, so frames
+        taken one after the other come at the camera's own rate. Only for
+        an unchanged light and position (a waiting frame was exposed
+        before the call)."""
+        with self.lock:
+            cam = self.camera
+        if cam is None or not getattr(cam, 'active', False):
+            return None
+        q = getattr(getattr(cam, 'cam_image_handler', None),
+                    '_frame_queue', None)
+        if q is None:
+            return self.grab_fresh(timeout_s)
+        try:
+            ok, arr, _ = q.get(block=True, timeout=timeout_s)
+        except Exception:
+            return None
+        if not ok or not isinstance(arr, np.ndarray) or arr.size == 0:
+            return None
+        n = getattr(self, 'soft_bin', 1)
+        if n > 1:
+            return bin_sum(arr, n, getattr(self, 'soft_bin_top', None))
+        return arr.copy()
+
+    # ------------------------------------------- lines the camera reads
+
+    def frame_lines(self) -> int | None:
+        """How many lines (rows) the camera reads per frame, or None when
+        the camera cannot say."""
+        with self.lock:
+            cam = self.camera
+            try:
+                return int(cam.active.Height.GetValue())
+            except Exception:
+                return None
+
+    def set_frame_lines(self, lines: int) -> int | None:
+        """Have the camera read ``lines`` rows per frame, a strip centred
+        on the sensor (fewer rows = a higher frame rate; the width is not
+        changed). Returns the number of rows it now reads (rounded to what
+        the camera takes), or None when the camera cannot do it.
+
+        Not the stock ``set_frame_size``: that one takes its upper limit
+        with the offset of the strip in use, so it cannot grow a strip
+        back to the full frame."""
+        with self.lock:
+            cam = self.camera
+            try:
+                node = cam.active.Height
+                with cam.update_camera_config():
+                    try:
+                        cam.active.OffsetY.SetValue(cam.active.OffsetY.GetMin())
+                    except Exception:
+                        pass
+                    lo, hi = int(node.GetMin()), int(node.GetMax())
+                    step = max(int(node.GetInc()), 1)
+                    want = min(max(int(lines), lo), hi)
+                    want = lo + (want - lo) // step * step
+                    node.SetValue(int(want))
+                    try:
+                        cam.active.BslCenterY.Execute()
+                    except Exception:
+                        try:
+                            off = cam.active.OffsetY
+                            inc = max(int(off.GetInc()), 1)
+                            off.SetValue((hi - want) // 2 // inc * inc)
+                        except Exception:
+                            pass
+                try:
+                    cam.cam_image_handler.reset()
+                except Exception:
+                    pass
+                return int(node.GetValue())
+            except Exception:
+                return None
+
+    def camera_frame_rate(self) -> float | None:
+        """Frames a second the camera says it gives with its settings as
+        they are (lines, exposure), or None."""
+        with self.lock:
+            cam = self.camera
+            for name in ('ResultingFrameRate', 'BslResultingAcquisitionFrameRate',
+                         'ResultingFrameRateAbs'):
+                try:
+                    return float(getattr(cam.active, name).GetValue())
+                except Exception:
+                    continue
+            return None
+
     def significant_bits(self) -> int:
         with self.lock:
             cam = self.camera

@@ -1783,8 +1783,9 @@ class LumaViewProApp(ExperimentWizardMixin, App):
     # ------------------------------------------------- fast time-lapse
 
     def fast_plan(self, channel: str, frames_text: str, duration_text: str,
-                  cycle_text: str) -> str:
+                  cycle_text: str, lines_text: str = '') -> str:
         """What "Record" will do with the fields as they are, in words."""
+        lines = int(self._f(lines_text, 0) or 0)
         frames = int(self._f(frames_text, 0) or 0)
         duration = float(self._f(duration_text, 0.0) or 0.0)
         cycle = max(float(self._f(cycle_text, 0.0) or 0.0), 0.0)
@@ -1797,8 +1798,10 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         end = (' or '.join(ends) + (', whichever comes first'
                                     if len(ends) == 2 else '')
                if ends else 'until Stop')
+        strip = (f' The camera reads {lines} lines only (a strip across the '
+                 f'middle of the field).' if lines > 0 else '')
         return (f'{channel}, where the stage is now: '
-                f'{fast_timelapse.describe_cycle(cycle)}; {end}.')
+                f'{fast_timelapse.describe_cycle(cycle)}; {end}.{strip}')
 
     def run_fast_timelapse(self):
         """Record the channel shown in Channel settings as a time-lapse at
@@ -1819,6 +1822,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
         frames = int(self._f(ids.fast_frames_input.text, 0) or 0)
         duration = float(self._f(ids.fast_duration_input.text, 0.0) or 0.0)
         cycle = max(float(self._f(ids.fast_cycle_input.text, 0.0) or 0.0), 0.0)
+        lines = max(int(self._f(ids.fast_lines_input.text, 0) or 0), 0)
         cs = self.channel_settings[ch]
         # Written to the local disk first when it is kept on a network
         # drive, as a protocol run is (run_mirror).
@@ -1848,7 +1852,8 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                 frame = self.hw.grab_settled(settle_s=0.1)
                 self.hw.leds_off()
                 return frame
-            return self.hw.grab_fresh()
+            # The light stays on: every frame the camera gives is used.
+            return self.hw.grab_next()
 
         def _progress(taken, t_s, last_cycle):
             self.watchdog.beat('run', 600.0, f'fast time-lapse frame {taken}')
@@ -1883,7 +1888,27 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                 setattr(self, 'run_line', f'Fast time-lapse {ch}: starting'),
                 setattr(self, 'run_active', True)), 0)
             run_guard.keep_awake(True)
+            full_lines = got_lines = None
+            camera_note = ''
             try:
+                # Light and camera as the colour is set.
+                self.hw.set_channel(ch, cs)
+                if lines > 0:
+                    # Fewer lines read by the camera: a higher frame rate.
+                    # Put back to what it was when the recording is over.
+                    full_lines = self.hw.frame_lines()
+                    if full_lines:
+                        got_lines = self.hw.set_frame_lines(lines)
+                    if not got_lines:
+                        full_lines = None
+                        camera_note = ('; this camera did not take a number '
+                                       'of lines: the whole frame was recorded')
+                    else:
+                        camera_note = (f'; {got_lines} of {full_lines} lines')
+                fps = self.hw.camera_frame_rate()
+                if fps:
+                    camera_note += (f'; the camera gives up to {fps:.1f} '
+                                    f'frames a second like this')
                 rec = fast_timelapse.Recorder(
                     path, ch, um_per_px=self.effective_um_per_px(),
                     x_um=x_um, y_um=y_um, z_um=z_um,
@@ -1896,17 +1921,29 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                         'um_per_px': self.effective_um_per_px(),
                         'asked_for': {'frames': frames or None,
                                       'duration_s': duration or None,
-                                      'cycle_s': cycle},
+                                      'cycle_s': cycle,
+                                      'lines': lines or None},
+                        'camera_lines': got_lines,
+                        'camera_lines_full_frame': full_lines,
+                        'camera_lines_note': (
+                            'the lines are a strip centred in the full frame; '
+                            'the stage position is the centre of both'
+                            if got_lines else None),
+                        'camera_frame_rate': fps,
                         'light': ('on for each frame only' if pulsed
                                   else 'on throughout'),
                         'colour_settings': acq.channel_settings_to_dict(
                             {ch: cs})[ch]})
                 if mirror is not None:
                     mirror.start()
-                # Light and camera as the colour is set; the first frames
-                # after a change are not used.
-                self.hw.set_channel(ch, cs)
-                self.hw.grab_settled(settle_s=0.2)
+                # The first frames after a change are not used (and none
+                # of the height the camera had before).
+                first = self.hw.grab_settled(settle_s=0.2)
+                for _ in range(10):
+                    if not got_lines or first is None or first.shape[0] \
+                            <= got_lines:
+                        break
+                    first = self.hw.grab_fresh()
                 if pulsed:
                     self.hw.leds_off()
                 result = fast_timelapse.record(
@@ -1921,6 +1958,13 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                     self.hw.leds_off()
                 except Exception:
                     pass
+                if full_lines:
+                    back = self.hw.set_frame_lines(full_lines)
+                    if back != full_lines:
+                        failed = failed or (
+                            f'the camera is at {back} lines, not back at '
+                            f'{full_lines}: restart the application')
+                        run_guard.log_error(f'fast time-lapse: {failed}')
                 Clock.schedule_once(
                     lambda dt: setattr(self, 'live_channel', 'OFF'), 0)
                 if rec is not None:
@@ -1950,7 +1994,7 @@ class LumaViewProApp(ExperimentWizardMixin, App):
                     + (f'; the camera waited for the disk at '
                        f'{rec.waited_for_disk} frames'
                        if rec is not None and rec.waited_for_disk else '')
-                    + f' -> {path}')
+                    + camera_note + f' -> {path}')
             how = result.get('how', '')
             head = ('FAST TIME-LAPSE STOPPED by an error (' + failed + '): '
                     if failed else
